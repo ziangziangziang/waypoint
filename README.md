@@ -8,6 +8,34 @@
   <strong>Local AI Gateway</strong> — OpenAI-compatible proxy with intelligent routing, failover, and a built-in playground UI for agentic workflows.
 </p>
 
+<p align="center">
+  <em>Sometimes a good LLM endpoint works behind a bad SSL cert. Waypoint bridges the gap—connect to any backend, handle SSL issues gracefully, and unify multiple endpoints behind one secure local interface.</em>
+</p>
+
+---
+
+## Screenshots
+
+### Playground
+<p align="center">
+  <img src="assets/playground.png" alt="Playground with chat interface" width="800" />
+</p>
+
+### Agent Mode with Tool Calling
+<p align="center">
+  <img src="assets/agent-mode.png" alt="Agent mode with MCP tools" width="800" />
+</p>
+
+### Endpoint Proxy & Usage Guides
+<p align="center">
+  <img src="assets/endpoint-proxy.png" alt="Local proxy to remote LLM endpoints with usage examples" width="800" />
+</p>
+
+### Dashboard
+<p align="center">
+  <img src="assets/dashboard.png" alt="Real-time statistics dashboard" width="800" />
+</p>
+
 ---
 
 ## Features
