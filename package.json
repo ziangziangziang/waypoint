@@ -1,0 +1,30 @@
+{
+  "name": "waypoint",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local OpenAI-compatible reverse proxy with routing and health checks",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "bin": {
+    "waypoint": "dist/cli/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "cli": "tsx cli/index.ts",
+    "seed": "tsx scripts/seed.ts",
+    "manual-test": "bash scripts/manual-test.sh"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "fastify": "^4.28.1",
+    "undici": "^6.19.8",
+    "yaml": "^2.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.4"
+  }
+}
