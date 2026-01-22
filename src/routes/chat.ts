@@ -15,7 +15,7 @@ interface ChatBody {
 
 export async function registerChatRoutes(app: FastifyInstance, paths: StoragePaths): Promise<void> {
   app.post("/v1/chat/completions", async (req: FastifyRequest, reply: FastifyReply) => {
-    const body = req.body as ChatBody | undefined;
+    let body = req.body as ChatBody | undefined;
     if (!body?.model) {
       const fallback = await pickDefaultModel(paths);
       if (!fallback) {

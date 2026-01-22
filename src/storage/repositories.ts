@@ -7,16 +7,67 @@ import {
   readRequestLogs,
   saveConfig,
   saveHealth,
-  StoragePaths
+  StoragePaths,
+  ConfigFile
 } from "./files";
-import { EndpointDoc, EndpointHealth, RequestLog } from "../types";
+import { EndpointDoc, EndpointHealth, EndpointType, RequestLog } from "../types";
+
+// ========================================
+// Config Cache for Hot-Reload Support
+// ========================================
+
+interface ConfigCache {
+  config: ConfigFile | null;
+  health: { endpoints: Record<string, EndpointHealth> } | null;
+  lastLoadedAt: number;
+}
+
+const cache: ConfigCache = {
+  config: null,
+  health: null,
+  lastLoadedAt: 0
+};
+
+const CACHE_TTL_MS = 1000; // 1 second TTL for cache
+
+/**
+ * Invalidate the config cache. Call this when config changes externally.
+ */
+export function invalidateConfigCache(): void {
+  cache.config = null;
+  cache.health = null;
+  cache.lastLoadedAt = 0;
+  console.log("[repositories] Config cache invalidated");
+}
+
+/**
+ * Check if cache is valid
+ */
+function isCacheValid(): boolean {
+  return cache.config !== null && (Date.now() - cache.lastLoadedAt) < CACHE_TTL_MS;
+}
+
+async function getCachedConfig(paths: StoragePaths): Promise<ConfigFile> {
+  if (!isCacheValid()) {
+    cache.config = await loadConfig(paths);
+    cache.lastLoadedAt = Date.now();
+  }
+  return cache.config!;
+}
+
+async function getCachedHealth(paths: StoragePaths): Promise<{ endpoints: Record<string, EndpointHealth> }> {
+  // Health is always fresh-loaded since it changes frequently
+  return loadHealth(paths);
+}
 
 export async function listEndpoints(paths: StoragePaths): Promise<EndpointDoc[]> {
-  const normalized = normalizeConfig(await loadConfig(paths));
+  const config = await getCachedConfig(paths);
+  const normalized = normalizeConfig(config);
   if (normalized.changed) {
     await saveConfig(paths, normalized.config);
+    cache.config = normalized.config;
   }
-  const health = await loadHealth(paths);
+  const health = await getCachedHealth(paths);
   return normalized.config.endpoints.map((endpoint) => ({
     ...endpoint,
     health: health.endpoints[endpoint.id] ?? defaultHealth()
@@ -106,11 +157,16 @@ export async function getEndpointByIdOrName(paths: StoragePaths, value: string):
 
 export async function getEligibleEndpointsForModel(
   paths: StoragePaths,
-  publicModel: string
+  publicModel: string,
+  endpointType?: EndpointType
 ): Promise<EndpointDoc[]> {
   const endpoints = await listEndpoints(paths);
   const now = new Date();
   return endpoints.filter((endpoint) => {
+    // Filter by endpoint type if specified
+    if (endpointType && endpoint.type !== endpointType) {
+      return false;
+    }
     if (!endpoint.models.some((model) => model.publicName === publicModel)) {
       return false;
     }
@@ -234,6 +290,30 @@ export async function listPublicModels(paths: StoragePaths): Promise<string[]> {
     }
   }
   return Array.from(names).sort();
+}
+
+export interface ModelWithType {
+  id: string;
+  type: 'llm' | 'diffusion' | 'audio' | 'embedding';
+  endpointName: string;
+}
+
+export async function listModelsWithTypes(paths: StoragePaths): Promise<ModelWithType[]> {
+  const config = normalizeConfig(await loadConfig(paths)).config;
+  const models = new Map<string, ModelWithType>();
+  for (const endpoint of config.endpoints) {
+    for (const model of endpoint.models) {
+      // First endpoint wins (in case model is on multiple endpoints)
+      if (!models.has(model.publicName)) {
+        models.set(model.publicName, {
+          id: model.publicName,
+          type: endpoint.type,
+          endpointName: endpoint.name,
+        });
+      }
+    }
+  }
+  return Array.from(models.values()).sort((a, b) => a.id.localeCompare(b.id));
 }
 
 export async function logRequest(paths: StoragePaths, log: RequestLog): Promise<void> {

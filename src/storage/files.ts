@@ -7,6 +7,8 @@ import { EndpointDoc, EndpointHealth, RequestLog } from "../types";
 
 export interface ConfigFile {
   endpoints: Array<Omit<EndpointDoc, "health">>;
+  // Auth configuration
+  authEnabled?: boolean;
 }
 
 export interface HealthFile {

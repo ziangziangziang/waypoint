@@ -1,5 +1,5 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { getStats, listEndpoints, createEndpoint, updateEndpoint, getEndpointByIdOrName } from "../storage/repositories";
+import { listEndpoints, createEndpoint, updateEndpoint, getEndpointByIdOrName } from "../storage/repositories";
 import { EndpointDoc, ModelMapping } from "../types";
 import { Agent, request } from "undici";
 import { StoragePaths } from "../storage/files";
@@ -119,13 +119,6 @@ export async function registerAdminRoutes(app: FastifyInstance, paths: StoragePa
       }))
     );
   });
-
-  app.get("/admin/stats", async (req, reply) => {
-    const query = req.query as { window?: string };
-    const windowMs = parseWindowMs(query.window ?? "1h");
-    const stats = await getStats(paths, windowMs);
-    reply.send(stats);
-  });
 }
 
 function isAuthorized(req: FastifyRequest, token?: string): boolean {
@@ -135,25 +128,4 @@ function isAuthorized(req: FastifyRequest, token?: string): boolean {
   }
   const remote = req.socket.remoteAddress ?? "";
   return remote === "127.0.0.1" || remote === "::1";
-}
-
-function parseWindowMs(value: string): number {
-  const match = value.match(/^(\d+)([smhd])$/);
-  if (!match) {
-    return 60 * 60 * 1000;
-  }
-  const amount = Number(match[1]);
-  const unit = match[2];
-  switch (unit) {
-    case "s":
-      return amount * 1000;
-    case "m":
-      return amount * 60 * 1000;
-    case "h":
-      return amount * 60 * 60 * 1000;
-    case "d":
-      return amount * 24 * 60 * 60 * 1000;
-    default:
-      return 60 * 60 * 1000;
-  }
 }

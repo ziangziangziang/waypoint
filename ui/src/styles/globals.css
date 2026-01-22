@@ -1,0 +1,223 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Waypoint Industrial Dark Theme
+       Inspired by control room interfaces and technical dashboards
+       Deep charcoal base with amber/gold accents */
+    
+    --background: 220 15% 6%;
+    --foreground: 40 15% 92%;
+    
+    --card: 220 15% 8%;
+    --card-foreground: 40 15% 92%;
+    
+    --popover: 220 15% 10%;
+    --popover-foreground: 40 15% 92%;
+    
+    /* Amber/Gold primary - warm industrial accent */
+    --primary: 38 92% 50%;
+    --primary-foreground: 220 15% 6%;
+    
+    --secondary: 220 10% 15%;
+    --secondary-foreground: 40 10% 75%;
+    
+    --muted: 220 10% 12%;
+    --muted-foreground: 220 10% 50%;
+    
+    --accent: 38 70% 45%;
+    --accent-foreground: 220 15% 6%;
+    
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    
+    --success: 142 71% 45%;
+    --success-foreground: 142 71% 10%;
+    
+    --warning: 38 92% 50%;
+    --warning-foreground: 38 92% 10%;
+    
+    --border: 220 10% 18%;
+    --input: 220 10% 14%;
+    --ring: 38 92% 50%;
+    
+    --radius: 0.375rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Custom scrollbar - minimal and dark */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-muted-foreground/50;
+  }
+}
+
+@layer components {
+  /* Industrial panel styling */
+  .panel {
+    @apply bg-card border border-border rounded-md;
+    box-shadow: 
+      inset 0 1px 0 0 hsl(220 10% 20% / 0.5),
+      0 4px 6px -1px hsl(0 0% 0% / 0.3);
+  }
+
+  .panel-header {
+    @apply px-4 py-3 border-b border-border flex items-center gap-3;
+    background: linear-gradient(
+      180deg,
+      hsl(220 15% 10%) 0%,
+      hsl(220 15% 8%) 100%
+    );
+  }
+
+  .panel-title {
+    @apply text-sm font-mono font-medium uppercase tracking-wider text-muted-foreground;
+  }
+
+  /* Status indicators */
+  .status-dot {
+    @apply w-2 h-2 rounded-full;
+  }
+
+  .status-dot-live {
+    @apply bg-success animate-pulse-glow;
+  }
+
+  .status-dot-degraded {
+    @apply bg-warning;
+  }
+
+  .status-dot-down {
+    @apply bg-destructive;
+  }
+
+  /* Terminal-style input */
+  .terminal-input {
+    @apply font-mono bg-input border-0 rounded-sm px-3 py-2 text-sm;
+    @apply focus:ring-1 focus:ring-primary focus:outline-none;
+    @apply placeholder:text-muted-foreground/50;
+  }
+
+  /* Metric card */
+  .metric-card {
+    @apply panel p-4 flex flex-col gap-1;
+  }
+
+  .metric-label {
+    @apply text-2xs font-mono uppercase tracking-widest text-muted-foreground;
+  }
+
+  .metric-value {
+    @apply text-2xl font-mono font-semibold text-foreground tabular-nums;
+  }
+
+  .metric-unit {
+    @apply text-sm text-muted-foreground ml-1;
+  }
+
+  /* Chat message bubbles */
+  .message-user {
+    @apply bg-primary/10 border border-primary/20 rounded-lg px-4 py-3;
+  }
+
+  .message-assistant {
+    @apply bg-secondary border border-border rounded-lg px-4 py-3;
+  }
+
+  .message-system {
+    @apply bg-muted/50 border border-dashed border-border rounded-lg px-4 py-3 text-muted-foreground;
+  }
+
+  /* Code blocks in chat */
+  .prose-code {
+    @apply font-mono text-sm bg-muted rounded px-1.5 py-0.5;
+  }
+
+  /* Glowing accent for important elements */
+  .glow-accent {
+    box-shadow: 0 0 20px hsl(38 92% 50% / 0.15);
+  }
+
+  /* Navigation active state */
+  .nav-active {
+    @apply bg-primary/10 text-primary border-l-2 border-primary;
+  }
+
+  /* Loading skeleton with industrial shimmer */
+  .skeleton {
+    @apply bg-muted animate-pulse rounded;
+  }
+}
+
+@layer utilities {
+  /* Text gradient for headings */
+  .text-gradient {
+    @apply bg-clip-text text-transparent;
+    background-image: linear-gradient(
+      135deg,
+      hsl(40 15% 92%) 0%,
+      hsl(38 92% 50%) 100%
+    );
+  }
+
+  /* Noise texture overlay */
+  .noise-overlay {
+    position: relative;
+  }
+
+  .noise-overlay::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+    opacity: 0.03;
+    pointer-events: none;
+  }
+
+  /* Grid pattern background */
+  .grid-pattern {
+    background-image: 
+      linear-gradient(hsl(220 10% 15% / 0.5) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(220 10% 15% / 0.5) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+
+  /* Scanline effect for retro feel */
+  .scanlines::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      hsl(0 0% 0% / 0.03) 2px,
+      hsl(0 0% 0% / 0.03) 4px
+    );
+    pointer-events: none;
+  }
+}

@@ -14,6 +14,8 @@ import fs from "fs";
 import path from "path";
 import { routeRequest } from "../src/routing/router";
 import { resolveModelMappings } from "../src/utils/modelDiscovery";
+import { aggregateStats, readStatsForWindow, resolveStatsDir } from "../src/storage/statsRepository";
+import { listMcpServers, addMcpServer, removeMcpServer, updateMcpServer } from "../src/mcp/registry";
 
 const program = new Command();
 
@@ -27,13 +29,14 @@ program
 
 program
   .command("add")
-  .requiredOption("--name <name>")
-  .requiredOption("--url <url>")
-  .requiredOption("--priority <priority>")
-  .option("--type <type>", "Endpoint type: llm or diffusion", "llm")
-  .option("--insecureTls", "Allow self-signed TLS")
-  .option("--apiKey <apiKey>")
-  .option("--model <mapping...>", "Model mapping as public=upstream")
+  .description("Add a new endpoint")
+  .requiredOption("--name <name>", "Endpoint display name")
+  .requiredOption("--url <url>", "Base URL of the endpoint")
+  .requiredOption("--priority <priority>", "Routing priority (lower = preferred)")
+  .option("--type <type>", "Endpoint type: llm (chat/completions), diffusion (/images/generations), audio, embedding", "llm")
+  .option("--insecureTls", "Allow self-signed TLS certificates")
+  .option("--apiKey <apiKey>", "Bearer token for Authorization header")
+  .option("--model <mapping...>", "Model mapping as 'public' or 'public=upstream'. If endpoint has 1 model, upstream is auto-detected.")
   .action(async (options) => {
     await ensureStorageDir(paths);
     const mappings = await resolveModelMappings(
@@ -229,6 +232,280 @@ service
     console.log("Waypoint is not running.");
   });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Logs Command
+// ─────────────────────────────────────────────────────────────────────────────
+
+program
+  .command("logs")
+  .description("Tail the waypoint log file")
+  .option("-f, --follow", "Follow log output (like tail -f)")
+  .option("-n, --lines <n>", "Number of lines to show", "50")
+  .action(async (options) => {
+    await ensureStorageDir(paths);
+    const logFile = path.join(paths.baseDir, "waypoint.log");
+    
+    if (!fs.existsSync(logFile)) {
+      console.log("No log file found. Start the service first.");
+      return;
+    }
+
+    const lines = Number(options.lines) || 50;
+    
+    if (options.follow) {
+      // Tail with follow using spawn
+      const tail = spawn("tail", ["-n", String(lines), "-f", logFile], {
+        stdio: "inherit"
+      });
+      
+      process.on("SIGINT", () => {
+        tail.kill();
+        process.exit(0);
+      });
+      
+      await new Promise((resolve) => {
+        tail.on("exit", resolve);
+      });
+    } else {
+      // Just show last N lines
+      try {
+        const content = fs.readFileSync(logFile, "utf8");
+        const allLines = content.split("\n");
+        const lastLines = allLines.slice(-lines).join("\n");
+        console.log(lastLines);
+      } catch (error) {
+        console.error(`Failed to read log file: ${(error as Error).message}`);
+        process.exitCode = 1;
+      }
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stats Command
+// ─────────────────────────────────────────────────────────────────────────────
+
+program
+  .command("stats")
+  .description("Show request statistics")
+  .option("--window <window>", "Time window (e.g., 24h, 7d)", "7d")
+  .option("--json", "Output as JSON")
+  .action(async (options) => {
+    await ensureStorageDir(paths);
+    
+    // Parse window
+    const windowStr = options.window;
+    let windowMs: number;
+    if (windowStr.endsWith("h")) {
+      windowMs = parseInt(windowStr) * 60 * 60 * 1000;
+    } else if (windowStr.endsWith("d")) {
+      windowMs = parseInt(windowStr) * 24 * 60 * 60 * 1000;
+    } else {
+      windowMs = parseInt(windowStr) || 7 * 24 * 60 * 60 * 1000;
+    }
+    
+    try {
+      const stats = await aggregateStats(paths, windowMs);
+      
+      if (options.json) {
+        console.log(JSON.stringify(stats, null, 2));
+        return;
+      }
+      
+      // Pretty print
+      console.log("\n📊 Waypoint Statistics");
+      console.log(`   Window: ${stats.window}\n`);
+      
+      console.log("── Request Summary ──");
+      console.log(`   Total:    ${stats.total}`);
+      console.log(`   Success:  ${stats.success}`);
+      console.log(`   Errors:   ${stats.errors}`);
+      console.log(`   Rate:     ${stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : 0}% success\n`);
+      
+      console.log("── Latency (ms) ──");
+      console.log(`   Avg:  ${stats.avgLatencyMs?.toFixed(0) ?? "N/A"}`);
+      console.log(`   P50:  ${stats.p50LatencyMs?.toFixed(0) ?? "N/A"}`);
+      console.log(`   P95:  ${stats.p95LatencyMs?.toFixed(0) ?? "N/A"}`);
+      console.log(`   P99:  ${stats.p99LatencyMs?.toFixed(0) ?? "N/A"}\n`);
+      
+      console.log("── Token Usage ──");
+      console.log(`   Total:      ${stats.totalTokens.toLocaleString()}`);
+      console.log(`   Per Hour:   ${stats.tokensPerHour?.toFixed(0) ?? "N/A"}\n`);
+      
+      if (Object.keys(stats.byModel).length > 0) {
+        console.log("── By Model ──");
+        console.table(
+          Object.entries(stats.byModel).map(([model, data]) => ({
+            model,
+            requests: data.count,
+            avgLatencyMs: data.avgLatencyMs.toFixed(0),
+            tokens: data.tokens.toLocaleString()
+          }))
+        );
+      }
+      
+      if (Object.keys(stats.byEndpoint).length > 0) {
+        console.log("── By Endpoint ──");
+        console.table(
+          Object.entries(stats.byEndpoint).map(([id, data]) => ({
+            id: id.slice(0, 8),
+            requests: data.count,
+            avgLatencyMs: data.avgLatencyMs.toFixed(0),
+            tokens: data.tokens.toLocaleString(),
+            errors: data.errors
+          }))
+        );
+      }
+    } catch (error) {
+      console.error(`Failed to load stats: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP Commands
+// ─────────────────────────────────────────────────────────────────────────────
+
+const mcp = program
+  .command("mcp")
+  .description("Manage MCP servers for agentic workflows");
+
+mcp
+  .command("add")
+  .description("Add a new MCP server")
+  .requiredOption("--name <name>", "Server name")
+  .requiredOption("--url <url>", "Server URL (streamable HTTP)")
+  .option("--disabled", "Add as disabled")
+  .action(async (options) => {
+    await ensureStorageDir(paths);
+    try {
+      const server = await addMcpServer(paths, {
+        name: options.name,
+        url: options.url,
+        enabled: !options.disabled
+      });
+      console.log(`Added MCP server: ${server.name}`);
+      console.log(JSON.stringify(server, null, 2));
+    } catch (error) {
+      console.error(`Failed to add server: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+mcp
+  .command("list")
+  .alias("ls")
+  .description("List all MCP servers")
+  .option("--json", "Output as JSON")
+  .action(async (options) => {
+    await ensureStorageDir(paths);
+    try {
+      const servers = await listMcpServers(paths);
+      
+      if (servers.length === 0) {
+        console.log("No MCP servers configured.");
+        return;
+      }
+      
+      if (options.json) {
+        console.log(JSON.stringify(servers, null, 2));
+        return;
+      }
+      
+      console.table(
+        servers.map((s) => ({
+          id: s.id.slice(0, 8),
+          name: s.name,
+          url: s.url,
+          status: s.status,
+          enabled: s.enabled ? "✓" : "✗",
+          tools: s.toolCount ?? 0
+        }))
+      );
+    } catch (error) {
+      console.error(`Failed to list servers: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+mcp
+  .command("rm")
+  .alias("remove")
+  .description("Remove an MCP server")
+  .argument("<idOrName>", "Server ID (prefix) or name")
+  .action(async (idOrName) => {
+    await ensureStorageDir(paths);
+    try {
+      const servers = await listMcpServers(paths);
+      const server = servers.find(
+        (s) => s.id.startsWith(idOrName) || s.name.toLowerCase() === idOrName.toLowerCase()
+      );
+      
+      if (!server) {
+        console.error("Server not found");
+        process.exitCode = 1;
+        return;
+      }
+      
+      await removeMcpServer(paths, server.id);
+      console.log(`Removed MCP server: ${server.name}`);
+    } catch (error) {
+      console.error(`Failed to remove server: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+mcp
+  .command("enable")
+  .description("Enable an MCP server")
+  .argument("<idOrName>", "Server ID (prefix) or name")
+  .action(async (idOrName) => {
+    await ensureStorageDir(paths);
+    try {
+      const servers = await listMcpServers(paths);
+      const server = servers.find(
+        (s) => s.id.startsWith(idOrName) || s.name.toLowerCase() === idOrName.toLowerCase()
+      );
+      
+      if (!server) {
+        console.error("Server not found");
+        process.exitCode = 1;
+        return;
+      }
+      
+      await updateMcpServer(paths, server.id, { enabled: true });
+      console.log(`Enabled MCP server: ${server.name}`);
+    } catch (error) {
+      console.error(`Failed to enable server: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+mcp
+  .command("disable")
+  .description("Disable an MCP server")
+  .argument("<idOrName>", "Server ID (prefix) or name")
+  .action(async (idOrName) => {
+    await ensureStorageDir(paths);
+    try {
+      const servers = await listMcpServers(paths);
+      const server = servers.find(
+        (s) => s.id.startsWith(idOrName) || s.name.toLowerCase() === idOrName.toLowerCase()
+      );
+      
+      if (!server) {
+        console.error("Server not found");
+        process.exitCode = 1;
+        return;
+      }
+      
+      await updateMcpServer(paths, server.id, { enabled: false });
+      console.log(`Disabled MCP server: ${server.name}`);
+    } catch (error) {
+      console.error(`Failed to disable server: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
 program.parseAsync().catch((error) => {
   console.error(error);
   process.exit(1);
@@ -257,7 +534,12 @@ function isImageModel(model: string): boolean {
   return name.includes("diffusion") || name.includes("stable") || name.includes("sd") || name.includes("flux");
 }
 
-async function resolveModelType(model: string): Promise<"llm" | "diffusion"> {
+function isAudioModel(model: string): boolean {
+  const name = model.toLowerCase();
+  return name.includes("whisper") || name.includes("tts") || name.includes("speech");
+}
+
+async function resolveModelType(model: string): Promise<"llm" | "diffusion" | "audio" | "embedding"> {
   const endpoints = await listEndpoints(paths);
   const match = endpoints.find((endpoint) =>
     endpoint.models.some((entry) => entry.publicName === model)
@@ -265,11 +547,16 @@ async function resolveModelType(model: string): Promise<"llm" | "diffusion"> {
   if (match) {
     return match.type;
   }
-  return isImageModel(model) ? "diffusion" : "llm";
+  if (isImageModel(model)) return "diffusion";
+  if (isAudioModel(model)) return "audio";
+  return "llm";
 }
 
-function normalizeType(value: string): "llm" | "diffusion" {
-  return value === "diffusion" ? "diffusion" : "llm";
+function normalizeType(value: string): "llm" | "diffusion" | "audio" | "embedding" {
+  if (value === "diffusion") return "diffusion";
+  if (value === "audio") return "audio";
+  if (value === "embedding") return "embedding";
+  return "llm";
 }
 
 async function readResponsePayload(response: { body: NodeJS.ReadableStream; headers: Record<string, string | string[]> }): Promise<unknown> {

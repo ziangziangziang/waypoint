@@ -1,0 +1,7 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "mkdir": true,
+        "npm install": true,
+        "git add": true
+    }
+}

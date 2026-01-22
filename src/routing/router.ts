@@ -1,4 +1,4 @@
-import { EndpointDoc, UpstreamError, UpstreamResult } from "../types";
+import { EndpointDoc, EndpointType, UpstreamError, UpstreamResult } from "../types";
 import {
   getEligibleEndpointsForModel,
   sortEndpointsForRouting,
@@ -27,9 +27,10 @@ export async function routeRequest(
   path: string,
   payload: Record<string, unknown>,
   headers: Record<string, string | string[] | undefined>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  endpointType?: EndpointType
 ): Promise<RouteOutcome> {
-  const candidates = await getEligibleEndpointsForModel(paths, publicModel);
+  const candidates = await getEligibleEndpointsForModel(paths, publicModel, endpointType);
   if (candidates.length === 0) {
     const error = new Error("No eligible endpoints for model") as UpstreamError;
     error.type = "no_endpoints";

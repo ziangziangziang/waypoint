@@ -15,16 +15,29 @@ export async function resolveModelMappings(
   if (!models || models.length === 0) {
     return mappings;
   }
-  if (models.length !== 1) {
-    return mappings;
+  
+  // If exactly one model, use it as the upstream for all mappings
+  // that don't already have an explicit upstream different from the public name
+  if (models.length === 1) {
+    const sole = models[0];
+    console.log(`[model-discovery] Single model found: ${sole}`);
+    return mappings.map((mapping) => {
+      // If user specified explicit upstream (public=upstream format), keep it
+      // Otherwise, use the discovered model as upstream
+      if (mapping.publicName !== mapping.upstreamModel) {
+        // User specified explicit mapping, keep it
+        return mapping;
+      }
+      // Public and upstream are the same (user just gave public name)
+      // Replace upstream with discovered model
+      console.log(`[model-discovery] Mapping ${mapping.publicName} -> ${sole}`);
+      return { ...mapping, upstreamModel: sole };
+    });
   }
-  const sole = models[0];
-  return mappings.map((mapping) => {
-    if (mapping.upstreamModel === sole || mapping.publicName === sole) {
-      return mapping;
-    }
-    return { ...mapping, upstreamModel: sole };
-  });
+  
+  // Multiple models - check if any mapping's upstream matches available models
+  console.log(`[model-discovery] ${models.length} models found: ${models.slice(0, 5).join(", ")}${models.length > 5 ? "..." : ""}`);
+  return mappings;
 }
 
 async function fetchModelList(endpoint: EndpointInfo): Promise<string[] | null> {
