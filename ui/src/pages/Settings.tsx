@@ -137,22 +137,13 @@ export function Settings() {
             </div>
             <div className="p-4 space-y-2">
               <a 
-                href="https://github.com/your-org/waypoint" 
+                href="https://github.com/ziangziangziang/waypoint"
                 target="_blank" 
                 rel="noopener noreferrer"
                 className="flex items-center gap-2 text-sm text-primary hover:underline"
               >
                 <ExternalLink className="w-3 h-3" />
                 GitHub Repository
-              </a>
-              <a 
-                href="https://platform.openai.com/docs/api-reference" 
-                target="_blank" 
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 text-sm text-primary hover:underline"
-              >
-                <ExternalLink className="w-3 h-3" />
-                OpenAI API Reference
               </a>
             </div>
           </div>
