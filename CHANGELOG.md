@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Interactive Agent Mode** - `waypoint agent` command launches the full TUI experience
+  - Same interface as running `codex` directly
+  - Auto-picks model from available endpoints
+  - Respects `--model` and `--cwd` options
 - **Auto Model Selection** - Agent runtime automatically picks the best available LLM model when no `--model` flag is specified
   - Selects from healthy endpoints based on priority and latency
   - Uses `pickBestLlmModel()` from storage repositories
@@ -24,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Agent streaming compatibility** - Agent runtime now works correctly with Waypoint proxy (was failing with "stream closed before response.completed")
 - **Models API Codex compatibility** - `/v1/models` now includes both `data` (OpenAI) and `models` (Codex) fields
+- **Skip login for localhost** - Codex TUI no longer shows login screen when `OPENAI_BASE_URL` points to localhost (Waypoint proxy)
 
 ---
 

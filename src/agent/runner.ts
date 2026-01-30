@@ -264,6 +264,98 @@ export class AgentRunner extends EventEmitter {
   }
 
   /**
+   * Run the agent in interactive mode (like running 'codex' directly).
+   * This launches the full TUI experience.
+   */
+  async runInteractive(options: {
+    cwd?: string;
+    model?: string;
+    onStdout?: (data: string) => void;
+    onStderr?: (data: string) => void;
+  } = {}): Promise<AgentResult> {
+    await this.initialize();
+
+    const {
+      cwd = this.config.workingDirectory,
+      model,
+      onStdout,
+      onStderr,
+    } = options;
+
+    // Build environment with isolation
+    const env = buildCodexEnv(this.config);
+
+    // Build command arguments - NO "exec" subcommand for interactive mode
+    const args: string[] = [];
+
+    // Determine model: explicit > config > auto-pick from available endpoints
+    let selectedModel = model || this.config.defaultModel;
+    if (!selectedModel) {
+      const paths = resolveStoragePaths();
+      selectedModel = await pickBestLlmModel(paths) ?? undefined;
+      if (selectedModel) {
+        this.emit("model-selected", selectedModel);
+      }
+    }
+
+    // Add model if we have one
+    if (selectedModel) {
+      args.push("--model", selectedModel);
+    }
+
+    return new Promise((resolve, reject) => {
+      const codexBinary = this.getCodexBinaryPath();
+
+      if (codexBinary.type === "none") {
+        reject(new Error(
+          "Codex binary not found. Build the vendored Codex first:\n\n" +
+          "  Option A: Build Rust binary\n" +
+          "    cd src/engine/codex/codex-rs && cargo build --release\n\n" +
+          "  Option B: Install npm package (gets vendor binaries)\n" +
+          "    cd src/engine/codex/codex-cli && npm install\n\n" +
+          "Run 'waypoint doctor' for more information."
+        ));
+        return;
+      }
+
+      this.emit("start", { interactive: true, model: selectedModel, cwd });
+
+      let stdout = "";
+      let stderr = "";
+
+      // Spawn based on binary type - use 'inherit' for full interactive TUI
+      let child: ChildProcess;
+      if (codexBinary.type === "js") {
+        child = spawn(process.execPath, [codexBinary.path, ...args], {
+          cwd,
+          env,
+          stdio: "inherit",  // Full interactive mode
+        });
+      } else {
+        child = spawn(codexBinary.path, args, {
+          cwd,
+          env,
+          stdio: "inherit",  // Full interactive mode
+        });
+      }
+
+      this.activeProcess = child;
+
+      child.on("error", (error) => {
+        this.activeProcess = null;
+        reject(error);
+      });
+
+      child.on("close", (code) => {
+        this.activeProcess = null;
+        const exitCode = code ?? 1;
+        this.emit("complete", { exitCode, stdout, stderr });
+        resolve({ exitCode, stdout, stderr });
+      });
+    });
+  }
+
+  /**
    * Stop the currently running agent
    */
   stop(): void {

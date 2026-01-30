@@ -609,6 +609,32 @@ mcp
 // ─────────────────────────────────────────────────────────────────────────────
 
 program
+  .command("agent")
+  .description("Start the interactive agent CLI (like running 'codex')")
+  .option("-m, --model <model>", "Model to use for the agent")
+  .option("-d, --cwd <directory>", "Working directory for the agent")
+  .action(async (options) => {
+    const runner = new AgentRunner({
+      defaultModel: options.model,
+      workingDirectory: options.cwd || process.cwd(),
+    });
+
+    try {
+      const result = await runner.runInteractive({
+        model: options.model,
+        cwd: options.cwd,
+        onStdout: (data) => process.stdout.write(data),
+        onStderr: (data) => process.stderr.write(data),
+      });
+      
+      process.exitCode = result.exitCode;
+    } catch (error) {
+      console.error(`Agent error: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+program
   .command("run")
   .description("Run the agent with a prompt")
   .argument("<prompt...>", "The prompt to send to the agent")
@@ -770,7 +796,7 @@ program
 // List of known subcommands to avoid treating them as prompts
 const knownCommands = new Set([
   "add", "ls", "test", "rm", "edit", "stat", "status", "acct",
-  "service", "logs", "stats", "mcp", "run", "doctor", "help", "--help", "-h"
+  "service", "logs", "stats", "mcp", "run", "agent", "doctor", "help", "--help", "-h"
 ]);
 
 // Check if the first argument is NOT a known command
