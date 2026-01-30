@@ -11,6 +11,8 @@ export async function registerModelsRoutes(app: FastifyInstance, paths: StorageP
       owned_by: "waypoint",
       // Extension: include endpoint type for routing decisions
       endpoint_type: m.type,
+      // Codex requirement: include slug field (same as id for simplicity)
+      slug: m.id,
     }));
     // Include both 'data' (OpenAI standard) and 'models' (Codex compatibility)
     reply.send({ object: "list", data, models: data });
