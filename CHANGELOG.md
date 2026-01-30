@@ -4,10 +4,48 @@ All notable changes to Waypoint will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-01-29
+
+### Added
+
+- **SSE Streaming for Responses API** - `/v1/responses` now supports proper Server-Sent Events streaming format compatible with Codex agent runtime
+  - Events: `response.created`, `response.output_item.done`, `response.completed`
+  - Content type uses `output_text` (Codex format) instead of `text`
+  - Tool calls transformed to `function_call` output items
+- **Tool Format Transformation** - Codex tool format automatically converted to OpenAI function calling format
+  - Wraps `{type:"function", name, parameters}` → `{type:"function", function:{name, parameters}}`
+  - Filters out `web_search` tools (not OpenAI compatible)
+- **Message Content Transformation** - Fixes `input_text` → `text` content part types for OpenAI compatibility
+
+### Fixed
+
+- **Agent streaming compatibility** - Agent runtime now works correctly with Waypoint proxy (was failing with "stream closed before response.completed")
+
+---
+
 ## [Unreleased]
 
 ### Added
 
+- **Agent Runtime** - Waypoint now includes an integrated agent runtime
+  - `waypoint run "<prompt>"` - explicit agent execution command
+  - `waypoint "<prompt>"` - shorthand (any unrecognized command is treated as an agent prompt)
+  - `waypoint doctor` - verify agent configuration and isolation invariants
+- **Agent Isolation** - complete isolation from global Codex installations
+  - All agent data stored in `~/.config/waypoint/codex` (never `~/.codex`)
+  - All API requests routed through Waypoint proxy (never `api.openai.com`)
+  - Runtime verification of isolation invariants
+- **Agent Configuration**
+  - `WAYPOINT_CODEX_HOME` - override agent data directory
+  - `WAYPOINT_BASE_URL` - override API endpoint
+  - `WAYPOINT_API_KEY` - override authentication
+  - `WAYPOINT_DEFAULT_MODEL` - set default model for agent
+- **Agent CLI Options**
+  - `--model, -m <model>` - specify model for agent execution
+  - `--auto` - enable full-auto approval mode
+  - `--suggest` - require approval for all actions (default)
+  - `--no-network` - disable network access in sandbox
+  - `--cwd, -d <directory>` - set working directory
 - **waypoint status command** - added as alias to `waypoint stat` for convenience
 - **API key support in health checks** - health checks now include Authorization headers when endpoints have apiKey configured
 - **On-demand health checks** - `waypoint ls` now refreshes endpoint health status before displaying (use `--no-check` to skip)

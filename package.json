@@ -1,6 +1,6 @@
 {
   "name": "waypoint",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Local OpenAI-compatible reverse proxy with routing, health checks, and playground UI",
   "license": "MIT",

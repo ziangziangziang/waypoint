@@ -116,8 +116,12 @@ Typical scripts you should prefer (if present):
   - `POST /v1/audio/transcriptions`
   - `POST /v1/audio/speech`
 - `src/routes/responses.ts`
-  - Compatibility shim translating “responses” API semantics to chat completions
-- Extend shared types (e.g., `src/types.ts`)
+  - Compatibility shim translating “responses” API semantics to chat completions  - **SSE Streaming**: When `stream: true`, returns proper Server-Sent Events:
+    - `event: response.created` - initial response metadata
+    - `event: response.output_item.done` - for each output (messages, tool calls)
+    - `event: response.completed` - final response with usage stats
+  - **Tool format transformation**: Converts Codex tools to OpenAI function calling format
+  - **Content type mapping**: Uses `output_text` (Codex) instead of `text` (OpenAI)- Extend shared types (e.g., `src/types.ts`)
   - `ImageGenerationRequest`
   - `AudioRequest` / transcription + speech request shapes
   - Response types matching OpenAI expectations where possible

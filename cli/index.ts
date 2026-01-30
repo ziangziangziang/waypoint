@@ -12,10 +12,12 @@ import { ensureStorageDir, loadConfig, resolveStoragePaths, saveConfig } from ".
 import { spawn, spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
+import os from "os";
 import { routeRequest } from "../src/routing/router";
 import { resolveModelMappings } from "../src/utils/modelDiscovery";
 import { aggregateStats, readStatsForWindow, resolveStatsDir } from "../src/storage/statsRepository";
 import { listMcpServers, addMcpServer, removeMcpServer, updateMcpServer } from "../src/mcp/registry";
+import { AgentRunner, buildAgentConfig, verifyIsolation } from "../src/agent/index";
 
 const program = new Command();
 
@@ -602,10 +604,207 @@ mcp
     }
   });
 
-program.parseAsync().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent Commands
+// ─────────────────────────────────────────────────────────────────────────────
+
+program
+  .command("run")
+  .description("Run the agent with a prompt")
+  .argument("<prompt...>", "The prompt to send to the agent")
+  .option("-m, --model <model>", "Model to use for the agent")
+  .option("--auto", "Auto-approve all actions (never ask)")
+  .option("--untrusted", "Only auto-approve safe read commands (most restrictive)")
+  .option("--no-network", "Disable network access in sandbox")
+  .option("-d, --cwd <directory>", "Working directory for the agent")
+  .action(async (promptParts, options) => {
+    const prompt = promptParts.join(" ");
+    
+    // Determine approval policy (Codex values: untrusted, on-failure, on-request, never)
+    let approvalPolicy: "untrusted" | "on-failure" | "on-request" | "never" = "on-request";
+    if (options.auto) {
+      approvalPolicy = "never";
+    } else if (options.untrusted) {
+      approvalPolicy = "untrusted";
+    }
+    
+    const runner = new AgentRunner({
+      defaultModel: options.model,
+      workingDirectory: options.cwd || process.cwd(),
+      networkAccess: options.network !== false,
+      approvalPolicy,
+    });
+
+    try {
+      const result = await runner.run({
+        prompt,
+        onStdout: (data) => process.stdout.write(data),
+        onStderr: (data) => process.stderr.write(data),
+      });
+      
+      process.exitCode = result.exitCode;
+    } catch (error) {
+      console.error(`Agent error: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("doctor")
+  .description("Verify Waypoint agent configuration and isolation")
+  .action(async () => {
+    console.log("\n🔍 Waypoint Doctor\n");
+    console.log("── Environment ──");
+    
+    const config = buildAgentConfig();
+    
+    // Show resolved paths
+    console.log(`   CODEX_HOME:        ${config.codexHome}`);
+    console.log(`   WAYPOINT_BASE_URL: ${config.baseUrl}`);
+    console.log(`   WAYPOINT_API_KEY:  ${config.apiKey ? "****" + config.apiKey.slice(-4) : "(none)"}`);
+    console.log(`   Working Dir:       ${config.workingDirectory}`);
+    console.log(`   Network Access:    ${config.networkAccess ? "enabled" : "disabled"}`);
+    console.log(`   Approval Policy:   ${config.approvalPolicy}\n`);
+    
+    // Verify isolation
+    console.log("── Isolation Check ──");
+    const isolation = verifyIsolation(config);
+    
+    if (isolation.valid) {
+      console.log("   ✓ Isolation invariants OK");
+      console.log(`   ✓ Data path: ${config.codexHome}`);
+      console.log(`   ✓ API endpoint: ${config.baseUrl}`);
+    } else {
+      console.log("   ✗ Isolation check FAILED:");
+      for (const error of isolation.errors) {
+        console.log(`     - ${error}`);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    
+    // Check directories exist
+    console.log("\n── Directory Status ──");
+    const dirs = [
+      config.codexHome,
+      path.join(config.codexHome, "sessions"),
+      path.join(config.codexHome, "log"),
+    ];
+    
+    for (const dir of dirs) {
+      const exists = fs.existsSync(dir);
+      const status = exists ? "✓" : "○";
+      console.log(`   ${status} ${dir}`);
+    }
+    
+    // Check Waypoint service
+    console.log("\n── Service Status ──");
+    const pid = readPid(pidFile);
+    if (pid && isRunning(pidFile)) {
+      console.log(`   ✓ Waypoint service running (pid ${pid})`);
+      
+      // Try to reach the service
+      try {
+        const response = await request(`${config.baseUrl}/models`, {
+          method: "GET",
+          headersTimeout: 2000,
+          bodyTimeout: 2000,
+        });
+        response.body.resume();
+        if (response.statusCode === 200) {
+          console.log(`   ✓ API reachable at ${config.baseUrl}`);
+        } else {
+          console.log(`   ⚠ API returned status ${response.statusCode}`);
+        }
+      } catch (error) {
+        console.log(`   ✗ Cannot reach API: ${(error as Error).message}`);
+      }
+    } else {
+      console.log("   ○ Waypoint service not running");
+      console.log("     Run 'waypoint service start' to start the service");
+    }
+    
+    // Check Codex binary
+    console.log("\n── Codex Engine ──");
+    const codexDir = path.join(getPackageRoot(), "src", "engine", "codex");
+    const codexJsEntry = path.join(codexDir, "codex-cli", "bin", "codex.js");
+    const vendorDir = path.join(codexDir, "codex-cli", "vendor");
+    const rustRelease = path.join(codexDir, "codex-rs", "target", "release", "waypoint-agent");
+    const rustDebug = path.join(codexDir, "codex-rs", "target", "debug", "waypoint-agent");
+    
+    if (fs.existsSync(codexJsEntry) && fs.existsSync(vendorDir)) {
+      console.log("   ✓ JS wrapper with vendor binaries found");
+      console.log(`     ${codexJsEntry}`);
+    } else if (fs.existsSync(rustRelease)) {
+      console.log("   ✓ Rust binary found (release)");
+      console.log(`     ${rustRelease}`);
+    } else if (fs.existsSync(rustDebug)) {
+      console.log("   ✓ Rust binary found (debug)");
+      console.log(`     ${rustDebug}`);
+    } else if (fs.existsSync(codexJsEntry)) {
+      console.log("   ⚠ JS wrapper found but vendor binaries missing");
+      console.log(`     ${codexJsEntry}`);
+      console.log("     Run: cd src/engine/codex/codex-cli && npm install");
+    } else {
+      console.log("   ✗ Codex binary not found");
+      console.log("     Build with: cd src/engine/codex/codex-rs && cargo build --release");
+      console.log("     Or install: cd src/engine/codex/codex-cli && npm install");
+    }
+    
+    // Check forbidden paths don't exist
+    console.log("\n── Safety Check ──");
+    const forbidden = path.join(os.homedir(), ".codex");
+    if (fs.existsSync(forbidden)) {
+      console.log(`   ⚠ Global ~/.codex exists (not used by Waypoint)`);
+    } else {
+      console.log("   ✓ No global ~/.codex directory");
+    }
+    
+    console.log("\n✅ Doctor complete\n");
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Default behavior: treat unknown commands as agent prompts
+// ─────────────────────────────────────────────────────────────────────────────
+
+// List of known subcommands to avoid treating them as prompts
+const knownCommands = new Set([
+  "add", "ls", "test", "rm", "edit", "stat", "status", "acct",
+  "service", "logs", "stats", "mcp", "run", "doctor", "help", "--help", "-h"
+]);
+
+// Check if the first argument is NOT a known command
+const firstArg = process.argv[2];
+const isAgentPrompt = firstArg && 
+  !firstArg.startsWith("-") && 
+  !knownCommands.has(firstArg);
+
+if (isAgentPrompt) {
+  // Treat all arguments as a prompt
+  const prompt = process.argv.slice(2).join(" ");
+  
+  (async () => {
+    const runner = new AgentRunner();
+    
+    try {
+      const result = await runner.run({
+        prompt,
+        onStdout: (data) => process.stdout.write(data),
+        onStderr: (data) => process.stderr.write(data),
+      });
+      
+      process.exit(result.exitCode);
+    } catch (error) {
+      console.error(`Agent error: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  })();
+} else {
+  program.parseAsync().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
 
 function parseMappings(values: string[]): { publicName: string; upstreamModel: string }[] {
   return values.map((value) => {

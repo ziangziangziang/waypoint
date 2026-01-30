@@ -151,6 +151,11 @@ waypoint add \
 ## CLI Commands
 
 ```bash
+# Agent commands (NEW!)
+waypoint "Fix the bug in main.ts"     # Run agent with prompt
+waypoint run "Add unit tests" --auto  # Explicit run with options
+waypoint doctor                       # Verify agent configuration
+
 # Endpoint management
 waypoint ls                           # List endpoints
 waypoint add --name --url --priority  # Add endpoint
@@ -180,6 +185,40 @@ waypoint mcp rm <id|name>             # Remove MCP server
 waypoint mcp enable <id|name>         # Enable server
 waypoint mcp disable <id|name>        # Disable server
 ```
+
+## Agent Runtime
+
+Waypoint includes a built-in agent runtime that executes AI-driven tasks using your configured LLM endpoints:
+
+```bash
+# Simple usage - just provide a prompt
+waypoint "Refactor the authentication module to use JWT"
+
+# With options
+waypoint run "Add comprehensive error handling" \
+  --model gpt-4 \
+  --auto \
+  --cwd ./src
+
+# Check your agent setup
+waypoint doctor
+```
+
+### Agent Isolation
+
+All agent data is isolated from global installations:
+- **Data directory**: `~/.config/waypoint/codex` (never `~/.codex`)
+- **API endpoint**: Your Waypoint proxy (never `api.openai.com`)
+- **Runtime verification**: `waypoint doctor` validates isolation invariants
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WAYPOINT_CODEX_HOME` | `~/.config/waypoint/codex` | Agent data directory |
+| `WAYPOINT_BASE_URL` | `http://localhost:8000/v1` | API endpoint |
+| `WAYPOINT_API_KEY` | `local-dev` | Authentication key |
+| `WAYPOINT_DEFAULT_MODEL` | (none) | Default model for agent |
 
 ## Web UI
 
