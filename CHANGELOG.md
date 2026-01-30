@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Auto Model Selection** - Agent runtime automatically picks the best available LLM model when no `--model` flag is specified
+  - Selects from healthy endpoints based on priority and latency
+  - Uses `pickBestLlmModel()` from storage repositories
 - **SSE Streaming for Responses API** - `/v1/responses` now supports proper Server-Sent Events streaming format compatible with Codex agent runtime
   - Events: `response.created`, `response.output_item.done`, `response.completed`
   - Content type uses `output_text` (Codex format) instead of `text`
@@ -20,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **Agent streaming compatibility** - Agent runtime now works correctly with Waypoint proxy (was failing with "stream closed before response.completed")
+- **Models API Codex compatibility** - `/v1/models` now includes both `data` (OpenAI) and `models` (Codex) fields
 
 ---
 

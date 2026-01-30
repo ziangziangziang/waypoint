@@ -317,6 +317,20 @@ export async function listModelsWithTypes(paths: StoragePaths): Promise<ModelWit
   return Array.from(models.values()).sort((a, b) => a.id.localeCompare(b.id));
 }
 
+/**
+ * Pick the best available LLM model based on endpoint priority and health.
+ * Returns the publicName of the first LLM model from the highest-priority healthy endpoint.
+ */
+export async function pickBestLlmModel(paths: StoragePaths): Promise<string | null> {
+  const endpoints = sortEndpointsForRouting(await listEligibleEndpoints(paths));
+  for (const endpoint of endpoints) {
+    if (endpoint.type === "llm" && endpoint.models.length > 0) {
+      return endpoint.models[0].publicName;
+    }
+  }
+  return null;
+}
+
 export async function logRequest(paths: StoragePaths, log: RequestLog): Promise<void> {
   await appendRequestLog(paths, log);
 }

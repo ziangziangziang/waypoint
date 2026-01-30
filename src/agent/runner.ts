@@ -18,6 +18,8 @@ import {
   ensureAgentDirs,
   verifyIsolation,
 } from "./config.js";
+import { pickBestLlmModel } from "../storage/repositories.js";
+import { resolveStoragePaths } from "../storage/files.js";
 
 export interface AgentRunOptions {
   /** User prompt to execute */
@@ -139,9 +141,19 @@ export class AgentRunner extends EventEmitter {
     // Build command arguments for the `exec` subcommand (non-interactive mode)
     const args: string[] = ["exec"];
 
-    // Add model if specified (--model is a direct flag)
-    if (model || this.config.defaultModel) {
-      args.push("--model", model || this.config.defaultModel!);
+    // Determine model: explicit > config > auto-pick from available endpoints
+    let selectedModel = model || this.config.defaultModel;
+    if (!selectedModel) {
+      const paths = resolveStoragePaths();
+      selectedModel = await pickBestLlmModel(paths) ?? undefined;
+      if (selectedModel) {
+        this.emit("model-selected", selectedModel);
+      }
+    }
+
+    // Add model if we have one
+    if (selectedModel) {
+      args.push("--model", selectedModel);
     }
 
     // Add approval policy and sandbox settings
