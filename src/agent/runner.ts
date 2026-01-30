@@ -270,6 +270,8 @@ export class AgentRunner extends EventEmitter {
   async runInteractive(options: {
     cwd?: string;
     model?: string;
+    approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
+    networkAccess?: boolean;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   } = {}): Promise<AgentResult> {
@@ -278,6 +280,8 @@ export class AgentRunner extends EventEmitter {
     const {
       cwd = this.config.workingDirectory,
       model,
+      approvalPolicy = this.config.approvalPolicy,
+      networkAccess = this.config.networkAccess,
       onStdout,
       onStderr,
     } = options;
@@ -302,6 +306,17 @@ export class AgentRunner extends EventEmitter {
     if (selectedModel) {
       args.push("--model", selectedModel);
     }
+
+    // Add approval policy and sandbox settings (same as exec mode)
+    if (approvalPolicy === "never") {
+      // Use --full-auto convenience flag for auto-approve + sandbox write
+      args.push("--full-auto");
+    } else if (approvalPolicy !== "on-request") {
+      // on-request is the default, only add flag for other policies
+      args.push("--ask-for-approval", approvalPolicy);
+    }
+
+    // Note: Network access control is handled via sandbox config, not a CLI flag
 
     return new Promise((resolve, reject) => {
       const codexBinary = this.getCodexBinaryPath();

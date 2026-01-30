@@ -612,17 +612,29 @@ program
   .command("agent")
   .description("Start the interactive agent CLI (like running 'codex')")
   .option("-m, --model <model>", "Model to use for the agent")
+  .option("--auto", "Auto-approve all actions (full-auto mode)")
+  .option("--no-network", "Disable network access in sandbox")
   .option("-d, --cwd <directory>", "Working directory for the agent")
   .action(async (options) => {
+    // Determine approval policy
+    let approvalPolicy: "untrusted" | "on-failure" | "on-request" | "never" = "on-request";
+    if (options.auto) {
+      approvalPolicy = "never";
+    }
+    
     const runner = new AgentRunner({
       defaultModel: options.model,
       workingDirectory: options.cwd || process.cwd(),
+      networkAccess: options.network !== false,
+      approvalPolicy,
     });
 
     try {
       const result = await runner.runInteractive({
         model: options.model,
         cwd: options.cwd,
+        approvalPolicy,
+        networkAccess: options.network !== false,
         onStdout: (data) => process.stdout.write(data),
         onStderr: (data) => process.stderr.write(data),
       });
