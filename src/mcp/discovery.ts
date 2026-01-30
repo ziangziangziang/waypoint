@@ -57,7 +57,8 @@ export async function discoverServerTools(
 
     return tools;
   } catch (error) {
-    console.error(`Failed to discover tools from ${server.name}:`, error);
+    const summary = formatDiscoveryError(error);
+    console.error(`Failed to discover tools from ${server.name}: ${summary}`);
     await updateMcpServerStatus(paths, server.id, "error");
     toolsCache.delete(server.id);
     return [];
@@ -85,6 +86,29 @@ export async function discoverAllTools(paths: StoragePaths): Promise<DiscoveredT
   }
 
   return allTools;
+}
+
+function formatDiscoveryError(error: unknown): string {
+  if (error instanceof McpError) {
+    return error.message;
+  }
+
+  const err = error as { message?: string; code?: string; cause?: unknown };
+  if (err?.code) {
+    return err.code;
+  }
+
+  const cause = err?.cause as { code?: string; message?: string } | undefined;
+  if (cause?.code) {
+    return cause.code;
+  }
+
+  const message = err?.message;
+  if (typeof message === "string" && message.trim().length > 0) {
+    return message;
+  }
+
+  return "unknown error";
 }
 
 /**

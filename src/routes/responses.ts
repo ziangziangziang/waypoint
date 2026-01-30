@@ -27,8 +27,15 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
       hasTools: !!body?.tools,
       toolCount: body?.tools?.length,
       stream: body?.stream,
-      inputType: typeof body?.input
+      inputType: typeof body?.input,
+      inputIsArray: Array.isArray(body?.input),
+      inputLength: Array.isArray(body?.input) ? body.input.length : (typeof body?.input === 'string' ? 1 : 0)
     });
+    
+    // Log first few input items for debugging multi-turn
+    if (Array.isArray(body?.input)) {
+      console.log("[responses] Input items:", JSON.stringify(body.input.slice(0, 5), null, 2).substring(0, 1000));
+    }
     
     if (!body?.model) {
       const fallback = await pickDefaultModel(paths);
@@ -47,6 +54,10 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
     // Transform to chat completions format
     const messages = transformToMessages(body);
     
+    // DEBUG: Log transformed messages for multi-turn debugging
+    console.log("[responses] Transformed messages count:", messages.length);
+    console.log("[responses] Messages:", JSON.stringify(messages.slice(0, 5), null, 2).substring(0, 2000));
+    
     // DEBUG: Log incoming tools
     if (body.tools) {
       console.log("[responses] Incoming tools:", JSON.stringify(body.tools).substring(0, 500));
@@ -59,14 +70,13 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
       console.log("[responses] Transformed tools:", JSON.stringify(transformedTools).substring(0, 500));
     }
     
-    // Track if client wants streaming - we'll convert the response to SSE format
+    // Track if client wants streaming
     const clientWantsStreaming = body.stream ?? false;
     
-    // Always fetch non-streaming from upstream, then convert to SSE if needed
     const chatPayload = {
       model: body.model,
       messages,
-      stream: false,
+      stream: clientWantsStreaming, // Pass through streaming preference
       temperature: body.temperature,
       max_tokens: body.max_tokens,
       tools: transformedTools,
@@ -89,24 +99,31 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
         controller.signal
       );
 
-      const upstreamBody = await readBody(outcome.attempt.response);
-      
-      // Transform response to Responses API format
-      const responsesFormat = transformToResponsesFormat(upstreamBody.payload, requestId);
-      
-      // If client wants streaming, send as proper SSE events (Codex format)
+      // Handle streaming response
       if (clientWantsStreaming) {
-        await sendAsSSE(reply, responsesFormat as ResponsesApiResponse);
+        await streamResponsesAPI(reply, outcome.attempt.response, requestId, body.model);
         await logRequest(paths, buildLog(
           requestId,
           body.model,
           outcome,
           Date.now() - start,
           true,
-          upstreamBody.totalTokens
+          0 // Token count not available in streaming
         ));
         return;
       }
+
+      // Non-streaming response
+      const upstreamBody = await readBody(outcome.attempt.response);
+      
+      // DEBUG: Log upstream response
+      console.log("[responses] Upstream response:", JSON.stringify(upstreamBody.payload).substring(0, 1500));
+      
+      // Transform response to Responses API format
+      const responsesFormat = transformToResponsesFormat(upstreamBody.payload, requestId);
+      
+      // DEBUG: Log transformed response
+      console.log("[responses] Transformed response:", JSON.stringify(responsesFormat).substring(0, 1000));
       
       setHeaders(reply, outcome.attempt.response.headers);
       reply.code(outcome.attempt.response.statusCode).send(responsesFormat);
@@ -140,8 +157,21 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
   });
 }
 
-function transformToMessages(body: ResponsesApiRequest): Array<{ role: string; content: string | unknown[] }> {
-  const messages: Array<{ role: string; content: string | unknown[] }> = [];
+/**
+ * Transform Codex Responses API input to OpenAI chat completions messages.
+ * 
+ * Codex sends a variety of item types:
+ * - { type: "message", role: "user/assistant/developer", content: [...] }
+ * - { type: "function_call", name: "...", arguments: "...", call_id: "..." }
+ * - { type: "function_call_output", call_id: "...", output: "..." }
+ * 
+ * OpenAI chat completions expects:
+ * - { role: "user/assistant/system", content: "..." }
+ * - Assistant messages can have tool_calls: [{ id, type: "function", function: { name, arguments } }]
+ * - { role: "tool", tool_call_id: "...", content: "..." }
+ */
+function transformToMessages(body: ResponsesApiRequest): Array<Record<string, unknown>> {
+  const messages: Array<Record<string, unknown>> = [];
   
   // Add system message from instructions if present
   if (body.instructions) {
@@ -152,14 +182,75 @@ function transformToMessages(body: ResponsesApiRequest): Array<{ role: string; c
   if (typeof body.input === "string") {
     messages.push({ role: "user", content: body.input });
   } else if (Array.isArray(body.input)) {
-    // Transform each message, fixing content part types
-    for (const msg of body.input) {
-      if (msg && typeof msg === "object" && "role" in msg && "content" in msg) {
-        const content = transformMessageContent(msg.content);
-        messages.push({ role: msg.role as string, content });
-      } else {
-        messages.push(msg);
+    // Process items, grouping consecutive function_calls into a single assistant message
+    let pendingToolCalls: Array<{ id: string; type: string; function: { name: string; arguments: string } }> = [];
+    
+    for (const item of body.input) {
+      if (!item || typeof item !== "object") continue;
+      
+      const itemObj = item as Record<string, unknown>;
+      const itemType = itemObj.type as string;
+      
+      // Handle function_call items - need to be grouped into an assistant message
+      if (itemType === "function_call") {
+        pendingToolCalls.push({
+          id: (itemObj.call_id as string) || (itemObj.id as string) || "",
+          type: "function",
+          function: {
+            name: itemObj.name as string,
+            arguments: itemObj.arguments as string
+          }
+        });
+        continue;
       }
+      
+      // Before processing other items, flush any pending tool calls
+      if (pendingToolCalls.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: null,
+          tool_calls: pendingToolCalls
+        });
+        pendingToolCalls = [];
+      }
+      
+      // Handle function_call_output items - become tool role messages
+      if (itemType === "function_call_output") {
+        messages.push({
+          role: "tool",
+          tool_call_id: itemObj.call_id as string,
+          content: typeof itemObj.output === "string" ? itemObj.output : JSON.stringify(itemObj.output)
+        });
+        continue;
+      }
+      
+      // Handle regular message items
+      if (itemType === "message" && "role" in itemObj && "content" in itemObj) {
+        const role = itemObj.role as string;
+        // Map developer role to system
+        const mappedRole = role === "developer" ? "system" : role;
+        const content = transformMessageContent(itemObj.content);
+        messages.push({ role: mappedRole, content });
+        continue;
+      }
+      
+      // Handle items with role/content directly (legacy format)
+      if ("role" in itemObj && "content" in itemObj) {
+        const role = itemObj.role as string;
+        const mappedRole = role === "developer" ? "system" : role;
+        const content = transformMessageContent(itemObj.content);
+        messages.push({ role: mappedRole, content });
+        continue;
+      }
+    }
+    
+    // Flush any remaining pending tool calls
+    if (pendingToolCalls.length > 0) {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: pendingToolCalls
+      });
     }
   }
   
@@ -168,7 +259,8 @@ function transformToMessages(body: ResponsesApiRequest): Array<{ role: string; c
 
 /**
  * Transform message content, fixing Codex content part types to OpenAI format.
- * Codex sends: { type: "input_text", text: "..." }
+ * Codex sends: { type: "input_text", text: "..." } for user messages
+ * Codex sends: { type: "output_text", text: "..." } for assistant messages
  * OpenAI expects: { type: "text", text: "..." }
  */
 function transformMessageContent(content: unknown): string | unknown[] {
@@ -180,8 +272,9 @@ function transformMessageContent(content: unknown): string | unknown[] {
     return content.map(part => {
       if (part && typeof part === "object") {
         const p = part as Record<string, unknown>;
-        // Fix Codex input_text → OpenAI text
-        if (p.type === "input_text") {
+        // Fix Codex input_text/output_text → OpenAI text
+        // Codex uses input_text for user messages, output_text for assistant messages
+        if (p.type === "input_text" || p.type === "output_text") {
           return { ...p, type: "text" };
         }
       }
@@ -330,6 +423,223 @@ function transformToResponsesFormat(chatResponse: unknown, requestId: string): R
       total_tokens: chat.usage.total_tokens ?? 0
     } : undefined
   };
+}
+
+/**
+ * Stream chat completions response and transform to Responses API SSE format.
+ * 
+ * This reads the upstream SSE stream (chat.completion.chunk format) and
+ * transforms it to Codex Responses API format in real-time.
+ */
+async function streamResponsesAPI(
+  reply: FastifyReply, 
+  upstreamResponse: { body: ReadableStream<Uint8Array> | NodeJS.ReadableStream | null },
+  requestId: string,
+  model: string
+): Promise<void> {
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive"
+  });
+
+  const sendEvent = (eventType: string, data: unknown) => {
+    reply.raw.write(`event: ${eventType}\n`);
+    reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  // Send response.created immediately
+  sendEvent("response.created", {
+    type: "response.created",
+    response: {
+      id: requestId,
+      object: "response",
+      created_at: Math.floor(Date.now() / 1000),
+      model,
+      output: [],
+      usage: null
+    }
+  });
+
+  // Accumulate content and tool calls for the final response
+  let accumulatedContent = "";
+  let accumulatedToolCalls: Array<{
+    id: string;
+    name: string;
+    arguments: string;
+  }> = [];
+  let usage: { input_tokens: number; output_tokens: number; total_tokens: number } | null = null;
+  let currentToolCallIndex = -1;
+
+  try {
+    const body = upstreamResponse.body;
+    if (!body) {
+      throw new Error("No response body");
+    }
+
+    // Convert to async iterable
+    const reader = 'getReader' in body 
+      ? body.getReader() 
+      : null;
+    
+    let buffer = "";
+    
+    const processChunk = (text: string) => {
+      buffer += text;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || ""; // Keep incomplete line in buffer
+      
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const data = line.slice(6).trim();
+          if (data === "[DONE]") {
+            continue;
+          }
+          try {
+            const chunk = JSON.parse(data);
+            const delta = chunk.choices?.[0]?.delta;
+            
+            if (delta) {
+              // Handle reasoning/thinking content delta
+              if (delta.reasoning_content || delta.reasoning) {
+                const reasoningDelta = delta.reasoning_content || delta.reasoning;
+                // Send reasoning delta event
+                sendEvent("response.reasoning_text.delta", {
+                  type: "response.reasoning_text.delta",
+                  output_index: 0,
+                  content_index: 0,
+                  delta: reasoningDelta
+                });
+              }
+              
+              // Handle content delta
+              if (delta.content) {
+                accumulatedContent += delta.content;
+                // Send content delta event
+                sendEvent("response.output_text.delta", {
+                  type: "response.output_text.delta",
+                  output_index: 0,
+                  content_index: 0,
+                  delta: delta.content
+                });
+              }
+              
+              // Handle tool calls delta
+              if (delta.tool_calls) {
+                for (const toolCallDelta of delta.tool_calls) {
+                  const idx = toolCallDelta.index;
+                  if (idx !== currentToolCallIndex) {
+                    currentToolCallIndex = idx;
+                    accumulatedToolCalls[idx] = {
+                      id: toolCallDelta.id || "",
+                      name: toolCallDelta.function?.name || "",
+                      arguments: ""
+                    };
+                  }
+                  if (toolCallDelta.id) {
+                    accumulatedToolCalls[idx].id = toolCallDelta.id;
+                  }
+                  if (toolCallDelta.function?.name) {
+                    accumulatedToolCalls[idx].name = toolCallDelta.function.name;
+                  }
+                  if (toolCallDelta.function?.arguments) {
+                    accumulatedToolCalls[idx].arguments += toolCallDelta.function.arguments;
+                  }
+                }
+              }
+            }
+            
+            // Capture usage from final chunk
+            if (chunk.usage) {
+              usage = {
+                input_tokens: chunk.usage.prompt_tokens ?? 0,
+                output_tokens: chunk.usage.completion_tokens ?? 0,
+                total_tokens: chunk.usage.total_tokens ?? 0
+              };
+            }
+          } catch (e) {
+            // Ignore parse errors for malformed chunks
+          }
+        }
+      }
+    };
+
+    if (reader) {
+      // Web Streams API (ReadableStream)
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        processChunk(decoder.decode(value, { stream: true }));
+      }
+    } else {
+      // Node.js stream
+      const nodeStream = body as NodeJS.ReadableStream;
+      for await (const chunk of nodeStream) {
+        processChunk(chunk.toString());
+      }
+    }
+
+    // Build final output
+    const output: ResponsesApiResponse["output"] = [];
+    
+    // Add tool calls first
+    for (const tc of accumulatedToolCalls) {
+      if (tc) {
+        output.push({
+          type: "function_call",
+          id: tc.id,
+          call_id: tc.id,
+          name: tc.name,
+          arguments: tc.arguments
+        });
+        // Send output_item.done for each tool call
+        sendEvent("response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: output.length - 1,
+          item: output[output.length - 1]
+        });
+      }
+    }
+    
+    // Add message content if any
+    if (accumulatedContent || output.length === 0) {
+      output.push({
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: accumulatedContent }]
+      });
+      // Send output_item.done for the message
+      sendEvent("response.output_item.done", {
+        type: "response.output_item.done",
+        output_index: output.length - 1,
+        item: output[output.length - 1]
+      });
+    }
+
+    // Send response.completed
+    sendEvent("response.completed", {
+      type: "response.completed",
+      response: {
+        id: requestId,
+        object: "response",
+        created_at: Math.floor(Date.now() / 1000),
+        model,
+        output,
+        usage
+      }
+    });
+
+  } catch (error) {
+    console.error("[responses] Streaming error:", error);
+    // Send error as part of the stream
+    sendEvent("error", {
+      type: "error",
+      error: { message: (error as Error).message }
+    });
+  }
+
+  reply.raw.end();
 }
 
 /**

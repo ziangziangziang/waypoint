@@ -131,6 +131,36 @@ waypoint add \
 | `POST /v1/audio/speech` | Text-to-speech |
 | `POST /v1/responses` | Responses API shim |
 
+### Responses API Shim
+
+The `/v1/responses` endpoint provides compatibility with the [Codex Responses API](https://platform.openai.com/docs/api-reference/responses) format, translating requests to standard chat completions internally. This enables Codex-based agents (like `codex-rs`) to work seamlessly through Waypoint.
+
+**Key Transformations:**
+
+| Codex Format | OpenAI Format | Notes |
+|--------------|---------------|-------|
+| `{ type: "input_text", text }` | `{ type: "text", text }` | User message content |
+| `{ type: "output_text", text }` | `{ type: "text", text }` | Assistant message content |
+| `{ type: "function_call", name, arguments, call_id }` | `tool_calls: [{ id, function: { name, arguments } }]` | Tool invocations |
+| `{ type: "function_call_output", call_id, output }` | `{ role: "tool", tool_call_id, content }` | Tool results |
+| `role: "developer"` | `role: "system"` | System instructions |
+
+**Streaming Format:**
+
+When `stream: true`, the endpoint returns Server-Sent Events in Codex format:
+- `response.created` — Initial response metadata
+- `response.output_text.delta` — Token-by-token content deltas
+- `response.reasoning_text.delta` — Reasoning deltas for thinking models
+- `response.output_item.done` — Complete output items (messages, tool calls)
+- `response.completed` — Final response with usage statistics
+
+**Why This Exists:**
+
+Codex-rs (the Rust-based agentic CLI) uses the Responses API format which differs from OpenAI's chat completions in subtle but important ways. Without this shim, multi-turn conversations with tool use would fail due to:
+1. Content type mismatches (`output_text` vs `text`)
+2. Function call format differences (flat items vs nested `tool_calls` array)
+3. Role mapping (`developer` → `system`)
+
 ## Admin Endpoints
 
 | Endpoint | Description |
