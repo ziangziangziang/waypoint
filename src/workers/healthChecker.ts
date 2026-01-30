@@ -13,20 +13,28 @@ export function startHealthChecker(paths: StoragePaths): void {
           const dispatcher = endpoint.insecureTls
             ? new Agent({ connect: { rejectUnauthorized: false } })
             : undefined;
+          const headers: Record<string, string> = {};
+          if (endpoint.apiKey) {
+            headers.authorization = `Bearer ${endpoint.apiKey}`;
+          }
           const response = await request(new URL("/v1/models", endpoint.baseUrl).toString(), {
             method: "GET",
-            headersTimeout: 2000,
-            bodyTimeout: 2000,
+            headers,
+            headersTimeout: 5000,
+            bodyTimeout: 5000,
             dispatcher
           });
           const latency = Date.now() - start;
           response.body.resume();
-          if (response.statusCode >= 200 && response.statusCode < 500) {
+          if (response.statusCode >= 200 && response.statusCode < 300) {
             await updateHealthCheck(paths, endpoint.id, "up", latency);
           } else {
+            console.log(`[health] ${endpoint.name}: DOWN (status ${response.statusCode})`);
             await updateHealthCheck(paths, endpoint.id, "down", null);
           }
-        } catch {
+        } catch (error) {
+          const errorCode = (error as NodeJS.ErrnoException).code ?? "UNKNOWN";
+          console.log(`[health] ${endpoint.name}: DOWN (${errorCode})`);
           await updateHealthCheck(paths, endpoint.id, "down", null);
         }
       })

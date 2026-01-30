@@ -63,6 +63,12 @@ export async function registerChatRoutes(app: FastifyInstance, paths: StoragePat
           errorMessage: (error as Error).message
         }
       });
+      // Don't try to send error if headers already sent (streaming started)
+      if (reply.raw.headersSent) {
+        req.log.warn({ err: error }, "Error after streaming started");
+        reply.raw.end();
+        return;
+      }
       const status = errorType === "no_endpoints" ? 400 : 502;
       reply.code(status).send({ error: { message: "Upstream unavailable" } });
     }

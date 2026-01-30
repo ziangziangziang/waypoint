@@ -22,6 +22,49 @@ const program = new Command();
 const paths = resolveStoragePaths();
 const pidFile = path.join(paths.baseDir, "waypoint.pid");
 
+/**
+ * Perform an on-demand health check for all endpoints.
+ * Updates health.json with fresh status before returning.
+ */
+async function refreshHealthStatus(): Promise<void> {
+  const endpoints = await listEndpoints(paths);
+  await Promise.all(
+    endpoints.map(async (endpoint) => {
+      const start = Date.now();
+      try {
+        const dispatcher = endpoint.insecureTls
+          ? new Agent({ connect: { rejectUnauthorized: false } })
+          : undefined;
+        const url = new URL("/v1/models", endpoint.baseUrl).toString();
+        const headers: Record<string, string> = {};
+        if (endpoint.apiKey) {
+          headers.authorization = `Bearer ${endpoint.apiKey}`;
+        }
+        const response = await request(url, {
+          method: "GET",
+          headers,
+          headersTimeout: 3000,
+          bodyTimeout: 3000,
+          dispatcher
+        });
+        const latency = Date.now() - start;
+        response.body.resume();
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          await updateHealthCheck(paths, endpoint.id, "up", latency);
+          console.log(`✓ ${endpoint.name}: UP (${response.statusCode}, ${latency}ms)`);
+        } else {
+          await updateHealthCheck(paths, endpoint.id, "down", null);
+          console.log(`✗ ${endpoint.name}: DOWN (status ${response.statusCode})`);
+        }
+      } catch (error) {
+        await updateHealthCheck(paths, endpoint.id, "down", null);
+        const errorMsg = (error as Error).message || "unknown error";
+        console.log(`✗ ${endpoint.name}: DOWN (${errorMsg})`);
+      }
+    })
+  );
+}
+
 program
   .name("waypoint")
   .description("Waypoint admin CLI")
@@ -61,8 +104,13 @@ program
 
 program
   .command("ls")
-  .action(async () => {
+  .option("--no-check", "Skip health check for faster listing")
+  .action(async (options) => {
     await ensureStorageDir(paths);
+    // Refresh health status unless --no-check is specified
+    if (options.check !== false) {
+      await refreshHealthStatus();
+    }
     const endpoints = await listEndpoints(paths);
     if (endpoints.length === 0) {
       console.log("No endpoints found.");
@@ -149,17 +197,65 @@ program
           const dispatcher = endpoint.insecureTls
             ? new Agent({ connect: { rejectUnauthorized: false } })
             : undefined;
+          const headers: Record<string, string> = {};
+          if (endpoint.apiKey) {
+            headers.authorization = `Bearer ${endpoint.apiKey}`;
+          }
           const response = await request(new URL("/v1/models", endpoint.baseUrl).toString(), {
             method: "GET",
+            headers,
             headersTimeout: 3000,
             bodyTimeout: 3000,
             dispatcher
           });
           response.body.resume();
           const latency = Date.now() - start;
-          const status = response.statusCode >= 200 && response.statusCode < 500 ? "up" : "down";
+          const status = response.statusCode >= 200 && response.statusCode < 300 ? "up" : "down";
           await updateHealthCheck(paths, endpoint.id, status, status === "up" ? latency : null);
-          return { name: endpoint.name, status, latencyMs: latency };
+          return { name: endpoint.name, status, statusCode: response.statusCode, latencyMs: latency };
+        } catch (error) {
+          await updateHealthCheck(paths, endpoint.id, "down", null);
+          return { name: endpoint.name, status: "down", error: (error as Error).message };
+        }
+      })
+    );
+    console.table(results);
+  });
+
+// Alias: waypoint status -> waypoint stat
+program
+  .command("status")
+  .description("Alias for 'stat' - Run a health check against each endpoint")
+  .action(async () => {
+    await ensureStorageDir(paths);
+    const endpoints = await listEndpoints(paths);
+    if (endpoints.length === 0) {
+      console.log("No endpoints found.");
+      return;
+    }
+    const results = await Promise.all(
+      endpoints.map(async (endpoint) => {
+        const start = Date.now();
+        try {
+          const dispatcher = endpoint.insecureTls
+            ? new Agent({ connect: { rejectUnauthorized: false } })
+            : undefined;
+          const headers: Record<string, string> = {};
+          if (endpoint.apiKey) {
+            headers.authorization = `Bearer ${endpoint.apiKey}`;
+          }
+          const response = await request(new URL("/v1/models", endpoint.baseUrl).toString(), {
+            method: "GET",
+            headers,
+            headersTimeout: 3000,
+            bodyTimeout: 3000,
+            dispatcher
+          });
+          response.body.resume();
+          const latency = Date.now() - start;
+          const status = response.statusCode >= 200 && response.statusCode < 300 ? "up" : "down";
+          await updateHealthCheck(paths, endpoint.id, status, status === "up" ? latency : null);
+          return { name: endpoint.name, status, statusCode: response.statusCode, latencyMs: latency };
         } catch (error) {
           await updateHealthCheck(paths, endpoint.id, "down", null);
           return { name: endpoint.name, status: "down", error: (error as Error).message };

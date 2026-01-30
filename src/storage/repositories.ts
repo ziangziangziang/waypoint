@@ -299,9 +299,10 @@ export interface ModelWithType {
 }
 
 export async function listModelsWithTypes(paths: StoragePaths): Promise<ModelWithType[]> {
-  const config = normalizeConfig(await loadConfig(paths)).config;
+  // Get endpoints with health status to filter out unhealthy ones
+  const endpoints = await listEligibleEndpoints(paths);
   const models = new Map<string, ModelWithType>();
-  for (const endpoint of config.endpoints) {
+  for (const endpoint of endpoints) {
     for (const model of endpoint.models) {
       // First endpoint wins (in case model is on multiple endpoints)
       if (!models.has(model.publicName)) {

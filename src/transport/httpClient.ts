@@ -46,13 +46,26 @@ export function classifyUpstreamError(error: unknown): UpstreamError {
   if (error instanceof Error) {
     const err = error as UpstreamError;
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "ETIMEDOUT") {
+    // Connection errors
+    if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "ETIMEDOUT" || code === "ENOTFOUND") {
       err.type = "connection";
+      err.retryable = true;
+      return err;
+    }
+    // Undici timeout errors
+    if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
+      err.type = "timeout";
       err.retryable = true;
       return err;
     }
     if (err.name === "AbortError") {
       err.type = "timeout";
+      err.retryable = true;
+      return err;
+    }
+    // Socket/stream errors during transfer
+    if (code === "ERR_STREAM_PREMATURE_CLOSE" || code === "EPIPE" || code === "ECONNABORTED") {
+      err.type = "stream_error";
       err.retryable = true;
       return err;
     }
