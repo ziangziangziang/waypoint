@@ -1,0 +1,40 @@
+scenarios:
+  - id: custom-chat-short
+    mode: chat
+    prompt: "Reply with WAYPOINT_CUSTOM_OK"
+    assertions:
+      contains: "WAYPOINT_CUSTOM_OK"
+      statusCode: 200
+
+  - id: custom-agent-tools
+    mode: agent
+    prompt: "If tools are available, call one and summarize with prefix WAYPOINT_AGENT_DONE:"
+    maxIterations: 5
+    assertions:
+      contains: "WAYPOINT_AGENT_DONE"
+      statusCode: 200
+
+  - id: custom-embeddings
+    mode: embeddings
+    input:
+      - "waypoint"
+      - "benchmark"
+    assertions:
+      minItems: 2
+      minVectorLength: 1
+      statusCode: 200
+
+  - id: custom-image
+    mode: image_generation
+    prompt: "A clean neon gateway symbol"
+    assertions:
+      minImages: 1
+      statusCode: 200
+
+  - id: custom-tts
+    mode: audio_speech
+    inputText: "Waypoint benchmark audio"
+    voice: "alloy"
+    assertions:
+      minBytes: 1
+      statusCode: 200

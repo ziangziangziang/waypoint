@@ -30,49 +30,97 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return response.json();
 }
 
-// ========================================
-// Endpoints API
-// ========================================
-
-export interface EndpointHealth {
-  status: 'up' | 'down';
-  lastCheckedAt?: string;
-  lastSuccessAt?: string;
-  lastFailureAt?: string;
-  consecutiveFailures: number;
-  downUntil?: string;
-  latencyMsEwma?: number;
+export interface AdminMeta {
+  name: string;
+  version: string;
+  now: string;
 }
 
-export interface ModelMapping {
-  publicName: string;
+export async function getAdminMeta(): Promise<AdminMeta> {
+  const response = await fetch(`${API_BASE}/admin/meta`);
+  return handleResponse<AdminMeta>(response);
+}
+
+// ========================================
+// Providers API
+// ========================================
+
+export interface ProviderModel {
+  providerModelId: string;
+  providerId: string;
+  modelId: string;
   upstreamModel: string;
+  baseUrl?: string;
+  apiKey?: string;
+  insecureTls?: boolean;
+  enabled?: boolean;
+  aliases?: string[];
+  free: boolean;
+  modalities: string[];
+  capabilities: ModelCapabilities;
+  endpointType: EndpointType;
+  benchmark?: {
+    livebench?: number;
+  };
 }
 
-export interface Endpoint {
+export interface Provider {
   id: string;
   name: string;
+  description?: string;
+  protocol: string;
+  protocolRaw?: string;
   baseUrl: string;
+  enabled: boolean;
+  supportsRouting: boolean;
   apiKey?: string;
-  insecureTls: boolean;
-  priority: number;
-  weight?: number;
-  type: 'llm' | 'diffusion' | 'audio' | 'embedding';
-  models: ModelMapping[];
-  health: EndpointHealth;
-  limits?: { timeoutMs?: number; maxConcurrent?: number };
-  createdAt: string;
-  updatedAt: string;
+  models: ProviderModel[];
 }
 
-export async function listEndpoints(): Promise<Endpoint[]> {
-  const response = await fetch(`${API_BASE}/admin/endpoints`);
-  return handleResponse<Endpoint[]>(response);
+export async function listProviders(): Promise<Provider[]> {
+  const response = await fetch(`${API_BASE}/admin/providers`);
+  return handleResponse<Provider[]>(response);
 }
 
-export async function getEndpointHealth(): Promise<Record<string, EndpointHealth>> {
-  const response = await fetch(`${API_BASE}/admin/health`);
-  return handleResponse<Record<string, EndpointHealth>>(response);
+export async function listProviderModels(providerId: string): Promise<ProviderModel[]> {
+  const response = await fetch(`${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/models`);
+  return handleResponse<ProviderModel[]>(response);
+}
+
+export async function addProviderModel(
+  providerId: string,
+  payload: Partial<ProviderModel>
+): Promise<ProviderModel> {
+  const response = await fetch(`${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/models`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<ProviderModel>(response);
+}
+
+export async function updateProviderModel(
+  providerId: string,
+  modelRef: string,
+  payload: Partial<ProviderModel>
+): Promise<ProviderModel> {
+  const response = await fetch(
+    `${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelRef)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }
+  );
+  return handleResponse<ProviderModel>(response);
+}
+
+export async function deleteProviderModel(providerId: string, modelRef: string): Promise<{ deleted: string }> {
+  const response = await fetch(
+    `${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelRef)}`,
+    { method: 'DELETE' }
+  );
+  return handleResponse<{ deleted: string }>(response);
 }
 
 // ========================================
@@ -80,6 +128,15 @@ export async function getEndpointHealth(): Promise<Record<string, EndpointHealth
 // ========================================
 
 export type EndpointType = 'llm' | 'diffusion' | 'audio' | 'embedding';
+export type ModelModality = 'text' | 'image' | 'audio' | 'embedding';
+
+export interface ModelCapabilities {
+  input: ModelModality[];
+  output: ModelModality[];
+  supportsTools?: boolean;
+  supportsStreaming?: boolean;
+  source?: 'configured' | 'inferred';
+}
 
 export interface Model {
   id: string;
@@ -87,6 +144,13 @@ export interface Model {
   created?: number;
   owned_by?: string;
   endpoint_type?: EndpointType;
+  capabilities?: ModelCapabilities;
+  waypoint_pool?: {
+    id: string;
+    strategy: string;
+    candidateCount: number;
+    scoreSource: string;
+  };
 }
 
 export interface ModelsResponse {
@@ -161,6 +225,8 @@ export async function getTokenUsage(window: string = '7d'): Promise<TokenUsage> 
 export type ContentPart = 
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'input_audio'; input_audio: { url?: string; data?: string; format?: string } }
+  | { type: 'audio'; audio: { url?: string; data?: string; format?: string } }
 
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -203,6 +269,30 @@ export interface ChatCompletionResponse {
   };
 }
 
+export interface ChatCompletionRawResponse {
+  id?: string;
+  object?: string;
+  created?: number;
+  model?: string;
+  choices?: Array<{
+    index?: number;
+    finish_reason?: string | null;
+    message?: {
+      role?: string;
+      content?: string | ContentPart[] | null;
+      audio?: { url?: string; data?: string; format?: string };
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+  [key: string]: unknown;
+}
+
 export async function createChatCompletion(
   request: ChatCompletionRequest
 ): Promise<ChatCompletionResponse> {
@@ -214,13 +304,30 @@ export async function createChatCompletion(
   return handleResponse<ChatCompletionResponse>(response);
 }
 
+export async function createChatCompletionRaw(
+  request: ChatCompletionRequest
+): Promise<ChatCompletionRawResponse> {
+  const response = await fetch(`${API_BASE}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...request, stream: false }),
+  });
+  return handleResponse<ChatCompletionRawResponse>(response);
+}
+
+export interface StreamChunk {
+  content: string;
+  reasoning?: string;
+}
+
 /**
  * Stream chat completion using Server-Sent Events
+ * Yields chunks containing both content and optional reasoning content
  */
 export async function* streamChatCompletion(
   request: ChatCompletionRequest,
   signal?: AbortSignal
-): AsyncGenerator<string, void, unknown> {
+): AsyncGenerator<StreamChunk, void, unknown> {
   const response = await fetch(`${API_BASE}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -250,12 +357,19 @@ export async function* streamChatCompletion(
       if (line.startsWith('data: ')) {
         const data = line.slice(6);
         if (data === '[DONE]') return;
-        
+
         try {
           const parsed = JSON.parse(data);
-          const content = parsed.choices?.[0]?.delta?.content;
-          if (content) {
-            yield content;
+          const delta = parsed.choices?.[0]?.delta;
+          const content = delta?.content;
+          // Support both reasoning_content (DeepSeek) and reasoning (other providers)
+          const reasoning = delta?.reasoning_content || delta?.reasoning;
+
+          if (content || reasoning) {
+            yield {
+              content: content || '',
+              reasoning: reasoning || undefined,
+            };
           }
         } catch {
           // Skip malformed JSON
@@ -315,13 +429,18 @@ export interface ChatSessionMessage {
     arguments: string;
     result?: string;
   }>;
-  timestamp: string;
+  // New API uses createdAt; timestamp is preserved for legacy payloads.
+  timestamp?: string;
+  createdAt?: string;
 }
 
 export interface ChatSession {
   id: string;
   name: string;
   model?: string;
+  titleStatus?: 'pending' | 'generated' | 'manual' | 'failed';
+  titleUpdatedAt?: string;
+  storageVersion?: number;
   messages: ChatSessionMessage[];
   createdAt: string;
   updatedAt: string;
@@ -331,6 +450,9 @@ export interface SessionListItem {
   id: string;
   name: string;
   model?: string;
+  titleStatus?: 'pending' | 'generated' | 'manual' | 'failed';
+  titleUpdatedAt?: string;
+  storageVersion?: number;
   messageCount: number;
   createdAt: string;
   updatedAt: string;
@@ -348,7 +470,11 @@ export async function listSessions(): Promise<SessionsListResponse> {
 
 export async function getSession(sessionId: string): Promise<ChatSession> {
   const response = await fetch(`${API_BASE}/admin/sessions/${sessionId}`);
-  return handleResponse<ChatSession>(response);
+  const session = await handleResponse<ChatSession>(response);
+  return {
+    ...session,
+    messages: session.messages.map(normalizeSessionMessageMedia),
+  };
 }
 
 export async function createSession(name?: string, model?: string): Promise<ChatSession> {
@@ -372,6 +498,32 @@ export async function updateSession(
   return handleResponse<ChatSession>(response);
 }
 
+export async function autoTitleSession(
+  sessionId: string,
+  payload: { model?: string; seedText?: string }
+): Promise<{
+  id: string;
+  name: string;
+  titleStatus?: 'pending' | 'generated' | 'manual' | 'failed';
+  titleUpdatedAt?: string;
+  generated: boolean;
+  model?: string;
+}> {
+  const response = await fetch(`${API_BASE}/admin/sessions/${sessionId}/auto-title`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<{
+    id: string;
+    name: string;
+    titleStatus?: 'pending' | 'generated' | 'manual' | 'failed';
+    titleUpdatedAt?: string;
+    generated: boolean;
+    model?: string;
+  }>(response);
+}
+
 export async function deleteSession(sessionId: string): Promise<void> {
   const response = await fetch(`${API_BASE}/admin/sessions/${sessionId}`, {
     method: 'DELETE',
@@ -384,13 +536,13 @@ export async function deleteSession(sessionId: string): Promise<void> {
 export async function addMessageToSession(
   sessionId: string,
   message: ChatSessionMessage
-): Promise<{ messageIndex: number }> {
+): Promise<{ messageId?: string; createdAt?: string }> {
   const response = await fetch(`${API_BASE}/admin/sessions/${sessionId}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(message),
   });
-  return handleResponse<{ messageIndex: number }>(response);
+  return handleResponse<{ messageId?: string; createdAt?: string }>(response);
 }
 
 export async function appendMessageContent(
@@ -419,25 +571,100 @@ export interface ImageCacheStats {
   newestEntry?: string;
 }
 
+export type MediaCacheStats = ImageCacheStats;
+
 export async function getImageCacheStats(): Promise<ImageCacheStats> {
   const response = await fetch(`${API_BASE}/admin/images/stats`);
   return handleResponse<ImageCacheStats>(response);
+}
+
+export async function getMediaCacheStats(): Promise<MediaCacheStats> {
+  const response = await fetch(`${API_BASE}/admin/media/stats`);
+  return handleResponse<MediaCacheStats>(response);
 }
 
 export function getCachedImageUrl(hash: string): string {
   return `${API_BASE}/admin/images/${hash}`;
 }
 
+export function resolveMediaUrl(hashOrUrl: string): string {
+  const value = hashOrUrl.trim();
+  if (value.length === 0) {
+    return value;
+  }
+  if (/^https?:\/\//i.test(value) || /^data:/i.test(value) || value.startsWith('/')) {
+    return value;
+  }
+  if (value.startsWith('admin/')) {
+    return `${API_BASE}/${value}`;
+  }
+  if (value.startsWith('media/')) {
+    return `${API_BASE}/admin/${value}`;
+  }
+  if (value.startsWith('images/')) {
+    return `${API_BASE}/admin/${value}`;
+  }
+  return `${API_BASE}/admin/media/${value}`;
+}
+
+export function normalizeSessionMessageMedia(message: ChatSessionMessage): ChatSessionMessage {
+  const normalizedContent = normalizeContentMedia(message.content);
+  const normalizedImages = message.images?.map(resolveMediaUrl);
+  return {
+    ...message,
+    content: normalizedContent,
+    images: normalizedImages,
+  };
+}
+
+export function normalizeContentMedia(
+  content: string | ContentPart[] | null
+): string | ContentPart[] | null {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  return content.map((part) => {
+    if (part.type === 'image_url') {
+      return {
+        ...part,
+        image_url: { ...part.image_url, url: resolveMediaUrl(part.image_url.url) },
+      };
+    }
+    if (part.type === 'input_audio' && part.input_audio?.url) {
+      return {
+        ...part,
+        input_audio: { ...part.input_audio, url: resolveMediaUrl(part.input_audio.url) },
+      };
+    }
+    if (part.type === 'audio' && part.audio?.url) {
+      return {
+        ...part,
+        audio: { ...part.audio, url: resolveMediaUrl(part.audio.url) },
+      };
+    }
+    return part;
+  });
+}
+
+export async function storeMedia(
+  data: string,
+  model?: string,
+  mimeType?: string
+): Promise<{ hash: string; url: string; mimeType?: string; evicted: string[] }> {
+  const response = await fetch(`${API_BASE}/admin/media`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data, model, mimeType }),
+  });
+  return handleResponse<{ hash: string; url: string; mimeType?: string; evicted: string[] }>(response);
+}
+
 export async function storeImage(
   data: string, 
   model?: string
 ): Promise<{ hash: string; url: string; evicted: string[] }> {
-  const response = await fetch(`${API_BASE}/admin/images`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ data, model }),
-  });
-  return handleResponse<{ hash: string; url: string; evicted: string[] }>(response);
+  const result = await storeMedia(data, model);
+  return { hash: result.hash, url: result.url, evicted: result.evicted };
 }
 
 export async function clearImageCache(): Promise<{ deleted: number }> {
@@ -445,6 +672,102 @@ export async function clearImageCache(): Promise<{ deleted: number }> {
     method: 'DELETE',
   });
   return handleResponse<{ deleted: number }>(response);
+}
+
+export interface BenchmarkRunSummary {
+  id: string;
+  status: 'running' | 'completed' | 'failed';
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  suite?: string;
+  profile?: string;
+  scenarioPath?: string;
+  succeeded?: number;
+  failed?: number;
+  successRate?: number;
+  artifactPath?: string;
+}
+
+export interface BenchmarkRunEvent {
+  type: string;
+  timestamp: string;
+  runId?: string;
+  scenarioId?: string;
+  scenarioIndex?: number;
+  totalScenarios?: number;
+  runIndex?: number;
+  totalRuns?: number;
+  phase?: 'warmup' | 'measured';
+  warning?: string;
+  summary?: {
+    total: number;
+    executed: number;
+    succeeded: number;
+    failed: number;
+    successRate: number;
+  };
+  exchange?: {
+    mode: string;
+    model: string;
+    requestPath: string;
+    statusCode: number;
+    contentType: string;
+    requestRaw: unknown;
+    requestSanitized: unknown;
+    responseRaw: unknown;
+    responseSanitized: unknown;
+  };
+}
+
+export interface BenchmarkRunRecord extends BenchmarkRunSummary {
+  request?: {
+    suite?: string;
+    scenarioPath?: string;
+    modelOverride?: string;
+    outPath?: string;
+    configPath?: string;
+    profile?: string;
+    baselinePath?: string;
+  };
+  progress?: {
+    totalScenarios: number;
+    completedScenarios: number;
+    currentScenarioId?: string;
+    currentScenarioIndex?: number;
+    currentRunIndex?: number;
+    totalRuns?: number;
+    phase?: 'warmup' | 'measured';
+  };
+  report?: unknown;
+  events?: BenchmarkRunEvent[];
+  error?: string;
+}
+
+export async function startBenchmarkRun(payload: {
+  suite?: string;
+  scenarioPath?: string;
+  modelOverride?: string;
+  configPath?: string;
+  profile?: string;
+  baselinePath?: string;
+}): Promise<BenchmarkRunRecord> {
+  const response = await fetch(`${API_BASE}/admin/benchmarks/runs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<BenchmarkRunRecord>(response);
+}
+
+export async function listBenchmarkRuns(): Promise<{ object: 'list'; data: BenchmarkRunSummary[] }> {
+  const response = await fetch(`${API_BASE}/admin/benchmarks/runs`);
+  return handleResponse<{ object: 'list'; data: BenchmarkRunSummary[] }>(response);
+}
+
+export async function getBenchmarkRun(runId: string): Promise<BenchmarkRunRecord> {
+  const response = await fetch(`${API_BASE}/admin/benchmarks/runs/${encodeURIComponent(runId)}`);
+  return handleResponse<BenchmarkRunRecord>(response);
 }
 
 // ========================================

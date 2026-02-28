@@ -1,36 +1,71 @@
-import { useState } from 'react'
-import { Settings as SettingsIcon, ExternalLink, Image as ImageIcon, Check } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Settings as SettingsIcon, ExternalLink, Image as ImageIcon, Check, Server, Code2, ChevronDown, ChevronUp } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { 
-  loadSettings, 
-  updateSetting, 
-  IMAGE_SIZE_OPTIONS, 
+import { EndpointUsageGuide } from '@/components/EndpointUsageGuide'
+import {
+  getAdminMeta,
+  listProviders,
+  type Provider,
+} from '@/api/client'
+import {
+  loadSettings,
+  updateSetting,
+  IMAGE_SIZE_OPTIONS,
   type ImageSize,
-  type UserSettings 
+  type UserSettings
 } from '@/stores/settings'
 
 export function Settings() {
   const [settings, setSettings] = useState<UserSettings>(loadSettings)
-  
+  const [providers, setProviders] = useState<Provider[]>([])
+  const [version, setVersion] = useState<string>('0.0.0')
+  const [providersExpanded, setProvidersExpanded] = useState(false)
+  const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set())
+
   const handleImageSizeChange = (size: ImageSize) => {
     const updated = updateSetting('defaultImageSize', size)
     setSettings(updated)
   }
 
+  useEffect(() => {
+    async function loadData() {
+      try {
+        const [providerData, meta] = await Promise.all([
+          listProviders(),
+          getAdminMeta(),
+        ])
+        setProviders(providerData)
+        setVersion(meta.version)
+      } catch (error) {
+        console.error('Failed to load settings metadata:', error)
+      }
+    }
+    void loadData()
+  }, [])
+
+  const toggleProvider = (providerId: string) => {
+    setExpandedProviders((previous) => {
+      const next = new Set(previous)
+      if (next.has(providerId)) {
+        next.delete(providerId)
+      } else {
+        next.add(providerId)
+      }
+      return next
+    })
+  }
+
   return (
-    <div className="flex-1 flex flex-col h-screen">
-      {/* Header */}
-      <header className="h-14 border-b border-border flex items-center px-6 gap-4 shrink-0">
+    <div className="flex-1 flex flex-col h-screen min-h-0">
+      <header className="sticky top-0 z-20 h-14 border-b border-border bg-background/95 backdrop-blur flex items-center px-6 gap-4 shrink-0">
         <div className="flex items-center gap-2">
           <SettingsIcon className="w-4 h-4 text-primary" />
           <h2 className="font-mono font-semibold text-sm uppercase tracking-wider">Settings</h2>
         </div>
       </header>
 
-      {/* Content */}
-      <div className="flex-1 p-6 overflow-auto">
-        <div className="max-w-2xl space-y-6">
-          {/* Image Generation Settings */}
+      <div className="flex-1 min-h-0 p-6 overflow-auto">
+        <div className="max-w-4xl space-y-6">
           <div className="panel">
             <div className="panel-header">
               <ImageIcon className="w-4 h-4 text-muted-foreground" />
@@ -68,77 +103,137 @@ export function Settings() {
             </div>
           </div>
 
-          {/* Info Panel */}
+          <div className="panel">
+            <div className="panel-header">
+              <Server className="w-4 h-4 text-muted-foreground" />
+              <span className="panel-title">Providers & Models</span>
+              <span className="text-2xs text-muted-foreground ml-auto">{providers.length} providers</span>
+            </div>
+            <button
+              onClick={() => setProvidersExpanded((value) => !value)}
+              className="w-full px-4 py-3 border-t border-border flex items-center gap-2 text-sm hover:bg-secondary/40 transition-colors"
+            >
+              <span>Show model breakdown and usage examples</span>
+              <span className="ml-auto text-2xs text-muted-foreground">
+                {providers.reduce((count, provider) => count + provider.models.filter((model) => model.enabled !== false).length, 0)} enabled models
+              </span>
+              {providersExpanded ? (
+                <ChevronUp className="w-4 h-4 text-muted-foreground" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-muted-foreground" />
+              )}
+            </button>
+            {providersExpanded && (
+              <div className="divide-y divide-border">
+                {providers.length === 0 && (
+                  <div className="p-6 text-center text-muted-foreground text-sm">
+                    No providers configured.
+                  </div>
+                )}
+                {providers.map((provider) => {
+                  const enabledModels = provider.models.filter((model) => model.enabled !== false)
+                  const isOpen = expandedProviders.has(provider.id)
+                  return (
+                    <div key={provider.id} className="p-4 space-y-3">
+                      <button
+                        onClick={() => toggleProvider(provider.id)}
+                        className="w-full flex items-center gap-3 text-left rounded-md p-1 hover:bg-secondary/40 transition-colors"
+                      >
+                        <div className={cn('status-dot', provider.enabled ? 'status-dot-live' : 'status-dot-down')} />
+                        <div className="flex-1 min-w-0">
+                          <p className="font-medium text-sm">{provider.id}</p>
+                          <p className="text-2xs text-muted-foreground truncate font-mono">{provider.baseUrl}</p>
+                        </div>
+                        <span className="text-2xs text-muted-foreground font-mono">
+                          {enabledModels.length}/{provider.models.length}
+                        </span>
+                        {isOpen ? (
+                          <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                        )}
+                      </button>
+
+                      {isOpen && (
+                        <div className="space-y-2">
+                          {enabledModels.length === 0 && (
+                            <p className="text-xs text-muted-foreground">No enabled models in this provider.</p>
+                          )}
+                          {enabledModels.map((model) => {
+                            const canonical = `${provider.id}/${model.modelId}`
+                            return (
+                              <div key={model.providerModelId} className="border border-border/70 rounded-md">
+                                <div className="px-3 py-2 flex items-center gap-2">
+                                  <Code2 className="w-3.5 h-3.5 text-muted-foreground" />
+                                  <p className="text-xs font-mono">{canonical}</p>
+                                  <span className="ml-auto text-2xs uppercase text-muted-foreground">{model.endpointType}</span>
+                                </div>
+                                <EndpointUsageGuide
+                                  target={{
+                                    id: model.providerModelId,
+                                    type: model.endpointType,
+                                    models: [
+                                      { publicName: canonical },
+                                      ...(model.aliases ?? []).map((alias) => ({ publicName: alias })),
+                                    ],
+                                  }}
+                                />
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
           <div className="panel">
             <div className="panel-header">
               <span className="panel-title">About Waypoint</span>
             </div>
             <div className="p-4 space-y-4">
               <p className="text-sm text-muted-foreground">
-                Waypoint is a local reverse proxy for LLM endpoints. It provides a unified 
-                OpenAI-compatible API for multiple backends, with automatic failover, 
-                health monitoring, and request statistics.
+                Waypoint is a provider-first local AI gateway. It provides an OpenAI-compatible
+                API over multiple providers/models, with routing, failover, and observability.
               </p>
-              
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <p className="text-2xs font-mono uppercase text-muted-foreground">Version</p>
-                  <p className="font-mono">0.2.0</p>
+                  <p className="font-mono">{version}</p>
                 </div>
                 <div>
                   <p className="text-2xs font-mono uppercase text-muted-foreground">Config Path</p>
-                  <p className="font-mono text-sm truncate">~/.config/waypoint/config.yaml</p>
+                  <p className="font-mono text-sm truncate">~/.config/waypoint/providers.json</p>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* CLI Commands */}
           <div className="panel">
             <div className="panel-header">
               <span className="panel-title">CLI Commands</span>
             </div>
             <div className="p-4 space-y-3">
-              <CommandRow 
-                command="waypoint add" 
-                description="Add a new endpoint" 
-              />
-              <CommandRow 
-                command="waypoint ls" 
-                description="List all endpoints" 
-              />
-              <CommandRow 
-                command="waypoint rm <name>" 
-                description="Remove an endpoint" 
-              />
-              <CommandRow 
-                command="waypoint edit" 
-                description="Edit config in $EDITOR" 
-              />
-              <CommandRow 
-                command="waypoint stat" 
-                description="Check endpoint health" 
-              />
-              <CommandRow 
-                command="waypoint service start" 
-                description="Start background service" 
-              />
-              <CommandRow 
-                command="waypoint service stop" 
-                description="Stop background service" 
-              />
+              <CommandRow command="waypoint provider import -f .env" description="Import providers and credentials" />
+              <CommandRow command="waypoint provider ls" description="List providers" />
+              <CommandRow command="waypoint provider model ls <providerId>" description="List models in one provider" />
+              <CommandRow command="waypoint provider model add <providerId> ..." description="Add a provider-owned model" />
+              <CommandRow command="waypoint provider model update <providerId> <modelRef>" description="Update model routing/capabilities/auth" />
+              <CommandRow command="waypoint bench" description="Run lightweight benchmark suite" />
             </div>
           </div>
 
-          {/* Links */}
           <div className="panel">
             <div className="panel-header">
               <span className="panel-title">Resources</span>
             </div>
             <div className="p-4 space-y-2">
-              <a 
+              <a
                 href="https://github.com/ziangziangziang/waypoint"
-                target="_blank" 
+                target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-2 text-sm text-primary hover:underline"
               >

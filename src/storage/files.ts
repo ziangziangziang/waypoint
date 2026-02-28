@@ -3,7 +3,7 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 import YAML from "yaml";
-import { EndpointDoc, EndpointHealth, RequestLog } from "../types";
+import { EndpointDoc, EndpointHealth, ProviderModelHealth, RequestLog } from "../types";
 
 export interface ConfigFile {
   endpoints: Array<Omit<EndpointDoc, "health">>;
@@ -15,11 +15,19 @@ export interface HealthFile {
   endpoints: Record<string, EndpointHealth>;
 }
 
+export interface ProviderHealthFile {
+  models: Record<string, ProviderModelHealth>;
+}
+
 export interface StoragePaths {
   baseDir: string;
   configPath: string;
   healthPath: string;
+  providerHealthPath: string;
   requestLogPath: string;
+  providersPath: string;
+  poolsPath: string;
+  poolStatePath: string;
 }
 
 export function resolveStoragePaths(): StoragePaths {
@@ -29,7 +37,11 @@ export function resolveStoragePaths(): StoragePaths {
     baseDir,
     configPath,
     healthPath: path.join(baseDir, "health.json"),
-    requestLogPath: path.join(baseDir, "request_logs.jsonl")
+    providerHealthPath: path.join(baseDir, "providers_health.json"),
+    requestLogPath: path.join(baseDir, "request_logs.jsonl"),
+    providersPath: path.join(baseDir, "providers.json"),
+    poolsPath: path.join(baseDir, "pools.json"),
+    poolStatePath: path.join(baseDir, "pool_state.json"),
   };
 }
 
@@ -80,6 +92,47 @@ export async function saveHealth(paths: StoragePaths, health: HealthFile): Promi
   await writeAtomic(paths.healthPath, JSON.stringify(health, null, 2));
 }
 
+export async function loadProviderHealth(paths: StoragePaths): Promise<ProviderHealthFile> {
+  await ensureStorageDir(paths);
+  try {
+    const raw = await fs.readFile(paths.providerHealthPath, "utf8");
+    const data = JSON.parse(raw) as ProviderHealthFile | null;
+    if (data?.models) {
+      return data;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+  return { models: {} };
+}
+
+export async function saveProviderHealth(paths: StoragePaths, health: ProviderHealthFile): Promise<void> {
+  await ensureStorageDir(paths);
+  await writeAtomic(paths.providerHealthPath, JSON.stringify(health, null, 2));
+}
+
+export async function readJsonFile<T>(
+  filePath: string,
+  fallback: T
+): Promise<T> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    return JSON.parse(raw) as T;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return fallback;
+    }
+    throw error;
+  }
+}
+
+export async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
+  await ensureDir(path.dirname(filePath));
+  await writeAtomic(filePath, JSON.stringify(value, null, 2));
+}
+
 export function newEndpointId(): string {
   return crypto.randomUUID();
 }
@@ -118,4 +171,8 @@ async function writeAtomic(filePath: string, content: string): Promise<void> {
   const tmp = path.join(dir, `.${path.basename(filePath)}.${crypto.randomUUID()}`);
   await fs.writeFile(tmp, content, "utf8");
   await fs.rename(tmp, filePath);
+}
+
+async function ensureDir(dir: string): Promise<void> {
+  await fs.mkdir(dir, { recursive: true });
 }

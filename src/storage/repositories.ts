@@ -10,7 +10,21 @@ import {
   StoragePaths,
   ConfigFile
 } from "./files";
-import { EndpointDoc, EndpointHealth, EndpointType, RequestLog } from "../types";
+import {
+  EndpointDoc,
+  EndpointHealth,
+  EndpointType,
+  ModelCapabilities,
+  ModelMapping,
+  ModelModality,
+  RequestLog,
+} from "../types";
+import {
+  CapabilitiesRequirements,
+  resolveCapabilities,
+  supportsRequirements,
+} from "../utils/modelCapabilities";
+import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 
 // ========================================
 // Config Cache for Hot-Reload Support
@@ -88,6 +102,7 @@ export async function createEndpoint(
     ...input,
     id: newEndpointId(),
     health: defaultHealth(),
+    disabled: input.disabled ?? false,
     createdAt: now,
     updatedAt: now
   };
@@ -125,6 +140,15 @@ export async function updateEndpoint(
   return { ...updated, health: healthState };
 }
 
+export async function setEndpointDisabled(
+  paths: StoragePaths,
+  id: string,
+  disabled: boolean
+): Promise<EndpointDoc | null> {
+  const endpoint = await updateEndpoint(paths, id, { disabled });
+  return endpoint;
+}
+
 export async function deleteEndpointByIdOrName(
   paths: StoragePaths,
   value: string
@@ -158,16 +182,28 @@ export async function getEndpointByIdOrName(paths: StoragePaths, value: string):
 export async function getEligibleEndpointsForModel(
   paths: StoragePaths,
   publicModel: string,
-  endpointType?: EndpointType
+  requirements: {
+    endpointType?: EndpointType;
+    requiredInput?: ModelModality[];
+    requiredOutput?: ModelModality[];
+  } = {}
 ): Promise<EndpointDoc[]> {
   const endpoints = await listEndpoints(paths);
   const now = new Date();
   return endpoints.filter((endpoint) => {
-    // Filter by endpoint type if specified
-    if (endpointType && endpoint.type !== endpointType) {
+    if (endpoint.disabled) {
       return false;
     }
-    if (!endpoint.models.some((model) => model.publicName === publicModel)) {
+    // Filter by endpoint type if specified
+    if (requirements.endpointType && endpoint.type !== requirements.endpointType) {
+      return false;
+    }
+    const model = endpoint.models.find((mapping) => mapping.publicName === publicModel);
+    if (!model) {
+      return false;
+    }
+    const capabilities = resolveCapabilities(model, endpoint.type);
+    if (!supportsRequirements(capabilities, requirements)) {
       return false;
     }
     if (endpoint.health.status === "down") {
@@ -184,6 +220,9 @@ export async function listEligibleEndpoints(paths: StoragePaths): Promise<Endpoi
   const endpoints = await listEndpoints(paths);
   const now = new Date();
   return endpoints.filter((endpoint) => {
+    if (endpoint.disabled) {
+      return false;
+    }
     if (endpoint.health.status === "down") {
       return false;
     }
@@ -296,6 +335,7 @@ export interface ModelWithType {
   id: string;
   type: 'llm' | 'diffusion' | 'audio' | 'embedding';
   endpointName: string;
+  capabilities: ModelCapabilities;
 }
 
 export async function listModelsWithTypes(paths: StoragePaths): Promise<ModelWithType[]> {
@@ -310,6 +350,7 @@ export async function listModelsWithTypes(paths: StoragePaths): Promise<ModelWit
           id: model.publicName,
           type: endpoint.type,
           endpointName: endpoint.name,
+          capabilities: resolveCapabilities(model, endpoint.type),
         });
       }
     }
@@ -322,13 +363,26 @@ export async function listModelsWithTypes(paths: StoragePaths): Promise<ModelWit
  * Returns the publicName of the first LLM model from the highest-priority healthy endpoint.
  */
 export async function pickBestLlmModel(paths: StoragePaths): Promise<string | null> {
-  const endpoints = sortEndpointsForRouting(await listEligibleEndpoints(paths));
-  for (const endpoint of endpoints) {
-    if (endpoint.type === "llm" && endpoint.models.length > 0) {
-      return endpoint.models[0].publicName;
-    }
-  }
-  return null;
+  return pickBestProviderModelByCapabilities(
+    paths,
+    { requiredInput: ["text"], requiredOutput: ["text"] },
+    "llm"
+  );
+}
+
+export async function pickBestModelByCapabilities(
+  paths: StoragePaths,
+  requirements: CapabilitiesRequirements,
+  preferredEndpointType?: EndpointType
+): Promise<string | null> {
+  return pickBestProviderModelByCapabilities(paths, requirements, preferredEndpointType);
+}
+
+export function getModelCapabilitiesForEndpoint(
+  endpointType: EndpointType,
+  mapping: ModelMapping
+): ModelCapabilities {
+  return resolveCapabilities(mapping, endpointType);
 }
 
 export async function logRequest(paths: StoragePaths, log: RequestLog): Promise<void> {
@@ -401,8 +455,8 @@ function stripHealth(endpoint: EndpointDoc): Omit<EndpointDoc, "health"> {
   return rest;
 }
 
-function normalizeConfig(config: { endpoints: Array<Omit<EndpointDoc, "health">> }): {
-  config: { endpoints: Array<Omit<EndpointDoc, "health">> };
+function normalizeConfig(config: ConfigFile): {
+  config: ConfigFile;
   changed: boolean;
 } {
   let changed = false;
@@ -414,6 +468,10 @@ function normalizeConfig(config: { endpoints: Array<Omit<EndpointDoc, "health">>
     }
     if (!next.type) {
       next = { ...next, type: "llm" };
+      changed = true;
+    }
+    if (typeof next.disabled !== "boolean") {
+      next = { ...next, disabled: false };
       changed = true;
     }
     if (!next.createdAt) {
@@ -432,5 +490,5 @@ function normalizeConfig(config: { endpoints: Array<Omit<EndpointDoc, "health">>
     }
     return next;
   });
-  return { config: { endpoints }, changed };
+  return { config: { ...config, endpoints }, changed };
 }

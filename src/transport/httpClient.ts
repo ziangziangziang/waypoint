@@ -2,6 +2,15 @@ import { Agent, request } from "undici";
 import { EndpointDoc, UpstreamError, UpstreamResult } from "../types";
 
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const TLS_VERIFY_ERROR_CODES = new Set([
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "CERT_HAS_EXPIRED",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED",
+]);
 
 export async function proxyUpstream(
   endpoint: EndpointDoc,
@@ -9,7 +18,10 @@ export async function proxyUpstream(
   payload: unknown,
   headers: Record<string, string | string[] | undefined>,
   timeoutMs: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  options?: {
+    skipDefaultAuth?: boolean;
+  }
 ): Promise<UpstreamResult> {
   const url = new URL(path, endpoint.baseUrl).toString();
   const dispatcher = endpoint.insecureTls
@@ -21,7 +33,7 @@ export async function proxyUpstream(
     accept: "application/json",
     ...filterHeaders(headers)
   };
-  if (endpoint.apiKey && !requestHeaders.authorization) {
+  if (endpoint.apiKey && !options?.skipDefaultAuth && !requestHeaders.authorization) {
     requestHeaders.authorization = `Bearer ${endpoint.apiKey}`;
   }
 
@@ -45,7 +57,15 @@ export async function proxyUpstream(
 export function classifyUpstreamError(error: unknown): UpstreamError {
   if (error instanceof Error) {
     const err = error as UpstreamError;
+    if (typeof err.type === "string" && typeof err.retryable === "boolean") {
+      return err;
+    }
     const code = (err as NodeJS.ErrnoException).code;
+    if (isTlsVerifyError(err, code)) {
+      err.type = "tls_verify_failed";
+      err.retryable = true;
+      return err;
+    }
     // Connection errors
     if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "ETIMEDOUT" || code === "ENOTFOUND") {
       err.type = "connection";
@@ -79,7 +99,22 @@ export function classifyUpstreamError(error: unknown): UpstreamError {
   return fallback;
 }
 
+function isTlsVerifyError(error: Error, code: string | undefined): boolean {
+  if (code && TLS_VERIFY_ERROR_CODES.has(code)) {
+    return true;
+  }
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("unable to verify the first certificate") ||
+    message.includes("self-signed certificate") ||
+    message.includes("certificate verify failed")
+  );
+}
+
 export function classifyHttpStatus(statusCode: number): { retryable: boolean; type: string } {
+  if (statusCode === 429) {
+    return { retryable: true, type: "rate_limited" };
+  }
   if (RETRYABLE_STATUSES.has(statusCode)) {
     return { retryable: true, type: "upstream_5xx" };
   }

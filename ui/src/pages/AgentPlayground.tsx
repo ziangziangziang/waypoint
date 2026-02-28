@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { 
   Send, ImagePlus, Loader2, Bot, User, Sparkles, Plus, Trash2, 
   MessageSquare, ChevronRight, X, Image as ImageIcon, Wrench,
-  ToggleLeft, ToggleRight, StopCircle
+  ToggleLeft, ToggleRight, StopCircle, Mic, PhoneCall, PhoneOff
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
@@ -12,33 +12,54 @@ import { MessageContent } from '@/components/MessageContent'
 import { cn } from '@/lib/utils'
 import { 
   streamChatCompletion, 
+  createChatCompletionRaw,
   listModels, 
   listSessions,
   getSession,
   createSession,
   deleteSession,
   addMessageToSession,
+  autoTitleSession,
   listMcpTools,
   executeMcpTool,
   generateImage,
+  storeImage as cacheImage,
+  storeMedia,
+  normalizeContentMedia,
+  normalizeSessionMessageMedia,
+  resolveMediaUrl,
+  ApiError,
   type ChatMessage as ApiChatMessage,
   type SessionListItem,
   type McpTool,
   type Model,
-  type EndpointType,
 } from '@/api/client'
 import { loadSettings, IMAGE_SIZE_OPTIONS, type ImageSize } from '@/stores/settings'
+import {
+  buildUserPayload,
+  findNonDataImageUrls,
+  toApiMessage,
+} from './agentPlaygroundPayload'
+import {
+  applyThinkingChunk,
+  createThinkingStreamState,
+  toDisplayContent,
+  toFinalContent,
+} from './agentThinkingContent'
 
 // Content can be a string or array of content parts (multimodal)
 type ContentPart = 
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'input_audio'; input_audio: { url?: string; data?: string; format?: string } }
+  | { type: 'audio'; audio: { url?: string; data?: string; format?: string } }
 
 interface Message {
   id: string
   role: 'user' | 'assistant' | 'system' | 'tool'
   content: string | ContentPart[] | null
   images?: string[]
+  requestImages?: string[]
   toolCalls?: ToolCall[]
   toolCallId?: string
   createdAt: Date
@@ -59,16 +80,81 @@ function getImageUrls(content: string | ContentPart[] | null): string[] {
   if (!content || typeof content === 'string') return []
   return content
     .filter((p): p is { type: 'image_url'; image_url: { url: string } } => p.type === 'image_url')
-    .map(p => p.image_url.url)
+    .map(p => resolveMediaUrl(p.image_url.url))
+}
+
+function getAudioUrls(content: string | ContentPart[] | null): string[] {
+  if (!content || typeof content === 'string') return []
+  const urls: string[] = []
+  for (const part of content) {
+    if (part.type === 'audio' && part.audio?.url) {
+      urls.push(resolveMediaUrl(part.audio.url))
+    }
+    if (part.type === 'input_audio' && part.input_audio?.url) {
+      urls.push(resolveMediaUrl(part.input_audio.url))
+    }
+  }
+  return urls
+}
+
+function formatModelTag(model: Model): string {
+  const caps = model.capabilities
+  if (caps && caps.input.length > 0 && caps.output.length > 0) {
+    return `[${caps.input.join('+')}->${caps.output.join('+')}]`
+  }
+  if (model.endpoint_type && model.endpoint_type !== 'llm') {
+    return `[${model.endpoint_type}]`
+  }
+  return ''
 }
 
 // Maximum tool iterations per user message to prevent infinite loops
 const MAX_TOOL_ITERATIONS = 10
+const MAX_IMAGE_PIXELS = 1080 * 720 - 1
+
+async function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(reader.error)
+    reader.onload = () => resolve(reader.result as string)
+    reader.readAsDataURL(file)
+  })
+}
+
+async function compressImageFile(file: File): Promise<string> {
+  const objectUrl = URL.createObjectURL(file)
+  try {
+    const image = new Image()
+    image.src = objectUrl
+    await image.decode()
+    const area = image.width * image.height
+    if (area <= MAX_IMAGE_PIXELS) {
+      return await fileToDataUrl(file)
+    }
+
+    const scale = Math.sqrt(MAX_IMAGE_PIXELS / area)
+    const targetWidth = Math.max(1, Math.floor(image.width * scale))
+    const targetHeight = Math.max(1, Math.floor(image.height * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = targetWidth
+    canvas.height = targetHeight
+    const context = canvas.getContext('2d')
+    if (!context) {
+      return await fileToDataUrl(file)
+    }
+    context.drawImage(image, 0, 0, targetWidth, targetHeight)
+    const mimeType = file.type === 'image/jpeg' || file.type === 'image/png' ? file.type : 'image/png'
+    return canvas.toDataURL(mimeType, mimeType === 'image/jpeg' ? 0.9 : undefined)
+  } finally {
+    URL.revokeObjectURL(objectUrl)
+  }
+}
 
 export function AgentPlayground() {
   // Session state
   const [sessions, setSessions] = useState<SessionListItem[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
+  const [activeSessionStorageVersion, setActiveSessionStorageVersion] = useState<number>(2)
   const [sessionName, setSessionName] = useState('')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   
@@ -78,16 +164,30 @@ export function AgentPlayground() {
   const [isLoading, setIsLoading] = useState(false)
   const [selectedModel, setSelectedModel] = useState<string>('')
   const [models, setModels] = useState<Model[]>([])
-  
-  // Get the endpoint type for the selected model
-  const getSelectedModelType = (): EndpointType => {
+
+  const selectedModelSupportsImageOutput = (): boolean => {
     const model = models.find(m => m.id === selectedModel)
-    return model?.endpoint_type ?? 'llm'
+    if (!model) return false
+    if (model.capabilities?.output?.includes('image')) return true
+    return (model.endpoint_type ?? 'llm') === 'diffusion'
   }
+
+  const selectedModelSupportsCall = (): boolean => {
+    const model = models.find(m => m.id === selectedModel)
+    if (!model?.capabilities) return false
+    return model.capabilities.input.includes('audio') && model.capabilities.output.includes('audio')
+  }
+
+  const modelSupportsCall = selectedModelSupportsCall()
   
   // Image input state
   const [pendingImages, setPendingImages] = useState<string[]>([])
+  const [pendingAudio, setPendingAudio] = useState<string | null>(null)
+  const [pendingAudioMimeType, setPendingAudioMimeType] = useState<string | undefined>(undefined)
   const [isDragging, setIsDragging] = useState(false)
+  const [callModeEnabled, setCallModeEnabled] = useState(false)
+  const [callStatus, setCallStatus] = useState<'idle' | 'recording' | 'sending' | 'playing'>('idle')
+  const [callError, setCallError] = useState<string | null>(null)
   
   // Image generation settings
   const [imageSize, setImageSize] = useState<ImageSize>(() => loadSettings().defaultImageSize)
@@ -106,6 +206,10 @@ export function AgentPlayground() {
   const stopAgentRef = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const isStreamingRef = useRef(false)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const mediaStreamRef = useRef<MediaStream | null>(null)
+  const recordingTimerRef = useRef<number | null>(null)
+  const callAudioRef = useRef<HTMLAudioElement | null>(null)
 
   // Load models on mount
   useEffect(() => {
@@ -152,6 +256,12 @@ export function AgentPlayground() {
     }
   }
 
+  const normalizeMessageForUi = (message: Message): Message => ({
+    ...message,
+    content: normalizeContentMedia(message.content) as Message['content'],
+    images: message.images?.map((value) => resolveMediaUrl(value)),
+  })
+
   // Auto-scroll to bottom - use instant scroll during streaming to prevent jitter
   useEffect(() => {
     const container = messagesContainerRef.current
@@ -167,15 +277,18 @@ export function AgentPlayground() {
     try {
       const session = await getSession(sessionId)
       setActiveSessionId(session.id)
+      setActiveSessionStorageVersion(session.storageVersion ?? 1)
       setSessionName(session.name)
       if (session.model) setSelectedModel(session.model)
-      setMessages(session.messages.map(m => ({
+      setMessages(session.messages.map(m => {
+        const normalized = normalizeSessionMessageMedia(m)
+        return ({
         id: crypto.randomUUID(),
-        role: m.role as Message['role'],
-        content: m.content,
-        images: m.images,
-        createdAt: new Date(m.timestamp),
-      })))
+        role: normalized.role as Message['role'],
+        content: normalizeContentMedia(normalized.content) as Message['content'],
+        images: normalized.images,
+        createdAt: new Date(m.createdAt ?? m.timestamp ?? new Date().toISOString()),
+      })}))
     } catch (error) {
       console.error('Failed to load session:', error)
     }
@@ -194,6 +307,7 @@ export function AgentPlayground() {
         updatedAt: session.updatedAt,
       }, ...prev])
       setActiveSessionId(session.id)
+      setActiveSessionStorageVersion(session.storageVersion ?? 2)
       setSessionName(session.name)
       setMessages([])
     } catch (error) {
@@ -208,6 +322,7 @@ export function AgentPlayground() {
       setSessions(prev => prev.filter(s => s.id !== sessionId))
       if (activeSessionId === sessionId) {
         setActiveSessionId(null)
+        setActiveSessionStorageVersion(2)
         setMessages([])
         setSessionName('')
       }
@@ -218,38 +333,186 @@ export function AgentPlayground() {
 
   // Image handling
   const processImages = useCallback((files: FileList | File[]) => {
-    Array.from(files).forEach(file => {
+    Array.from(files).forEach(async (file) => {
       if (!file.type.startsWith('image/')) return
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        const base64 = e.target?.result as string
+      try {
+        const base64 = await compressImageFile(file)
         setPendingImages(prev => [...prev, base64])
+      } catch (error) {
+        console.warn('Failed to compress image, using raw data URL:', error)
+        const fallback = await fileToDataUrl(file)
+        setPendingImages(prev => [...prev, fallback])
       }
-      reader.readAsDataURL(file)
     })
   }, [])
+
+  const processAudioFile = useCallback((file: File) => {
+    if (!file.type.startsWith('audio/')) return
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const base64 = e.target?.result as string
+      setPendingAudio(base64)
+      setPendingAudioMimeType(file.type || undefined)
+      setCallError(null)
+    }
+    reader.readAsDataURL(file)
+  }, [])
+
+  const processSelectedFiles = useCallback((files: FileList | File[]) => {
+    const entries = Array.from(files)
+    const imageFiles = entries.filter((file) => file.type.startsWith('image/'))
+    if (imageFiles.length > 0) {
+      processImages(imageFiles)
+    }
+    if (callModeEnabled) {
+      const audioFile = entries.find((file) => file.type.startsWith('audio/'))
+      if (audioFile) {
+        processAudioFile(audioFile)
+      }
+    }
+  }, [callModeEnabled, processAudioFile, processImages])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragging(false)
     if (e.dataTransfer.files.length > 0) {
-      processImages(e.dataTransfer.files)
+      processSelectedFiles(e.dataTransfer.files)
     }
-  }, [processImages])
+  }, [processSelectedFiles])
 
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     const items = e.clipboardData.items
-    const files: File[] = []
+    const imageFiles: File[] = []
     for (let i = 0; i < items.length; i++) {
       if (items[i].type.startsWith('image/')) {
         const file = items[i].getAsFile()
-        if (file) files.push(file)
+        if (file) imageFiles.push(file)
+      } else if (callModeEnabled && items[i].type.startsWith('audio/')) {
+        const file = items[i].getAsFile()
+        if (file) processAudioFile(file)
       }
     }
-    if (files.length > 0) {
-      processImages(files)
+    if (imageFiles.length > 0) {
+      processImages(imageFiles)
     }
-  }, [processImages])
+  }, [callModeEnabled, processAudioFile, processImages])
+
+  const stopPlayback = useCallback(() => {
+    if (callAudioRef.current) {
+      callAudioRef.current.pause()
+      callAudioRef.current.currentTime = 0
+      callAudioRef.current = null
+    }
+    if (callStatus === 'playing') {
+      setCallStatus('idle')
+    }
+  }, [callStatus])
+
+  const clearRecordingTimer = () => {
+    if (recordingTimerRef.current !== null) {
+      window.clearTimeout(recordingTimerRef.current)
+      recordingTimerRef.current = null
+    }
+  }
+
+  const stopMediaStream = () => {
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop())
+      mediaStreamRef.current = null
+    }
+  }
+
+  const stopRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current
+    if (!recorder || recorder.state !== 'recording') {
+      clearRecordingTimer()
+      stopMediaStream()
+      setCallStatus('idle')
+      return
+    }
+    recorder.stop()
+    clearRecordingTimer()
+  }, [])
+
+  const cancelRecording = useCallback(() => {
+    stopRecording()
+    setPendingAudio(null)
+    setPendingAudioMimeType(undefined)
+    setCallError(null)
+  }, [stopRecording])
+
+  const startRecording = useCallback(async () => {
+    if (!selectedModelSupportsCall() || isLoading || callStatus === 'sending') {
+      return
+    }
+
+    try {
+      stopPlayback()
+      setCallError(null)
+      setCallStatus('recording')
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      mediaStreamRef.current = stream
+      let recorder: MediaRecorder
+      try {
+        recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' })
+      } catch {
+        recorder = new MediaRecorder(stream)
+      }
+      mediaRecorderRef.current = recorder
+      const chunks: BlobPart[] = []
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data)
+        }
+      }
+
+      recorder.onstop = async () => {
+        stopMediaStream()
+        clearRecordingTimer()
+        if (chunks.length > 0) {
+          const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' })
+          const reader = new FileReader()
+          reader.onload = () => {
+            const result = reader.result as string
+            setPendingAudio(result)
+            setPendingAudioMimeType(blob.type || 'audio/webm')
+            setCallStatus('idle')
+          }
+          reader.readAsDataURL(blob)
+        } else {
+          setCallStatus('idle')
+        }
+      }
+
+      recorder.start()
+      recordingTimerRef.current = window.setTimeout(() => {
+        stopRecording()
+      }, 60_000)
+    } catch (error) {
+      console.error('Microphone access failed:', error)
+      setCallStatus('idle')
+      setCallError('Microphone permission denied or unavailable. You can upload an audio file instead.')
+    }
+  }, [callStatus, isLoading, modelSupportsCall, stopPlayback, stopRecording])
+
+  useEffect(() => {
+    if (!modelSupportsCall && callModeEnabled) {
+      setCallModeEnabled(false)
+      setPendingAudio(null)
+      setPendingAudioMimeType(undefined)
+      setCallStatus('idle')
+      setCallError(null)
+    }
+  }, [callModeEnabled, modelSupportsCall])
+
+  useEffect(() => {
+    return () => {
+      clearRecordingTimer()
+      stopMediaStream()
+      stopPlayback()
+    }
+  }, [stopPlayback])
 
   // Build tools array for the API
   const buildToolsForApi = () => {
@@ -274,7 +537,14 @@ export function AgentPlayground() {
       const result = await executeMcpTool(toolCall.name, args)
       return result.result
     } catch (error) {
-      throw new Error(`Tool execution failed: ${(error as Error).message}`)
+      let reason = (error as Error).message
+      if (error instanceof ApiError) {
+        const body = error.body as { error?: { message?: string } } | undefined
+        if (body?.error?.message) {
+          reason = body.error.message
+        }
+      }
+      throw new Error(`Tool execution failed: ${reason}`)
     }
   }
 
@@ -297,18 +567,6 @@ export function AgentPlayground() {
       
       // Build messages for API
       const chatMessages = currentHistory.map(m => {
-        if (m.images && m.images.length > 0) {
-          return {
-            role: m.role,
-            content: [
-              ...(m.content ? [{ type: 'text' as const, text: m.content }] : []),
-              ...m.images.map(img => ({
-                type: 'image_url' as const,
-                image_url: { url: img },
-              })),
-            ],
-          }
-        }
         if (m.role === 'tool' && m.toolCallId) {
           return {
             role: 'tool' as const,
@@ -316,8 +574,9 @@ export function AgentPlayground() {
             content: m.content,
           }
         }
-        return { role: m.role, content: m.content }
+        return toApiMessage(m)
       }) as ApiChatMessage[]
+      warnIfNonDataImageUrls(chatMessages, 'agent-loop')
 
       // Stream the response
       abortControllerRef.current = new AbortController()
@@ -489,22 +748,140 @@ export function AgentPlayground() {
     setCurrentIteration(0)
   }
 
+  const warnIfNonDataImageUrls = (chatMessages: ApiChatMessage[], context: string) => {
+    if (!import.meta.env.DEV) return
+    const invalidUrls = findNonDataImageUrls(chatMessages)
+    if (invalidUrls.length > 0) {
+      console.warn(`[AgentPlayground][${context}] Non-data image URLs detected in chat payload`, invalidUrls)
+    }
+  }
+
+  const extractAssistantAudio = (message: unknown): { url?: string; data?: string; format?: string } | null => {
+    if (!message || typeof message !== 'object') return null
+    const msg = message as Record<string, unknown>
+    const direct = msg.audio as Record<string, unknown> | undefined
+    if (direct && (typeof direct.url === 'string' || typeof direct.data === 'string')) {
+      return {
+        url: typeof direct.url === 'string' ? direct.url : undefined,
+        data: typeof direct.data === 'string' ? direct.data : undefined,
+        format: typeof direct.format === 'string' ? direct.format : undefined,
+      }
+    }
+    const content = msg.content
+    if (!Array.isArray(content)) return null
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue
+      const p = part as Record<string, unknown>
+      const audioObj = p.audio as Record<string, unknown> | undefined
+      if ((p.type === 'audio' || p.type === 'output_audio') && audioObj) {
+        return {
+          url: typeof audioObj.url === 'string' ? audioObj.url : undefined,
+          data: typeof audioObj.data === 'string' ? audioObj.data : undefined,
+          format: typeof audioObj.format === 'string' ? audioObj.format : undefined,
+        }
+      }
+    }
+    return null
+  }
+
+  const formatToMimeType = (format?: string): string | undefined => {
+    if (!format) return undefined
+    const lower = format.toLowerCase()
+    if (lower === 'wav') return 'audio/wav'
+    if (lower === 'mp3' || lower === 'mpeg') return 'audio/mpeg'
+    if (lower === 'ogg') return 'audio/ogg'
+    if (lower === 'webm') return 'audio/webm'
+    if (lower === 'm4a' || lower === 'mp4') return 'audio/mp4'
+    return undefined
+  }
+
+  const maybeAutoTitleSession = async (seedText: string): Promise<void> => {
+    if (!activeSessionId) return
+    const trimmed = seedText.trim()
+    if (!trimmed) return
+    const defaultNamePattern = /^Session\s+\d{1,2}\/\d{1,2}\/\d{2,4}$/
+    if (!defaultNamePattern.test(sessionName)) {
+      return
+    }
+    try {
+      const response = await autoTitleSession(activeSessionId, {
+        model: selectedModel,
+        seedText: trimmed,
+      })
+      setSessionName(response.name)
+      setSessions((prev) =>
+        prev.map((item) =>
+          item.id === activeSessionId
+            ? { ...item, name: response.name, titleStatus: response.titleStatus, titleUpdatedAt: response.titleUpdatedAt }
+            : item
+        )
+      )
+    } catch (error) {
+      console.warn('Auto-title skipped:', error)
+    }
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if ((!input.trim() && pendingImages.length === 0) || isLoading) return
+    const hasText = input.trim().length > 0
+    const canSend = callModeEnabled
+      ? Boolean(pendingAudio)
+      : hasText || pendingImages.length > 0
+    if (!canSend || isLoading) return
 
     stopAgentRef.current = false
+    setCallError(null)
+
+    const requestImageUrls = pendingImages.length > 0 ? [...pendingImages] : []
+    let displayImageRefs = requestImageUrls.length > 0 ? [...requestImageUrls] : undefined
+    if ((activeSessionStorageVersion ?? 1) >= 2 && pendingImages.length > 0) {
+      try {
+        const cached = await Promise.all(
+          pendingImages.map((image) => cacheImage(image, selectedModel))
+        )
+        displayImageRefs = cached.map((item) => item.url)
+      } catch (error) {
+        console.error('Failed to cache input images, falling back to inline images:', error)
+      }
+    }
+
+    let audioRef: string | undefined
+    if (pendingAudio) {
+      if ((activeSessionStorageVersion ?? 1) >= 2) {
+        try {
+          const cachedAudio = await storeMedia(pendingAudio, selectedModel, pendingAudioMimeType)
+          audioRef = cachedAudio.url
+        } catch (error) {
+          console.error('Failed to cache input audio, falling back to inline audio:', error)
+          audioRef = pendingAudio
+        }
+      } else {
+        audioRef = pendingAudio
+      }
+    }
+
+    const payload = buildUserPayload({
+      callModeEnabled,
+      text: input,
+      requestImageUrls,
+      displayImageRefs,
+      audioRef,
+    })
+
     const userMessage: Message = {
       id: crypto.randomUUID(),
       role: 'user',
-      content: input.trim(),
-      images: pendingImages.length > 0 ? [...pendingImages] : undefined,
+      content: payload.content,
+      images: payload.images,
+      requestImages: payload.requestImages,
       createdAt: new Date(),
     }
 
-    setMessages(prev => [...prev, userMessage])
+    setMessages(prev => [...prev, normalizeMessageForUi(userMessage)])
     setInput('')
     setPendingImages([])
+    setPendingAudio(null)
+    setPendingAudioMimeType(undefined)
     setIsLoading(true)
 
     // Save user message to session
@@ -512,10 +889,14 @@ export function AgentPlayground() {
       try {
         await addMessageToSession(activeSessionId, {
           role: 'user',
-          content: getTextContent(userMessage.content),
+          content: userMessage.content,
           images: userMessage.images,
           timestamp: userMessage.createdAt.toISOString(),
         })
+        const textForTitle = getTextContent(userMessage.content)
+        if (textForTitle) {
+          void maybeAutoTitleSession(textForTitle)
+        }
       } catch (error) {
         console.error('Failed to save user message:', error)
       }
@@ -527,12 +908,89 @@ export function AgentPlayground() {
       content: '',
       createdAt: new Date(),
     }
-    setMessages(prev => [...prev, assistantMessage])
+    setMessages(prev => [...prev, normalizeMessageForUi(assistantMessage)])
 
     try {
-      const modelType = getSelectedModelType()
-      
-      if (modelType === 'diffusion') {
+      if (callModeEnabled) {
+        setCallStatus('sending')
+        const chatMessages = [...messages, userMessage].map(toApiMessage)
+        warnIfNonDataImageUrls(chatMessages, 'call-mode')
+        const response = await createChatCompletionRaw({
+          model: selectedModel,
+          messages: chatMessages,
+          stream: false,
+        })
+        const assistant = response.choices?.[0]?.message
+        const assistantText =
+          typeof assistant?.content === 'string'
+            ? assistant.content
+            : getTextContent((assistant?.content as ContentPart[] | null) ?? null)
+
+        const audio = extractAssistantAudio(assistant)
+        let assistantAudioUrl: string | undefined
+        if (audio?.url) {
+          assistantAudioUrl = resolveMediaUrl(audio.url)
+        } else if (audio?.data) {
+          const dataUrl = audio.data.startsWith('data:')
+            ? audio.data
+            : `data:${formatToMimeType(audio.format) ?? 'audio/wav'};base64,${audio.data}`
+          if ((activeSessionStorageVersion ?? 1) >= 2) {
+            const cached = await storeMedia(
+              dataUrl,
+              selectedModel,
+              formatToMimeType(audio.format) ?? pendingAudioMimeType
+            )
+            assistantAudioUrl = cached.url
+          } else {
+            assistantAudioUrl = dataUrl
+          }
+        }
+
+        const assistantContent: ContentPart[] = [
+          ...(assistantText ? [{ type: 'text' as const, text: assistantText }] : []),
+          ...(assistantAudioUrl
+            ? [{ type: 'audio' as const, audio: { url: assistantAudioUrl, format: audio?.format } }]
+            : []),
+        ]
+
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === assistantMessage.id
+              ? { ...m, content: assistantContent.length > 0 ? assistantContent : assistantText || '' }
+              : m
+          )
+        )
+
+        if (assistantAudioUrl) {
+          stopPlayback()
+          const player = new Audio(assistantAudioUrl)
+          callAudioRef.current = player
+          setCallStatus('playing')
+          player.onended = () => {
+            setCallStatus('idle')
+            callAudioRef.current = null
+          }
+          player.onerror = () => {
+            setCallStatus('idle')
+            callAudioRef.current = null
+          }
+          void player.play().catch((error) => {
+            console.warn('Audio playback failed:', error)
+            setCallStatus('idle')
+            callAudioRef.current = null
+          })
+        } else {
+          setCallStatus('idle')
+        }
+
+        if (activeSessionId) {
+          await addMessageToSession(activeSessionId, {
+            role: 'assistant',
+            content: assistantContent.length > 0 ? assistantContent : assistantText || '',
+            timestamp: new Date().toISOString(),
+          })
+        }
+      } else if (selectedModelSupportsImageOutput()) {
         // Image generation mode
         const prompt = getTextContent(userMessage.content)
         if (!prompt) {
@@ -549,7 +1007,20 @@ export function AgentPlayground() {
         
         // Convert response to content with image
         const imageData = imageResponse.data[0]
-        const imageUrl = imageData.url || (imageData.b64_json ? `data:image/png;base64,${imageData.b64_json}` : '')
+        let imageUrl = imageData.url || ''
+        if (!imageUrl && imageData.b64_json) {
+          if ((activeSessionStorageVersion ?? 1) >= 2) {
+            try {
+              const cached = await cacheImage(imageData.b64_json, selectedModel)
+              imageUrl = cached.url
+            } catch (error) {
+              console.error('Failed to cache generated image, using inline payload:', error)
+              imageUrl = `data:image/png;base64,${imageData.b64_json}`
+            }
+          } else {
+            imageUrl = `data:image/png;base64,${imageData.b64_json}`
+          }
+        }
         
         const imageContent: ContentPart[] = []
         if (imageData.revised_prompt) {
@@ -590,43 +1061,39 @@ export function AgentPlayground() {
         abortControllerRef.current = new AbortController()
         isStreamingRef.current = true
         
-        const chatMessages = [...messages, userMessage].map(m => {
-          if (m.images && m.images.length > 0) {
-            return {
-              role: m.role,
-              content: [
-                ...(m.content ? [{ type: 'text' as const, text: m.content }] : []),
-                ...m.images.map(img => ({
-                  type: 'image_url' as const,
-                  image_url: { url: img },
-                })),
-              ],
-            }
-          }
-          return { role: m.role, content: m.content }
-        }) as ApiChatMessage[]
+        const chatMessages = [...messages, userMessage].map(toApiMessage) as ApiChatMessage[]
+        warnIfNonDataImageUrls(chatMessages, 'chat-stream')
 
-        let fullContent = ''
+        let streamState = createThinkingStreamState()
         for await (const chunk of streamChatCompletion(
           { model: selectedModel, messages: chatMessages },
           abortControllerRef.current.signal
         )) {
-          fullContent += chunk
+          streamState = applyThinkingChunk(streamState, chunk)
+          const displayContent = toDisplayContent(streamState)
           setMessages(prev => 
             prev.map(m => 
               m.id === assistantMessage.id 
-                ? { ...m, content: fullContent }
+                ? { ...m, content: displayContent }
                 : m
             )
           )
         }
+        const finalContent = toFinalContent(streamState)
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === assistantMessage.id
+              ? { ...m, content: finalContent }
+              : m
+          )
+        )
 
         // Save assistant message
-        if (activeSessionId && fullContent) {
+        if (activeSessionId && finalContent) {
           try {
             await addMessageToSession(activeSessionId, {
               role: 'assistant',
-              content: fullContent,
+              content: finalContent,
               timestamp: new Date().toISOString(),
             })
           } catch (error) {
@@ -637,6 +1104,10 @@ export function AgentPlayground() {
     } catch (error) {
       if ((error as Error).name === 'AbortError') return
       console.error('Chat error:', error)
+      if (callModeEnabled) {
+        setCallError((error as Error).message || 'Call turn failed. Try again.')
+      }
+      setCallStatus('idle')
       setMessages(prev => 
         prev.map(m => 
           m.id === assistantMessage.id 
@@ -649,6 +1120,9 @@ export function AgentPlayground() {
       abortControllerRef.current = null
       stopAgentRef.current = false
       isStreamingRef.current = false
+      if (!callAudioRef.current) {
+        setCallStatus('idle')
+      }
     }
   }
 
@@ -660,7 +1134,7 @@ export function AgentPlayground() {
   }
 
   return (
-    <div className="flex-1 flex h-screen">
+    <div className="flex-1 flex h-screen min-h-0">
       {/* Sessions Sidebar */}
       <aside className={cn(
         'border-r border-border flex flex-col shrink-0 transition-all duration-300',
@@ -740,9 +1214,9 @@ export function AgentPlayground() {
       </aside>
 
       {/* Main Chat Area */}
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col min-h-0">
         {/* Header */}
-        <header className="h-14 border-b border-border flex items-center px-6 gap-4 shrink-0">
+        <header className="sticky top-0 z-20 h-14 border-b border-border bg-background/95 backdrop-blur flex items-center px-6 gap-4 shrink-0">
           <div className="flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-primary" />
             <h2 className="font-mono font-semibold text-sm uppercase tracking-wider">
@@ -787,6 +1261,27 @@ export function AgentPlayground() {
               Tools
             </Button>
           )}
+
+          {modelSupportsCall && (
+            <Button
+              variant={callModeEnabled ? "default" : "ghost"}
+              size="sm"
+              className="h-7 text-xs gap-1"
+              onClick={() => {
+                setCallModeEnabled(!callModeEnabled)
+                setPendingAudio(null)
+                setPendingAudioMimeType(undefined)
+                setCallError(null)
+                if (callStatus === 'recording') {
+                  stopRecording()
+                }
+                stopPlayback()
+              }}
+            >
+              {callModeEnabled ? <PhoneCall className="w-3.5 h-3.5" /> : <PhoneOff className="w-3.5 h-3.5" />}
+              Call
+            </Button>
+          )}
           
           <div className="flex-1" />
           
@@ -798,7 +1293,7 @@ export function AgentPlayground() {
             {models.length === 0 && <option value="">No models available</option>}
             {models.map(model => (
               <option key={model.id} value={model.id}>
-                {model.id} {model.endpoint_type && model.endpoint_type !== 'llm' ? `[${model.endpoint_type}]` : ''}
+                {model.id} {formatModelTag(model)}
               </option>
             ))}
           </select>
@@ -807,12 +1302,12 @@ export function AgentPlayground() {
         <div className="flex-1 flex overflow-hidden">
           {/* Messages Area */}
           <div className="flex-1 flex flex-col">
-            <div 
-              ref={messagesContainerRef}
-              className={cn(
-                'flex-1 overflow-y-auto p-6 space-y-4 relative',
-                isDragging && 'bg-primary/5 border-2 border-dashed border-primary/30'
-              )}
+        <div 
+          ref={messagesContainerRef}
+          className={cn(
+            'flex-1 min-h-0 overflow-y-auto p-6 space-y-4 relative',
+            isDragging && 'bg-primary/5 border-2 border-dashed border-primary/30'
+          )}
               onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
               onDragLeave={() => setIsDragging(false)}
               onDrop={handleDrop}
@@ -821,7 +1316,9 @@ export function AgentPlayground() {
                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
                   <div className="bg-background/90 rounded-lg p-6 text-center">
                     <ImageIcon className="w-12 h-12 text-primary mx-auto mb-2" />
-                    <p className="font-mono text-sm">Drop image here</p>
+                    <p className="font-mono text-sm">
+                      {callModeEnabled ? 'Drop image or audio here' : 'Drop image here'}
+                    </p>
                   </div>
                 </div>
               )}
@@ -839,11 +1336,13 @@ export function AgentPlayground() {
                           ? 'Agent mode enabled - select tools to use'
                           : 'Select a model and start a conversation'}
                       </p>
-                      <p className="text-muted-foreground text-xs mt-2">
-                        Supports images via drag, drop, paste, or upload
-                      </p>
-                    </div>
-                  </div>
+                  <p className="text-muted-foreground text-xs mt-2">
+                    {callModeEnabled
+                      ? 'Call mode: push-to-talk + optional text/images'
+                      : 'Supports images via drag, drop, paste, or upload'}
+                  </p>
+                </div>
+              </div>
                 </div>
               )}
               
@@ -878,17 +1377,17 @@ export function AgentPlayground() {
                     )}
                   >
                     {/* Render explicitly attached images */}
-                    {message.images && message.images.length > 0 && (
-                      <div className="flex flex-wrap gap-2 mb-2">
-                        {message.images.map((img, i) => (
-                          <img 
-                            key={i} 
-                            src={img} 
-                            alt={`Attached ${i + 1}`}
-                            className="max-w-32 max-h-32 rounded border border-border"
-                          />
-                        ))}
-                      </div>
+                {message.images && message.images.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mb-2">
+                    {message.images.map((img, i) => (
+                      <img 
+                        key={i} 
+                        src={resolveMediaUrl(img)} 
+                        alt={`Attached ${i + 1}`}
+                        className="max-w-32 max-h-32 rounded border border-border"
+                      />
+                    ))}
+                  </div>
                     )}
                     {/* Render images from multimodal content (e.g., image generation responses) */}
                     {getImageUrls(message.content).length > 0 && (
@@ -907,6 +1406,18 @@ export function AgentPlayground() {
                               className="max-w-xs max-h-64 rounded border border-border hover:border-primary transition-colors cursor-pointer"
                             />
                           </a>
+                        ))}
+                      </div>
+                    )}
+                    {getAudioUrls(message.content).length > 0 && (
+                      <div className="flex flex-col gap-2 mb-2">
+                        {getAudioUrls(message.content).map((url, i) => (
+                          <audio
+                            key={i}
+                            controls
+                            src={url}
+                            className="w-full max-w-sm"
+                          />
                         ))}
                       </div>
                     )}
@@ -971,10 +1482,28 @@ export function AgentPlayground() {
               </div>
             )}
 
+            {callModeEnabled && pendingAudio && (
+              <div className="border-t border-border px-4 py-2 bg-secondary/20">
+                <div className="flex items-center gap-2">
+                  <audio controls src={pendingAudio} className="w-full max-w-md" />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 shrink-0"
+                    onClick={cancelRecording}
+                    title="Remove pending audio"
+                  >
+                    <X className="w-3 h-3" />
+                  </Button>
+                </div>
+              </div>
+            )}
+
             {/* Input Area */}
             <div className="border-t border-border p-4">
               {/* Image Size Picker (shown for diffusion models) */}
-              {getSelectedModelType() === 'diffusion' && (
+              {selectedModelSupportsImageOutput() && (
                 <div className="mb-3 flex items-center gap-2">
                   <span className="text-xs text-muted-foreground">Image Size:</span>
                   <div className="flex gap-1 flex-wrap">
@@ -1001,34 +1530,71 @@ export function AgentPlayground() {
                   type="file"
                   ref={fileInputRef}
                   className="hidden"
-                  accept="image/*"
+                  accept={callModeEnabled ? "image/*,audio/*" : "image/*"}
                   multiple
-                  onChange={(e) => e.target.files && processImages(e.target.files)}
+                  onChange={(e) => {
+                    if (!e.target.files) return
+                    processSelectedFiles(e.target.files)
+                    e.target.value = ''
+                  }}
                 />
                 <Button
                   type="button"
                   variant="outline"
                   size="icon"
                   className="shrink-0"
-                  title="Attach image"
+                  title={callModeEnabled ? "Attach image/audio" : "Attach image"}
                   onClick={() => fileInputRef.current?.click()}
                 >
                   <ImagePlus className="w-4 h-4" />
                 </Button>
+                {callModeEnabled && (
+                  <Button
+                    type="button"
+                    variant={callStatus === 'recording' ? 'destructive' : 'outline'}
+                    size="icon"
+                    className="shrink-0"
+                    title={callStatus === 'recording' ? 'Stop recording' : 'Start recording'}
+                    disabled={isLoading || callStatus === 'sending'}
+                    onClick={() => {
+                      if (callStatus === 'recording') {
+                        stopRecording()
+                      } else {
+                        void startRecording()
+                      }
+                    }}
+                  >
+                    {callStatus === 'recording' ? (
+                      <StopCircle className="w-4 h-4" />
+                    ) : (
+                      <Mic className="w-4 h-4" />
+                    )}
+                  </Button>
+                )}
                 <Textarea
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
                   placeholder={
-                    agentModeEnabled && selectedTools.size > 0
+                    callModeEnabled
+                      ? 'Record audio with mic, then optionally add text or images...'
+                      : agentModeEnabled && selectedTools.size > 0
                       ? 'Ask me anything... (agent mode enabled)'
                       : 'Type a message... (paste or drop images)'
                   }
                   className="min-h-[44px] max-h-32"
                   rows={1}
                 />
-                {isLoading ? (
+                {isLoading && callModeEnabled ? (
+                  <Button
+                    type="button"
+                    disabled
+                    className="shrink-0"
+                  >
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  </Button>
+                ) : isLoading ? (
                   <Button
                     type="button"
                     variant="destructive"
@@ -1040,7 +1606,12 @@ export function AgentPlayground() {
                 ) : (
                   <Button
                     type="submit"
-                    disabled={(!input.trim() && pendingImages.length === 0) || isLoading}
+                    disabled={
+                      isLoading ||
+                      (callModeEnabled
+                        ? !pendingAudio
+                        : (!input.trim() && pendingImages.length === 0))
+                    }
                     className="shrink-0"
                   >
                     <Send className="w-4 h-4" />
@@ -1050,7 +1621,18 @@ export function AgentPlayground() {
               <p className="text-2xs text-muted-foreground mt-2 text-center font-mono">
                 Enter to send | Shift+Enter for new line
                 {agentModeEnabled && ' | Agent mode: max 10 iterations'}
+                {callModeEnabled && ' | Call mode: record, then send'}
               </p>
+              {callModeEnabled && (
+                <p className="text-2xs text-muted-foreground mt-1 text-center font-mono">
+                  Status: {callStatus}
+                </p>
+              )}
+              {callError && (
+                <p className="text-2xs text-destructive mt-1 text-center font-mono">
+                  {callError}
+                </p>
+              )}
             </div>
           </div>
 

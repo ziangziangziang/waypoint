@@ -4,6 +4,8 @@ import { routeRequest } from "../routing/router";
 import { logRequest } from "../storage/repositories";
 import { RequestLog } from "../types";
 import { StoragePaths } from "../storage/files";
+import { selectPoolCandidates } from "../pools/scheduler";
+import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 
 interface EmbeddingsBody {
   model: string;
@@ -13,7 +15,29 @@ interface EmbeddingsBody {
 
 export async function registerEmbeddingsRoutes(app: FastifyInstance, paths: StoragePaths): Promise<void> {
   app.post("/v1/embeddings", async (req: FastifyRequest, reply: FastifyReply) => {
-    const body = req.body as EmbeddingsBody | undefined;
+    let body = req.body as EmbeddingsBody | undefined;
+    if (!body?.model) {
+      const smart = await selectPoolCandidates(paths, "smart", {
+        requiredInput: ["text"],
+        requiredOutput: ["embedding"],
+      }, {
+        operation: "embeddings",
+        stream: false,
+      });
+      if (smart && smart.candidates.length > 0) {
+        body = { ...(body ?? { input: "" }), model: "smart" };
+      }
+    }
+    if (!body?.model) {
+      const direct = await pickBestProviderModelByCapabilities(
+        paths,
+        { requiredInput: ["text"], requiredOutput: ["embedding"] },
+        "embedding"
+      );
+      if (direct) {
+        body = { ...(body ?? { input: "" }), model: direct };
+      }
+    }
     if (!body?.model) {
       reply.code(400).send({ error: { message: "model is required" } });
       return;
@@ -32,7 +56,12 @@ export async function registerEmbeddingsRoutes(app: FastifyInstance, paths: Stor
         "/v1/embeddings",
         body as Record<string, unknown>,
         req.headers as Record<string, string | string[] | undefined>,
-        controller.signal
+        controller.signal,
+        {
+          endpointType: "embedding",
+          requiredInput: ["text"],
+          requiredOutput: ["embedding"],
+        }
       );
 
       const upstreamBody = await readBody(outcome.attempt.response);
@@ -51,7 +80,23 @@ export async function registerEmbeddingsRoutes(app: FastifyInstance, paths: Stor
           errorMessage: (error as Error).message
         }
       });
-      const status = errorType === "no_endpoints" ? 400 : 502;
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
       reply.code(status).send({ error: { message: "Upstream unavailable" } });
     }
   });

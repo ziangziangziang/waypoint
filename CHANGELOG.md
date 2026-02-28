@@ -1,92 +1,73 @@
 # Changelog
 
-All notable changes to Waypoint will be documented in this file.
+All notable changes to Waypoint are documented here.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.4.2] - 2026-02-23
+
+### Added
+
+- Model-level capability classification (`input`/`output` modalities) on model mappings.
+- `/v1/models` now returns `capabilities` per model while keeping `endpoint_type` for compatibility.
+- Capability inference engine with config-first precedence and heuristic fallback.
+- Benchmark mode expansion to embeddings, image generation, and audio (speech/transcription), with per-mode assertions.
+- Benchmark skip+warn behavior for unconfigured model families plus per-mode summary metrics.
+
+### Changed
+
+- Route eligibility now supports capability requirements (`requiredInput`/`requiredOutput`) in addition to endpoint type.
+- Default model selection prefers capability-matching models before endpoint-type fallback.
+- Playground model picker labels now show capability tags when available (e.g. `text+image->text`).
+
+## [0.4.1] - 2026-02-23
+
+### Added
+
+- Config-first benchmark system with profile support (`--config`, `--profile`).
+- Benchmark baseline comparison support (`--baseline`) for soft regression warnings.
+- New benchmark artifact pair per run (`.json` + `.txt`) with gate outcomes and per-scenario measured samples.
+- Example benchmark config and scenario files under `examples/`.
+
+### Changed
+
+- Benchmark runner now executes warmup + measured runs and reports pass rate per scenario.
+- Scenario schema validation now enforces required fields and emits location-aware error messages.
+- Agent benchmark loop now enforces per-tool timeout and max-iteration failure reason (`max_iterations_reached`).
+
+### Fixed
+
+- Benchmark gate semantics now separate hard failures (exit code 1) from soft warnings (exit code 0).
+
+## [0.4.0] - 2026-02-23
+
+### Changed
+
+- Realigned product scope around **model proxy + playground + benchmark**.
+- Removed embedded CLI coding-agent runtime surface (`agent`, `run`, `doctor`, and implicit prompt execution).
+- Added `waypoint bench` / `waypoint benchmark` command for lightweight benchmarking.
+- Added built-in smoke suite and file-driven scenario support (`.json`, `.jsonl`, `.yaml`).
+- Added benchmark artifacts under `$WAYPOINT_DIR/benchmarks` (or `~/.config/waypoint/benchmarks`).
+- Updated docs to position Waypoint as a local gateway for external clients (including Opencode).
+
+### Added
+
+- `docs/opencode.md` for proxy-only Opencode integration.
+- `docs/benchmark.md` for benchmark scenarios, assertions, and artifact output.
+
+### Fixed
+
+- Image cache now accepts both raw base64 and `data:image/...;base64,...` payloads.
+- New sessions now default to cache-backed image references (`storageVersion: 2`) to avoid session JSON bloat.
+- MCP startup/discovery errors are now concise by default, with optional verbose logs via `WAYPOINT_DEBUG_ERRORS=1`.
 
 ## [0.3.0] - 2026-01-29
 
 ### Added
 
-- **Interactive Agent Mode** - `waypoint agent` command launches the full TUI experience
-  - Same interface as running `codex` directly
-  - Auto-picks model from available endpoints
-  - Respects `--model` and `--cwd` options
-- **Auto Model Selection** - Agent runtime automatically picks the best available LLM model when no `--model` flag is specified
-  - Selects from healthy endpoints based on priority and latency
-  - Uses `pickBestLlmModel()` from storage repositories
-- **SSE Streaming for Responses API** - `/v1/responses` now supports proper Server-Sent Events streaming format compatible with Codex agent runtime
-  - Events: `response.created`, `response.output_item.done`, `response.completed`
-  - Content type uses `output_text` (Codex format) instead of `text`
-  - Tool calls transformed to `function_call` output items
-- **Tool Format Transformation** - Codex tool format automatically converted to OpenAI function calling format
-  - Wraps `{type:"function", name, parameters}` → `{type:"function", function:{name, parameters}}`
-  - Filters out `web_search` tools (not OpenAI compatible)
-- **Message Content Transformation** - Fixes `input_text` → `text` content part types for OpenAI compatibility
+- Responses API compatibility and streaming support.
+- MCP tool-call compatibility improvements.
+- Waypoint branding and runtime integration updates.
 
 ### Fixed
 
-- **Agent streaming compatibility** - Agent runtime now works correctly with Waypoint proxy (was failing with "stream closed before response.completed")
-- **Models API Codex compatibility** - `/v1/models` now includes both `data` (OpenAI) and `models` (Codex) fields
-- **Skip login for localhost** - Codex TUI no longer shows login screen when `OPENAI_BASE_URL` points to localhost (Waypoint proxy)
-
----
-
-## [Unreleased]
-
-### Added
-
-- **Agent Runtime** - Waypoint now includes an integrated agent runtime
-  - `waypoint run "<prompt>"` - explicit agent execution command
-  - `waypoint "<prompt>"` - shorthand (any unrecognized command is treated as an agent prompt)
-  - `waypoint doctor` - verify agent configuration and isolation invariants
-- **Agent Isolation** - complete isolation from global Codex installations
-  - All agent data stored in `~/.config/waypoint/codex` (never `~/.codex`)
-  - All API requests routed through Waypoint proxy (never `api.openai.com`)
-  - Runtime verification of isolation invariants
-- **Agent Configuration**
-  - `WAYPOINT_CODEX_HOME` - override agent data directory
-  - `WAYPOINT_BASE_URL` - override API endpoint
-  - `WAYPOINT_API_KEY` - override authentication
-  - `WAYPOINT_DEFAULT_MODEL` - set default model for agent
-- **Agent CLI Options**
-  - `--model, -m <model>` - specify model for agent execution
-  - `--auto` - enable full-auto approval mode
-  - `--suggest` - require approval for all actions (default)
-  - `--no-network` - disable network access in sandbox
-  - `--cwd, -d <directory>` - set working directory
-- **waypoint status command** - added as alias to `waypoint stat` for convenience
-- **API key support in health checks** - health checks now include Authorization headers when endpoints have apiKey configured
-- **On-demand health checks** - `waypoint ls` now refreshes endpoint health status before displaying (use `--no-check` to skip)
-- **Health check logging** - verbose output showing status codes and error details during health checks
-- **App icon & favicon** - Custom Waypoint icon in multiple sizes (16, 32, 180, 192, 512px) with apple-touch-icon support
-- **Markdown rendering** in chat responses with full GitHub Flavored Markdown support
-- **Mermaid diagram support** - code blocks with `mermaid` language are rendered as interactive diagrams
-- **Collapsible thinking blocks** - `<think>...</think>` content is displayed in a collapsible "Thinking process" section
-- **Copy raw button** - hover over any assistant message to copy the raw markdown content
-- **Code block copy buttons** - each code block has a copy button with syntax highlighting
-
-### Fixed
-
-- **ERR_HTTP_HEADERS_SENT crash** - server no longer crashes when timeouts occur during streaming; checks if headers are already sent before attempting error responses
-- **Stale health status** - CLI commands now show real-time endpoint health instead of cached status
-- **Health check accuracy** - changed logic to only consider 2xx responses as "up" (404 and 403 now correctly mark endpoints as "down")
-- **Models API filtering** - `/v1/models` now only returns models from healthy endpoints
-- **Timeout handling** - added comprehensive error classification for undici timeout errors (UND_ERR_HEADERS_TIMEOUT, UND_ERR_BODY_TIMEOUT, UND_ERR_CONNECT_TIMEOUT)
-- **Stream error handling** - added handling for premature stream closures (ERR_STREAM_PREMATURE_CLOSE, EPIPE, ECONNABORTED)
-- **MCP Accept header** - fixed MCP client to send `Accept: application/json, text/event-stream` per Streamable HTTP spec
-- **MCP SSE response parsing** - added proper parsing for `event: message\ndata: {...}` response format
-- **Tool choice compatibility** - removed `tool_choice: "auto"` from requests for vLLM backend compatibility
-- **MCP auto-connect on startup** - tools are now discovered automatically when Waypoint starts, fixing "Tool not found" errors after restart
-- **Thinking block parsing** - handles responses that start with thinking content without opening `<think>` tag (common with Qwen3 models)
-- **Mermaid rendering errors** - added `suppressErrorRendering`, debounced rendering (300ms), and DOM cleanup to prevent error SVGs from appearing during streaming
-- **Chat input jumping** - replaced `scrollIntoView` with direct `scrollTop` manipulation and `requestAnimationFrame` for smooth, jitter-free auto-scrolling
-- **Mermaid re-triggering** - wrapped `MessageContent` component with `memo` to prevent unnecessary re-renders when typing in chat box
-
-### Changed
-
-- **Health check timeouts** - increased background health checker timeout from 2s to 5s for more reliable checks
-- **TypeScript compilation** - excluded `src/engine` directory from build to avoid third-party code errors
-
-- **ThinkingBlock overflow** - added horizontal scroll for long lines in thinking block content
-- **Scroll behavior** - only auto-scrolls when user is near bottom (within 150px), allowing users to scroll up without jumping back
+- Model-list compatibility improvements (`slug` and compatibility fields).
+- Localhost login bypass behavior for proxied local deployments.

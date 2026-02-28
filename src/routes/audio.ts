@@ -2,9 +2,11 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { randomUUID } from "crypto";
 import { pipeline } from "stream";
 import { routeRequest } from "../routing/router";
-import { logRequest, listEligibleEndpoints, sortEndpointsForRouting } from "../storage/repositories";
+import { logRequest } from "../storage/repositories";
 import { RequestLog } from "../types";
 import { StoragePaths } from "../storage/files";
+import { selectPoolCandidates } from "../pools/scheduler";
+import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 
 export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePaths): Promise<void> {
   // POST /v1/audio/transcriptions (speech-to-text)
@@ -14,7 +16,7 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
     
     const model = (body?.model as string) ?? await pickDefaultAudioModel(paths);
     if (!model) {
-      reply.code(400).send({ error: { message: "No audio model available. Please add an audio endpoint." } });
+      reply.code(400).send({ error: { message: "No audio model available. Add or enable a provider model." } });
       return;
     }
 
@@ -32,7 +34,11 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
         body as Record<string, unknown>,
         req.headers as Record<string, string | string[] | undefined>,
         controller.signal,
-        "audio"
+        {
+          endpointType: "audio",
+          requiredInput: ["audio"],
+          requiredOutput: ["text"],
+        }
       );
 
       const upstreamBody = await readBody(outcome.attempt.response);
@@ -54,7 +60,23 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
         request: { stream: false },
         result: { errorType, errorMessage: (error as Error).message }
       });
-      const status = errorType === "no_endpoints" ? 400 : 502;
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message, type: errorType } });
+        return;
+      }
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
       reply.code(status).send({ error: { message: "Transcription unavailable", type: errorType } });
     }
   });
@@ -65,7 +87,7 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
     
     const model = (body?.model as string) ?? await pickDefaultAudioModel(paths);
     if (!model) {
-      reply.code(400).send({ error: { message: "No audio model available" } });
+      reply.code(400).send({ error: { message: "No audio model available. Add or enable a provider model." } });
       return;
     }
 
@@ -83,7 +105,11 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
         body as Record<string, unknown>,
         req.headers as Record<string, string | string[] | undefined>,
         controller.signal,
-        "audio"
+        {
+          endpointType: "audio",
+          requiredInput: ["audio"],
+          requiredOutput: ["text"],
+        }
       );
 
       const upstreamBody = await readBody(outcome.attempt.response);
@@ -100,7 +126,24 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
         request: { stream: false },
         result: { errorType, errorMessage: (error as Error).message }
       });
-      reply.code(502).send({ error: { message: "Translation unavailable" } });
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message, type: errorType } });
+        return;
+      }
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
+      reply.code(status).send({ error: { message: "Translation unavailable", type: errorType } });
     }
   });
 
@@ -115,7 +158,7 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
 
     const model = body.model ?? await pickDefaultTtsModel(paths);
     if (!model) {
-      reply.code(400).send({ error: { message: "No TTS model available. Please add an audio endpoint." } });
+      reply.code(400).send({ error: { message: "No TTS model available. Add or enable a text-to-audio provider model." } });
       return;
     }
 
@@ -133,7 +176,11 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
         { ...body, model } as Record<string, unknown>,
         req.headers as Record<string, string | string[] | undefined>,
         controller.signal,
-        "audio"
+        {
+          endpointType: "audio",
+          requiredInput: ["text"],
+          requiredOutput: ["audio"],
+        }
       );
 
       // Speech returns binary audio - stream it directly
@@ -155,42 +202,70 @@ export async function registerAudioRoutes(app: FastifyInstance, paths: StoragePa
         reply.raw.end();
         return;
       }
-      const status = errorType === "no_endpoints" ? 400 : 502;
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message, type: errorType } });
+        return;
+      }
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
       reply.code(status).send({ error: { message: "Speech synthesis unavailable", type: errorType } });
     }
   });
 }
 
 async function pickDefaultAudioModel(paths: StoragePaths): Promise<string | null> {
-  const endpoints = sortEndpointsForRouting(await listEligibleEndpoints(paths));
-  for (const endpoint of endpoints) {
-    if (endpoint.type === "audio") {
-      // Look for whisper-like model names
-      const model = endpoint.models.find(m => 
-        m.publicName.toLowerCase().includes("whisper") ||
-        m.publicName.toLowerCase().includes("transcription")
-      )?.publicName ?? endpoint.models[0]?.publicName;
-      if (model) {
-        return model;
-      }
-    }
+  const smart = await selectPoolCandidates(paths, "smart", {
+    requiredInput: ["audio"],
+    requiredOutput: ["text"],
+  }, {
+    operation: "audio_transcriptions",
+    stream: false,
+  });
+  if (smart && smart.candidates.length > 0) {
+    return "smart";
+  }
+
+  const byCapabilities = await pickBestProviderModelByCapabilities(
+    paths,
+    { requiredInput: ["audio"], requiredOutput: ["text"] },
+    "audio"
+  );
+  if (byCapabilities) {
+    return byCapabilities;
   }
   return null;
 }
 
 async function pickDefaultTtsModel(paths: StoragePaths): Promise<string | null> {
-  const endpoints = sortEndpointsForRouting(await listEligibleEndpoints(paths));
-  for (const endpoint of endpoints) {
-    if (endpoint.type === "audio") {
-      // Look for TTS-like model names
-      const model = endpoint.models.find(m => 
-        m.publicName.toLowerCase().includes("tts") ||
-        m.publicName.toLowerCase().includes("speech")
-      )?.publicName ?? endpoint.models[0]?.publicName;
-      if (model) {
-        return model;
-      }
-    }
+  const smart = await selectPoolCandidates(paths, "smart", {
+    requiredInput: ["text"],
+    requiredOutput: ["audio"],
+  }, {
+    operation: "audio_speech",
+    stream: false,
+  });
+  if (smart && smart.candidates.length > 0) {
+    return "smart";
+  }
+
+  const byCapabilities = await pickBestProviderModelByCapabilities(
+    paths,
+    { requiredInput: ["text"], requiredOutput: ["audio"] },
+    "audio"
+  );
+  if (byCapabilities) {
+    return byCapabilities;
   }
   return null;
 }

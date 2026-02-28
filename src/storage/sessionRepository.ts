@@ -39,9 +39,7 @@ export async function listSessions(paths: StoragePaths): Promise<ChatSession[]> 
       try {
         const filePath = path.join(sessionsDir, file);
         const raw = await fs.readFile(filePath, "utf8");
-        const session = JSON.parse(raw) as ChatSession;
-        session.createdAt = new Date(session.createdAt);
-        session.updatedAt = new Date(session.updatedAt);
+        const session = parseSession(JSON.parse(raw) as ChatSession);
         sessions.push(session);
       } catch {
         // Skip malformed session files
@@ -64,16 +62,7 @@ export async function getSession(paths: StoragePaths, sessionId: string): Promis
   
   try {
     const raw = await fs.readFile(filePath, "utf8");
-    const session = JSON.parse(raw) as ChatSession;
-    session.createdAt = new Date(session.createdAt);
-    session.updatedAt = new Date(session.updatedAt);
-    
-    // Parse message dates
-    for (const message of session.messages) {
-      message.createdAt = new Date(message.createdAt);
-    }
-    
-    return session;
+    return parseSession(JSON.parse(raw) as ChatSession);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
@@ -93,6 +82,9 @@ export async function createSession(
     id: crypto.randomUUID(),
     name: input.name ?? `Session ${now.toLocaleDateString()}`,
     model: input.model,
+    titleStatus: input.name ? "manual" : "pending",
+    titleUpdatedAt: now,
+    storageVersion: 2,
     messages: [],
     createdAt: now,
     updatedAt: now,
@@ -105,14 +97,23 @@ export async function createSession(
 export async function updateSession(
   paths: StoragePaths,
   sessionId: string,
-  patch: Partial<Pick<ChatSession, "name" | "model">>
+  patch: Partial<Pick<ChatSession, "name" | "model" | "titleStatus" | "titleUpdatedAt">>
 ): Promise<ChatSession | null> {
   const session = await getSession(paths, sessionId);
   if (!session) return null;
   
+  const titleStatus =
+    patch.titleStatus ??
+    (patch.name !== undefined ? "manual" : session.titleStatus);
+  const titleUpdatedAt =
+    patch.titleUpdatedAt ??
+    (patch.name !== undefined || patch.titleStatus !== undefined ? new Date() : session.titleUpdatedAt);
+
   const updated: ChatSession = {
     ...session,
     ...patch,
+    titleStatus,
+    titleUpdatedAt,
     updatedAt: new Date(),
   };
   
@@ -178,4 +179,39 @@ async function saveSession(paths: StoragePaths, session: ChatSession): Promise<v
   const filePath = sessionFilePath(paths, session.id);
   const json = JSON.stringify(session, null, 2);
   await fs.writeFile(filePath, json, "utf8");
+}
+
+function parseSession(raw: ChatSession): ChatSession {
+  const session: ChatSession = {
+    ...raw,
+    storageVersion: typeof raw.storageVersion === "number" ? raw.storageVersion : 1,
+    titleStatus:
+      raw.titleStatus === "pending" ||
+      raw.titleStatus === "generated" ||
+      raw.titleStatus === "manual" ||
+      raw.titleStatus === "failed"
+        ? raw.titleStatus
+        : undefined,
+    titleUpdatedAt: raw.titleUpdatedAt ? new Date(raw.titleUpdatedAt) : undefined,
+    createdAt: new Date(raw.createdAt),
+    updatedAt: new Date(raw.updatedAt),
+    messages: Array.isArray(raw.messages)
+      ? raw.messages.map((message) => ({
+          ...message,
+          createdAt: parseMessageDate(message),
+        }))
+      : [],
+  };
+
+  return session;
+}
+
+function parseMessageDate(message: ChatMessage & { timestamp?: string }): Date {
+  if (message.createdAt) {
+    return new Date(message.createdAt);
+  }
+  if (typeof message.timestamp === "string") {
+    return new Date(message.timestamp);
+  }
+  return new Date();
 }

@@ -1,0 +1,5 @@
+{"id":"jsonl-chat-1","mode":"chat","prompt":"Say WAYPOINT_JSONL_OK","assertions":{"contains":"WAYPOINT_JSONL_OK","statusCode":200}}
+{"id":"jsonl-agent-1","mode":"agent","prompt":"Use a tool if available then answer.","assertions":{"statusCode":200}}
+{"id":"jsonl-emb-1","mode":"embeddings","input":"waypoint jsonl embedding","assertions":{"minItems":1,"minVectorLength":1,"statusCode":200}}
+{"id":"jsonl-img-1","mode":"image_generation","prompt":"A simple blue square","assertions":{"minImages":1,"statusCode":200}}
+{"id":"jsonl-tts-1","mode":"audio_speech","inputText":"Waypoint jsonl speech","voice":"alloy","assertions":{"minBytes":1,"statusCode":200}}

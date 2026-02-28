@@ -1,10 +1,12 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { randomUUID } from "crypto";
-import { pipeline } from "stream";
 import { routeRequest } from "../routing/router";
-import { logRequest, listEligibleEndpoints, sortEndpointsForRouting } from "../storage/repositories";
+import { logRequest } from "../storage/repositories";
 import { ImageGenerationRequest, RequestLog } from "../types";
 import { StoragePaths } from "../storage/files";
+import { selectPoolCandidates } from "../pools/scheduler";
+import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
+import { resolveGenerationModel, runImageGeneration } from "../services/imageGeneration";
 
 export async function registerImageRoutes(app: FastifyInstance, paths: StoragePaths): Promise<void> {
   // POST /v1/images/generations
@@ -16,9 +18,9 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
       return;
     }
 
-    const model = body.model ?? await pickDefaultDiffusionModel(paths);
+    const model = await resolveGenerationModel(paths, body.model);
     if (!model) {
-      reply.code(400).send({ error: { message: "No diffusion model available. Please add a diffusion endpoint." } });
+      reply.code(400).send({ error: { message: "No diffusion model available. Add or enable a provider model." } });
       return;
     }
 
@@ -29,24 +31,30 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
     req.raw.on("close", () => controller.abort());
 
     try {
-      const outcome = await routeRequest(
+      const generated = await runImageGeneration(
         paths,
-        model,
-        "/v1/images/generations",
-        { ...body, model } as Record<string, unknown>,
+        { ...body, model },
         req.headers as Record<string, string | string[] | undefined>,
-        controller.signal,
-        "diffusion"
+        controller.signal
       );
-
-      const upstreamBody = await readBody(outcome.attempt.response);
-      setHeaders(reply, outcome.attempt.response.headers);
-      reply.code(outcome.attempt.response.statusCode).send(upstreamBody.payload);
+      setHeaders(reply, generated.headers);
+      reply.code(generated.statusCode).send(generated.payload);
       
       await logRequest(paths, buildLog(
         requestId,
         model,
-        outcome,
+        {
+          attempt: {
+            endpoint: {
+              id: generated.route.endpointId,
+              name: generated.route.endpointName,
+            },
+            upstreamModel: generated.route.upstreamModel,
+            response: {
+              statusCode: generated.statusCode,
+            },
+          },
+        },
         Date.now() - start,
         false
       ));
@@ -62,7 +70,23 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
           errorMessage: (error as Error).message
         }
       });
-      const status = errorType === "no_endpoints" ? 400 : 502;
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message, type: errorType } });
+        return;
+      }
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
       reply.code(status).send({ error: { message: "Image generation unavailable", type: errorType } });
     }
   });
@@ -96,7 +120,11 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
         body as Record<string, unknown>,
         req.headers as Record<string, string | string[] | undefined>,
         controller.signal,
-        "diffusion"
+        {
+          endpointType: "diffusion",
+          requiredInput: ["image"],
+          requiredOutput: ["image"],
+        }
       );
 
       const upstreamBody = await readBody(outcome.attempt.response);
@@ -113,7 +141,24 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
         request: { stream: false },
         result: { errorType, errorMessage: (error as Error).message }
       });
-      reply.code(502).send({ error: { message: "Image edit unavailable" } });
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message, type: errorType } });
+        return;
+      }
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
+      reply.code(status).send({ error: { message: "Image edit unavailable", type: errorType } });
     }
   });
 
@@ -121,7 +166,7 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
   app.post("/v1/images/variations", async (req: FastifyRequest, reply: FastifyReply) => {
     const body = req.body as { model?: string } | undefined;
 
-    const model = body?.model ?? await pickDefaultDiffusionModel(paths);
+    const model = body?.model ?? await pickDefaultImageEditModel(paths);
     if (!model) {
       reply.code(400).send({ error: { message: "No diffusion model available" } });
       return;
@@ -141,7 +186,11 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
         (body ?? {}) as Record<string, unknown>,
         req.headers as Record<string, string | string[] | undefined>,
         controller.signal,
-        "diffusion"
+        {
+          endpointType: "diffusion",
+          requiredInput: ["image"],
+          requiredOutput: ["image"],
+        }
       );
 
       const upstreamBody = await readBody(outcome.attempt.response);
@@ -158,22 +207,72 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
         request: { stream: false },
         result: { errorType, errorMessage: (error as Error).message }
       });
-      reply.code(502).send({ error: { message: "Image variation unavailable" } });
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message, type: errorType } });
+        return;
+      }
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
+      reply.code(status).send({ error: { message: "Image variation unavailable", type: errorType } });
     }
   });
 }
 
 async function pickDefaultDiffusionModel(paths: StoragePaths): Promise<string | null> {
-  const endpoints = sortEndpointsForRouting(await listEligibleEndpoints(paths));
-  for (const endpoint of endpoints) {
-    if (endpoint.type === "diffusion") {
-      const model = endpoint.models[0]?.publicName;
-      if (model) {
-        return model;
-      }
-    }
+  const smart = await selectPoolCandidates(paths, "smart", {
+    requiredInput: ["text"],
+    requiredOutput: ["image"],
+  }, {
+    operation: "images_generation",
+    stream: false,
+  });
+  if (smart && smart.candidates.length > 0) {
+    return "smart";
+  }
+
+  const byCapabilities = await pickBestProviderModelByCapabilities(
+    paths,
+    { requiredInput: ["text"], requiredOutput: ["image"] },
+    "diffusion"
+  );
+  if (byCapabilities) {
+    return byCapabilities;
   }
   return null;
+}
+
+async function pickDefaultImageEditModel(paths: StoragePaths): Promise<string | null> {
+  const smart = await selectPoolCandidates(paths, "smart", {
+    requiredInput: ["image", "text"],
+    requiredOutput: ["image"],
+  }, {
+    operation: "images_edits",
+    stream: false,
+  });
+  if (smart && smart.candidates.length > 0) {
+    return "smart";
+  }
+
+  const byCapabilities = await pickBestProviderModelByCapabilities(
+    paths,
+    { requiredInput: ["image"], requiredOutput: ["image"] },
+    "diffusion"
+  );
+  if (byCapabilities) {
+    return byCapabilities;
+  }
+  return pickDefaultDiffusionModel(paths);
 }
 
 function setHeaders(reply: FastifyReply, headers: Record<string, string | string[]>): void {

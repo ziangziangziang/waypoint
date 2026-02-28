@@ -9,17 +9,16 @@ import {
   Server
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { EndpointUsageGuide } from '@/components/EndpointUsageGuide'
 import { cn } from '@/lib/utils'
 import { 
   getStats, 
   getLatencyDistribution,
   getTokenUsage,
-  listEndpoints,
+  listProviders as listProviderCatalog,
   type StatsAggregation,
   type LatencyDistribution,
   type TokenUsage,
-  type Endpoint
+  type Provider
 } from '@/api/client'
 import {
   BarChart,
@@ -39,23 +38,23 @@ export function Dashboard() {
   const [stats, setStats] = useState<StatsAggregation | null>(null)
   const [latency, setLatency] = useState<LatencyDistribution | null>(null)
   const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null)
-  const [endpoints, setEndpoints] = useState<Endpoint[]>([])
+  const [providers, setProviders] = useState<Provider[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [timeWindow, setTimeWindow] = useState('24h')
 
   const loadData = async () => {
     setIsLoading(true)
     try {
-      const [statsData, latencyData, tokenData, endpointsData] = await Promise.all([
+      const [statsData, latencyData, tokenData, providersData] = await Promise.all([
         getStats(timeWindow),
         getLatencyDistribution(timeWindow),
         getTokenUsage(timeWindow),
-        listEndpoints(),
+        listProviderCatalog(),
       ])
       setStats(statsData)
       setLatency(latencyData)
       setTokenUsage(tokenData)
-      setEndpoints(endpointsData)
+      setProviders(providersData)
     } catch (error) {
       console.error('Failed to load dashboard data:', error)
     } finally {
@@ -84,11 +83,16 @@ export function Dashboard() {
 
   // Transform token usage by day for chart
   const tokenChartData = tokenUsage?.byDay ?? []
+  const totalProviderModels = providers.reduce((sum, provider) => sum + provider.models.length, 0)
+  const enabledProviderModels = providers.reduce(
+    (sum, provider) => sum + provider.models.filter((model) => model.enabled !== false).length,
+    0
+  )
 
   return (
-    <div className="flex-1 flex flex-col h-screen overflow-auto">
+    <div className="flex-1 flex flex-col h-screen min-h-0">
       {/* Header */}
-      <header className="h-14 border-b border-border flex items-center px-6 gap-4 shrink-0">
+      <header className="sticky top-0 z-20 h-14 border-b border-border bg-background/95 backdrop-blur flex items-center px-6 gap-4 shrink-0">
         <div className="flex items-center gap-2">
           <Activity className="w-4 h-4 text-primary" />
           <h2 className="font-mono font-semibold text-sm uppercase tracking-wider">Dashboard</h2>
@@ -125,7 +129,7 @@ export function Dashboard() {
       </header>
 
       {/* Dashboard Content */}
-      <div className="flex-1 p-6 space-y-6 overflow-auto">
+      <div className="flex-1 min-h-0 p-6 space-y-6 overflow-auto">
         {/* Metrics Grid */}
         <div className="grid grid-cols-4 gap-4">
           <MetricCard
@@ -361,52 +365,50 @@ export function Dashboard() {
           </div>
         )}
 
-        {/* Endpoints Status */}
+        {/* Providers + Models */}
         <div className="panel">
           <div className="panel-header">
             <Server className="w-4 h-4 text-muted-foreground" />
-            <span className="panel-title">Endpoints</span>
+            <span className="panel-title">Providers & Models</span>
             <span className="text-2xs text-muted-foreground ml-auto">
-              {endpoints.length} configured
+              {providers.length} providers / {totalProviderModels} models
             </span>
           </div>
           <div className="divide-y divide-border">
-            {endpoints.length === 0 && (
+            {providers.length === 0 && (
               <div className="p-8 text-center text-muted-foreground">
-                <p>No endpoints configured</p>
-                <p className="text-xs mt-1">Add endpoints via CLI: waypoint add</p>
+                <p>No providers configured</p>
+                <p className="text-xs mt-1">Import providers via CLI: waypoint provider import</p>
               </div>
             )}
-            {endpoints.map((endpoint) => (
-              <div key={endpoint.id} className="divide-y divide-border/30">
-                <div className="p-4 flex items-center gap-4">
-                  <div className={cn(
-                    'status-dot',
-                    endpoint.health.status === 'up' ? 'status-dot-live' : 'status-dot-down'
-                  )} />
+            {providers.map((provider) => (
+              <div key={provider.id} className="p-4">
+                <div className="flex items-center gap-4">
+                  <div className={cn('status-dot', provider.enabled ? 'status-dot-live' : 'status-dot-down')} />
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-sm truncate">{endpoint.name}</p>
-                    <p className="text-xs text-muted-foreground truncate font-mono">
-                      {endpoint.baseUrl}
-                    </p>
+                    <p className="font-medium text-sm truncate">{provider.id}</p>
+                    <p className="text-xs text-muted-foreground truncate font-mono">{provider.baseUrl}</p>
                   </div>
                   <div className="text-right">
                     <p className="text-sm font-mono tabular-nums">
-                      {endpoint.health.latencyMsEwma?.toFixed(0) ?? '-'} ms
+                      {provider.models.filter((model) => model.enabled !== false).length}/{provider.models.length}
                     </p>
-                    <p className="text-2xs text-muted-foreground">avg latency</p>
+                    <p className="text-2xs text-muted-foreground">enabled models</p>
                   </div>
                   <div className="text-right">
                     <p className="text-xs font-mono uppercase px-2 py-0.5 rounded bg-secondary">
-                      {endpoint.type}
+                      {provider.protocolRaw ?? provider.protocol}
                     </p>
                   </div>
                 </div>
-                <EndpointUsageGuide endpoint={endpoint} />
               </div>
             ))}
           </div>
+          <div className="px-4 pb-4 pt-2 text-xs text-muted-foreground">
+            Enabled models: {enabledProviderModels} / {totalProviderModels}
+          </div>
         </div>
+
       </div>
     </div>
   )

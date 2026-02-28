@@ -9,15 +9,21 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import type { Endpoint } from '@/api/client'
+import type { EndpointType } from '@/api/client'
 
-interface EndpointUsageGuideProps {
-  endpoint: Endpoint
+export interface UsageGuideTarget {
+  id: string
+  type: EndpointType
+  models: Array<{ publicName: string }>
 }
 
 type TabId = 'curl' | 'python' | 'nodejs'
 
-export function EndpointUsageGuide({ endpoint }: EndpointUsageGuideProps) {
+interface EndpointUsageGuideProps {
+  target: UsageGuideTarget
+}
+
+export function EndpointUsageGuide({ target }: EndpointUsageGuideProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<TabId>('curl')
   const [copiedId, setCopiedId] = useState<string | null>(null)
@@ -28,7 +34,7 @@ export function EndpointUsageGuide({ endpoint }: EndpointUsageGuideProps) {
     : 'http://localhost:8000'
 
   // Get the first model's public name (most common use case)
-  const modelName = endpoint.models[0]?.publicName ?? 'model-name'
+  const modelName = target.models[0]?.publicName ?? 'model-name'
 
   const copyToClipboard = async (text: string, id: string) => {
     await navigator.clipboard.writeText(text)
@@ -37,7 +43,7 @@ export function EndpointUsageGuide({ endpoint }: EndpointUsageGuideProps) {
   }
 
   const generateExamples = () => {
-    switch (endpoint.type) {
+    switch (target.type) {
       case 'llm':
         return generateLlmExamples()
       case 'diffusion':
@@ -283,7 +289,7 @@ main();`,
           <div className="space-y-1">
             <p className="text-2xs font-mono uppercase text-muted-foreground">Available Models</p>
             <div className="flex flex-wrap gap-1">
-              {endpoint.models.map((model, i) => (
+              {target.models.map((model, i) => (
                 <span
                   key={i}
                   className="px-2 py-0.5 bg-secondary rounded text-xs font-mono"
@@ -322,9 +328,9 @@ main();`,
               variant="ghost"
               size="icon"
               className="absolute top-2 right-2 h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity bg-zinc-800 hover:bg-zinc-700"
-              onClick={() => copyToClipboard(examples[activeTab], `${endpoint.id}-${activeTab}`)}
+              onClick={() => copyToClipboard(examples[activeTab], `${target.id}-${activeTab}`)}
             >
-              {copiedId === `${endpoint.id}-${activeTab}` ? (
+              {copiedId === `${target.id}-${activeTab}` ? (
                 <Check className="w-3.5 h-3.5 text-green-400" />
               ) : (
                 <Copy className="w-3.5 h-3.5 text-zinc-400" />
@@ -340,9 +346,9 @@ main();`,
             </p>
             <p>
               <span className="font-medium">Endpoint Type:</span>{' '}
-              <span className="uppercase">{endpoint.type}</span>
+              <span className="uppercase">{target.type}</span>
             </p>
-            {endpoint.type === 'llm' && (
+            {target.type === 'llm' && (
               <p className="text-muted-foreground/70">
                 Supports streaming via <code className="bg-secondary px-1 py-0.5 rounded">stream: true</code>
               </p>

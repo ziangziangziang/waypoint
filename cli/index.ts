@@ -1,35 +1,71 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import {
-  createEndpoint,
-  deleteEndpointByIdOrName,
+  getModelCapabilitiesForEndpoint,
   getUsageByEndpoint,
   listEndpoints,
+  setEndpointDisabled,
   updateHealthCheck
 } from "../src/storage/repositories";
 import { Agent, request } from "undici";
-import { ensureStorageDir, loadConfig, resolveStoragePaths, saveConfig } from "../src/storage/files";
-import { spawn, spawnSync } from "child_process";
+import { ensureStorageDir, resolveStoragePaths } from "../src/storage/files";
+import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
-import os from "os";
 import { routeRequest } from "../src/routing/router";
-import { resolveModelMappings } from "../src/utils/modelDiscovery";
-import { aggregateStats, readStatsForWindow, resolveStatsDir } from "../src/storage/statsRepository";
+import { aggregateStats } from "../src/storage/statsRepository";
 import { listMcpServers, addMcpServer, removeMcpServer, updateMcpServer } from "../src/mcp/registry";
-import { AgentRunner, buildAgentConfig, verifyIsolation } from "../src/agent/index";
+import { runBenchmark } from "../src/benchmark/runner";
+import { importProviders } from "../src/providers/importer";
+import { listModelsForApi } from "../src/providers/modelRegistry";
+import { getProviderModelHealthMap, probeProviderModels } from "../src/providers/health";
+import {
+  canonicalProviderModelId,
+  deleteProviderModel,
+  getProviderById,
+  getProviderModel,
+  listProviderModels,
+  listProviders,
+  setProviderModelApiKey,
+  setProviderModelEnabled,
+  setProviderEnabled,
+  updateProvider,
+  updateProviderModel,
+  normalizeDomainSuffixes,
+  upsertProvider,
+  upsertProviderModel,
+} from "../src/providers/repository";
+import { rebuildDefaultPools } from "../src/pools/builder";
+import { listPools } from "../src/pools/repository";
+import { canonicalizeProtocol, hasProtocolAdapter, listAdapterOperations } from "../src/protocols/registry";
+import { ProviderModelRecord, ProviderProtocol, ProviderRecord } from "../src/providers/types";
+import { ModelCapabilities, ModelModality } from "../src/types";
 
 const program = new Command();
 
 const paths = resolveStoragePaths();
 const pidFile = path.join(paths.baseDir, "waypoint.pid");
 
+function resolveDefaultRegistryPath(): string {
+  const candidates = [
+    path.resolve(process.cwd(), "providers/free-llm-api/registry.yaml"),
+    path.resolve(__dirname, "../providers/free-llm-api/registry.yaml"),
+    path.resolve(__dirname, "../../providers/free-llm-api/registry.yaml"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return candidates[0];
+}
+
 /**
  * Perform an on-demand health check for all endpoints.
  * Updates health.json with fresh status before returning.
  */
 async function refreshHealthStatus(): Promise<void> {
-  const endpoints = await listEndpoints(paths);
+  const endpoints = (await listEndpoints(paths)).filter((endpoint) => !endpoint.disabled);
   await Promise.all(
     endpoints.map(async (endpoint) => {
       const start = Date.now();
@@ -69,8 +105,8 @@ async function refreshHealthStatus(): Promise<void> {
 
 program
   .name("waypoint")
-  .description("Waypoint admin CLI")
-  .version("0.1.0");
+  .description("Waypoint proxy and operations CLI")
+  .version("0.5.3");
 
 program
   .command("add")
@@ -82,31 +118,17 @@ program
   .option("--insecureTls", "Allow self-signed TLS certificates")
   .option("--apiKey <apiKey>", "Bearer token for Authorization header")
   .option("--model <mapping...>", "Model mapping as 'public' or 'public=upstream'. If endpoint has 1 model, upstream is auto-detected.")
-  .action(async (options) => {
-    await ensureStorageDir(paths);
-    const mappings = await resolveModelMappings(
-      {
-        baseUrl: options.url,
-        apiKey: options.apiKey,
-        insecureTls: Boolean(options.insecureTls)
-      },
-      parseMappings(options.model ?? [])
+  .action(async () => {
+    console.error(
+      "Endpoint writes are deprecated in v0.5.0. Use `waypoint provider model add ...` and migration commands."
     );
-    const endpoint = await createEndpoint(paths, {
-      name: options.name,
-      baseUrl: options.url,
-      apiKey: options.apiKey,
-      insecureTls: Boolean(options.insecureTls),
-      priority: Number(options.priority),
-      type: normalizeType(options.type),
-      models: mappings
-    });
-    console.log(JSON.stringify(endpoint, null, 2));
+    process.exitCode = 1;
   });
 
 program
   .command("ls")
   .option("--no-check", "Skip health check for faster listing")
+  .option("--verbose", "Show full endpoint fields")
   .action(async (options) => {
     await ensureStorageDir(paths);
     // Refresh health status unless --no-check is specified
@@ -118,16 +140,25 @@ program
       console.log("No endpoints found.");
       return;
     }
-    console.table(
-      endpoints.map((endpoint) => ({
-        id: endpoint.id,
-        name: endpoint.name,
-        baseUrl: endpoint.baseUrl,
-        type: endpoint.type,
-        status: endpoint.health.status,
-        priority: endpoint.priority
-      }))
-    );
+    const rows = options.verbose
+      ? endpoints.map((endpoint) => ({
+          id: endpoint.id,
+          name: endpoint.name,
+          baseUrl: endpoint.baseUrl,
+          type: endpoint.type,
+          disabled: endpoint.disabled ? "yes" : "no",
+          status: endpoint.health.status,
+          priority: endpoint.priority,
+        }))
+      : endpoints.map((endpoint) => ({
+          name: endpoint.name,
+          host: compactEndpointUrl(endpoint.baseUrl),
+          type: endpoint.type,
+          disabled: endpoint.disabled ? "yes" : "no",
+          status: endpoint.health.status,
+          prio: endpoint.priority,
+        }));
+    console.table(rows);
   });
 
 program
@@ -157,29 +188,21 @@ program
 program
   .command("rm")
   .argument("<idOrName>")
-  .action(async (idOrName) => {
-    await ensureStorageDir(paths);
-    const endpoint = await deleteEndpointByIdOrName(paths, idOrName);
-    if (!endpoint) {
-      console.error("Endpoint not found");
-      process.exitCode = 1;
-      return;
-    }
-    console.log(JSON.stringify({ deleted: endpoint.name, id: endpoint.id }, null, 2));
+  .action(async () => {
+    console.error(
+      "Endpoint writes are deprecated in v0.5.0. Disable or migrate endpoints instead of deleting them."
+    );
+    process.exitCode = 1;
   });
 
 program
   .command("edit")
   .description("Open the config file in your editor")
   .action(async () => {
-    await ensureStorageDir(paths);
-    const config = await loadConfig(paths);
-    if (!config.endpoints) {
-      await saveConfig(paths, { endpoints: [] });
-    }
-    const editor = process.env.EDITOR ?? "vim";
-    const result = spawnSync(editor, [paths.configPath], { stdio: "inherit" });
-    process.exitCode = result.status ?? 0;
+    console.error(
+      "Endpoint config edit is blocked in v0.5.0. Use provider/model management commands instead."
+    );
+    process.exitCode = 1;
   });
 
 program
@@ -188,12 +211,13 @@ program
   .action(async () => {
     await ensureStorageDir(paths);
     const endpoints = await listEndpoints(paths);
-    if (endpoints.length === 0) {
+    const activeEndpoints = endpoints.filter((endpoint) => !endpoint.disabled);
+    if (activeEndpoints.length === 0) {
       console.log("No endpoints found.");
       return;
     }
     const results = await Promise.all(
-      endpoints.map(async (endpoint) => {
+      activeEndpoints.map(async (endpoint) => {
         const start = Date.now();
         try {
           const dispatcher = endpoint.insecureTls
@@ -221,6 +245,16 @@ program
         }
       })
     );
+    const disabledRows = endpoints
+      .filter((endpoint) => endpoint.disabled)
+      .map((endpoint) => ({
+        name: endpoint.name,
+        status: "disabled",
+        error: "skipped (disabled)",
+      }));
+    if (disabledRows.length > 0) {
+      results.push(...disabledRows);
+    }
     console.table(results);
   });
 
@@ -231,12 +265,13 @@ program
   .action(async () => {
     await ensureStorageDir(paths);
     const endpoints = await listEndpoints(paths);
-    if (endpoints.length === 0) {
+    const activeEndpoints = endpoints.filter((endpoint) => !endpoint.disabled);
+    if (activeEndpoints.length === 0) {
       console.log("No endpoints found.");
       return;
     }
     const results = await Promise.all(
-      endpoints.map(async (endpoint) => {
+      activeEndpoints.map(async (endpoint) => {
         const start = Date.now();
         try {
           const dispatcher = endpoint.insecureTls
@@ -264,6 +299,16 @@ program
         }
       })
     );
+    const disabledRows = endpoints
+      .filter((endpoint) => endpoint.disabled)
+      .map((endpoint) => ({
+        name: endpoint.name,
+        status: "disabled",
+        error: "skipped (disabled)",
+      }));
+    if (disabledRows.length > 0) {
+      results.push(...disabledRows);
+    }
     console.table(results);
   });
 
@@ -605,261 +650,1052 @@ mcp
   });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Agent Commands
+// Provider Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
-program
-  .command("agent")
-  .description("Start the interactive agent CLI (like running 'codex')")
-  .option("-m, --model <model>", "Model to use for the agent")
-  .option("--auto", "Auto-approve all actions (full-auto mode)")
-  .option("--no-network", "Disable network access in sandbox")
-  .option("-d, --cwd <directory>", "Working directory for the agent")
+const provider = program
+  .command("provider")
+  .description("Manage provider catalog and smart pools");
+
+provider
+  .command("import")
+  .description("Import providers from free-llm-api registry and load credentials")
+  .option(
+    "--registry <path>",
+    "Path to providers registry yaml",
+    resolveDefaultRegistryPath()
+  )
+  .option("-f, --env-file <path>", "Path to .env file", ".env")
+  .option("--overwrite-auth", "Overwrite stored provider keys with env values")
+  .option("--no-rebuild-pools", "Skip automatic smart pool rebuild")
   .action(async (options) => {
-    // Determine approval policy
-    let approvalPolicy: "untrusted" | "on-failure" | "on-request" | "never" = "on-request";
-    if (options.auto) {
-      approvalPolicy = "never";
-    }
-    
-    const runner = new AgentRunner({
-      defaultModel: options.model,
-      workingDirectory: options.cwd || process.cwd(),
-      networkAccess: options.network !== false,
-      approvalPolicy,
-    });
-
+    await ensureStorageDir(paths);
     try {
-      const result = await runner.runInteractive({
-        model: options.model,
-        cwd: options.cwd,
-        approvalPolicy,
-        networkAccess: options.network !== false,
-        onStdout: (data) => process.stdout.write(data),
-        onStderr: (data) => process.stderr.write(data),
+      const result = await importProviders(paths, {
+        registryPath: options.registry,
+        envFilePath: options.envFile,
+        overwriteAuth: Boolean(options.overwriteAuth),
       });
-      
-      process.exitCode = result.exitCode;
-    } catch (error) {
-      console.error(`Agent error: ${(error as Error).message}`);
-      process.exitCode = 1;
-    }
-  });
-
-program
-  .command("run")
-  .description("Run the agent with a prompt")
-  .argument("<prompt...>", "The prompt to send to the agent")
-  .option("-m, --model <model>", "Model to use for the agent")
-  .option("--auto", "Auto-approve all actions (never ask)")
-  .option("--untrusted", "Only auto-approve safe read commands (most restrictive)")
-  .option("--no-network", "Disable network access in sandbox")
-  .option("-d, --cwd <directory>", "Working directory for the agent")
-  .action(async (promptParts, options) => {
-    const prompt = promptParts.join(" ");
-    
-    // Determine approval policy (Codex values: untrusted, on-failure, on-request, never)
-    let approvalPolicy: "untrusted" | "on-failure" | "on-request" | "never" = "on-request";
-    if (options.auto) {
-      approvalPolicy = "never";
-    } else if (options.untrusted) {
-      approvalPolicy = "untrusted";
-    }
-    
-    const runner = new AgentRunner({
-      defaultModel: options.model,
-      workingDirectory: options.cwd || process.cwd(),
-      networkAccess: options.network !== false,
-      approvalPolicy,
-    });
-
-    try {
-      const result = await runner.run({
-        prompt,
-        onStdout: (data) => process.stdout.write(data),
-        onStderr: (data) => process.stderr.write(data),
-      });
-      
-      process.exitCode = result.exitCode;
-    } catch (error) {
-      console.error(`Agent error: ${(error as Error).message}`);
-      process.exitCode = 1;
-    }
-  });
-
-program
-  .command("doctor")
-  .description("Verify Waypoint agent configuration and isolation")
-  .action(async () => {
-    console.log("\n🔍 Waypoint Doctor\n");
-    console.log("── Environment ──");
-    
-    const config = buildAgentConfig();
-    
-    // Show resolved paths
-    console.log(`   CODEX_HOME:        ${config.codexHome}`);
-    console.log(`   WAYPOINT_BASE_URL: ${config.baseUrl}`);
-    console.log(`   WAYPOINT_API_KEY:  ${config.apiKey ? "****" + config.apiKey.slice(-4) : "(none)"}`);
-    console.log(`   Working Dir:       ${config.workingDirectory}`);
-    console.log(`   Network Access:    ${config.networkAccess ? "enabled" : "disabled"}`);
-    console.log(`   Approval Policy:   ${config.approvalPolicy}\n`);
-    
-    // Verify isolation
-    console.log("── Isolation Check ──");
-    const isolation = verifyIsolation(config);
-    
-    if (isolation.valid) {
-      console.log("   ✓ Isolation invariants OK");
-      console.log(`   ✓ Data path: ${config.codexHome}`);
-      console.log(`   ✓ API endpoint: ${config.baseUrl}`);
-    } else {
-      console.log("   ✗ Isolation check FAILED:");
-      for (const error of isolation.errors) {
-        console.log(`     - ${error}`);
+      let rebuilt = 0;
+      if (options.rebuildPools !== false) {
+        const pools = await rebuildDefaultPools(paths);
+        rebuilt = pools.length;
       }
+      console.log(`Imported providers: ${result.importedProviders}`);
+      console.log(`Imported models: ${result.importedModels}`);
+      if (rebuilt > 0) {
+        console.log(`Rebuilt pools: ${rebuilt}`);
+      }
+      if (result.warnings.length > 0) {
+        console.log("Warnings:");
+        for (const warning of result.warnings) {
+          console.log(`  - ${warning}`);
+        }
+      }
+    } catch (error) {
+      console.error(`Provider import failed: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+provider
+  .command("ls")
+  .alias("list")
+  .description("List providers")
+  .option("--json", "Output as JSON")
+  .option("--verbose", "Show protocol operation details")
+  .option("--no-check", "Skip health check for faster listing")
+  .action(async (options) => {
+    await ensureStorageDir(paths);
+    if (options.check !== false) {
+      await probeProviderModels(paths);
+    }
+    const providers = await listProviders(paths);
+    if (options.json) {
+      console.log(JSON.stringify(providers, null, 2));
+      return;
+    }
+    if (providers.length === 0) {
+      console.log("No providers imported.");
+      return;
+    }
+    const healthMap = await getProviderModelHealthMap(paths);
+    const rows = options.verbose
+      ? providers.map((provider) => ({
+          protocol: provider.protocolRaw ?? provider.protocol,
+          operations:
+            listAdapterOperations(provider.protocol)?.operations.join(",") ?? "-",
+          streamOps:
+            listAdapterOperations(provider.protocol)?.streamOperations.join(",") ?? "-",
+          id: provider.id,
+          name: provider.name,
+          enabled: provider.enabled ? "yes" : "no",
+          tls: provider.insecureTls ? "insecure" : "strict",
+          autoInsecureDomains: provider.autoInsecureTlsDomains?.length ?? 0,
+          routable: provider.supportsRouting ? "yes" : "no",
+          models: provider.models.length,
+          scored: provider.models.filter((model) => typeof model.benchmark?.livebench === "number")
+            .length,
+          hasKey: provider.apiKey || provider.models.some((model) => Boolean(model.apiKey)) ? "yes" : "no",
+          health: summarizeProviderHealth(provider.models, healthMap),
+        }))
+      : providers.map((provider) => ({
+          id: provider.id,
+          protocol: provider.protocolRaw ?? provider.protocol,
+          enabled: provider.enabled ? "yes" : "no",
+          tls: provider.insecureTls ? "insecure" : "strict",
+          autoInsecureDomains: provider.autoInsecureTlsDomains?.length ?? 0,
+          models: provider.models.length,
+          scored: provider.models.filter((model) => typeof model.benchmark?.livebench === "number")
+            .length,
+          hasKey: provider.apiKey || provider.models.some((model) => Boolean(model.apiKey)) ? "yes" : "no",
+          health: summarizeProviderHealth(provider.models, healthMap),
+        }));
+    console.table(rows);
+  });
+
+provider
+  .command("show")
+  .description("Show one provider")
+  .argument("<providerId>")
+  .action(async (providerId) => {
+    await ensureStorageDir(paths);
+    const providerRecord = await getProviderById(paths, providerId);
+    if (!providerRecord) {
+      console.error("Provider not found");
       process.exitCode = 1;
       return;
     }
-    
-    // Check directories exist
-    console.log("\n── Directory Status ──");
-    const dirs = [
-      config.codexHome,
-      path.join(config.codexHome, "sessions"),
-      path.join(config.codexHome, "log"),
-    ];
-    
-    for (const dir of dirs) {
-      const exists = fs.existsSync(dir);
-      const status = exists ? "✓" : "○";
-      console.log(`   ${status} ${dir}`);
+    const adapterOps = listAdapterOperations(providerRecord.protocol);
+    console.log(
+      JSON.stringify(
+        {
+          ...providerRecord,
+          supportedOperations: adapterOps?.operations ?? [],
+          streamSupportedOperations: adapterOps?.streamOperations ?? [],
+        },
+        null,
+        2
+      )
+    );
+  });
+
+provider
+  .command("update")
+  .description("Update provider TLS policy and allowlist")
+  .argument("<providerId>")
+  .option("--insecure-tls", "Set provider default TLS mode to insecure")
+  .option("--strict-tls", "Set provider default TLS mode to strict")
+  .option("--auto-insecure-domain <suffix...>", "Set auto-insecure TLS allowlist domains")
+  .option("--clear-auto-insecure-domains", "Clear auto-insecure TLS allowlist")
+  .option("--no-rebuild", "Skip automatic smart pool rebuild")
+  .action(async (providerId, options) => {
+    await ensureStorageDir(paths);
+    if (options.insecureTls && options.strictTls) {
+      console.error("Choose either --insecure-tls or --strict-tls, not both.");
+      process.exitCode = 1;
+      return;
     }
-    
-    // Check Waypoint service
-    console.log("\n── Service Status ──");
-    const pid = readPid(pidFile);
-    if (pid && isRunning(pidFile)) {
-      console.log(`   ✓ Waypoint service running (pid ${pid})`);
-      
-      // Try to reach the service
-      try {
-        const response = await request(`${config.baseUrl}/models`, {
-          method: "GET",
-          headersTimeout: 2000,
-          bodyTimeout: 2000,
-        });
-        response.body.resume();
-        if (response.statusCode === 200) {
-          console.log(`   ✓ API reachable at ${config.baseUrl}`);
-        } else {
-          console.log(`   ⚠ API returned status ${response.statusCode}`);
-        }
-      } catch (error) {
-        console.log(`   ✗ Cannot reach API: ${(error as Error).message}`);
+    const patch: Partial<ProviderRecord> = {};
+    if (options.insecureTls) {
+      patch.insecureTls = true;
+    }
+    if (options.strictTls) {
+      patch.insecureTls = false;
+    }
+    if (options.clearAutoInsecureDomains) {
+      patch.autoInsecureTlsDomains = [];
+    } else if (options.autoInsecureDomain) {
+      patch.autoInsecureTlsDomains = normalizeDomainSuffixes(options.autoInsecureDomain);
+    }
+
+    if (Object.keys(patch).length === 0) {
+      console.error("No provider changes requested.");
+      process.exitCode = 1;
+      return;
+    }
+
+    const updated = await updateProvider(paths, providerId, patch);
+    if (!updated) {
+      console.error("Provider not found");
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Updated provider: ${updated.id}`);
+  });
+
+provider
+  .command("models")
+  .description("List models for a provider")
+  .argument("<providerId>")
+  .option("--free", "Only free models")
+  .option("--modality <modality>", "Filter by modality (e.g., text-to-text,image-to-text)")
+  .option("--json", "Output as JSON")
+  .action(async (providerId, options) => {
+    await ensureStorageDir(paths);
+    const providerRecord = await getProviderById(paths, providerId);
+    if (!providerRecord) {
+      console.error("Provider not found");
+      process.exitCode = 1;
+      return;
+    }
+    const modality = typeof options.modality === "string" ? options.modality.trim() : undefined;
+    const filtered = providerRecord.models.filter((model) => {
+      if (options.free && !model.free) {
+        return false;
       }
-    } else {
-      console.log("   ○ Waypoint service not running");
-      console.log("     Run 'waypoint service start' to start the service");
+      if (modality && !model.modalities.includes(modality)) {
+        return false;
+      }
+      return true;
+    });
+    if (options.json) {
+      console.log(JSON.stringify(filtered, null, 2));
+      return;
     }
-    
-    // Check Codex binary
-    console.log("\n── Codex Engine ──");
-    const codexDir = path.join(getPackageRoot(), "src", "engine", "codex");
-    const codexJsEntry = path.join(codexDir, "codex-cli", "bin", "codex.js");
-    const vendorDir = path.join(codexDir, "codex-cli", "vendor");
-    const rustRelease = path.join(codexDir, "codex-rs", "target", "release", "waypoint-agent");
-    const rustDebug = path.join(codexDir, "codex-rs", "target", "debug", "waypoint-agent");
-    
-    if (fs.existsSync(codexJsEntry) && fs.existsSync(vendorDir)) {
-      console.log("   ✓ JS wrapper with vendor binaries found");
-      console.log(`     ${codexJsEntry}`);
-    } else if (fs.existsSync(rustRelease)) {
-      console.log("   ✓ Rust binary found (release)");
-      console.log(`     ${rustRelease}`);
-    } else if (fs.existsSync(rustDebug)) {
-      console.log("   ✓ Rust binary found (debug)");
-      console.log(`     ${rustDebug}`);
-    } else if (fs.existsSync(codexJsEntry)) {
-      console.log("   ⚠ JS wrapper found but vendor binaries missing");
-      console.log(`     ${codexJsEntry}`);
-      console.log("     Run: cd src/engine/codex/codex-cli && npm install");
-    } else {
-      console.log("   ✗ Codex binary not found");
-      console.log("     Build with: cd src/engine/codex/codex-rs && cargo build --release");
-      console.log("     Or install: cd src/engine/codex/codex-cli && npm install");
+    console.table(
+      filtered.map((model) => ({
+        id: model.modelId,
+        upstream: model.upstreamModel,
+        baseUrl: model.baseUrl ?? providerRecord.baseUrl,
+        enabled: model.enabled === false ? "no" : "yes",
+        free: model.free ? "yes" : "no",
+        modalities: model.modalities.join(","),
+        livebench: model.benchmark?.livebench ?? "-",
+      }))
+    );
+  });
+
+const providerModel = provider
+  .command("model")
+  .description("Manage provider-owned models");
+
+providerModel
+  .command("ls")
+  .description("List models for a provider")
+  .argument("<providerId>")
+  .option("--json", "Output as JSON")
+  .option("--enabled", "Only show enabled models")
+  .option("--modality <modality>", "Filter by modality (e.g. text-to-text,image-to-text)")
+  .option("--verbose", "Show full model metadata")
+  .option("--no-check", "Skip health check for faster listing")
+  .action(async (providerId, options) => {
+    await ensureStorageDir(paths);
+    if (options.check !== false) {
+      await probeProviderModels(paths);
     }
-    
-    // Check forbidden paths don't exist
-    console.log("\n── Safety Check ──");
-    const forbidden = path.join(os.homedir(), ".codex");
-    if (fs.existsSync(forbidden)) {
-      console.log(`   ⚠ Global ~/.codex exists (not used by Waypoint)`);
-    } else {
-      console.log("   ✓ No global ~/.codex directory");
+    const healthMap = await getProviderModelHealthMap(paths);
+    const models = await listProviderModels(paths, providerId);
+    if (!models) {
+      console.error("Provider not found");
+      process.exitCode = 1;
+      return;
     }
-    
-    console.log("\n✅ Doctor complete\n");
+
+    const modality = typeof options.modality === "string" ? options.modality.trim() : undefined;
+    const filtered = models.filter((model) => {
+      if (options.enabled && model.enabled === false) {
+        return false;
+      }
+      if (modality && !model.modalities.includes(modality)) {
+        return false;
+      }
+      return true;
+    });
+
+    if (options.json) {
+      console.log(JSON.stringify(filtered, null, 2));
+      return;
+    }
+
+    const rows = options.verbose
+      ? filtered.map((model) => ({
+          providerModelId: model.providerModelId,
+          modelId: model.modelId,
+          upstreamModel: model.upstreamModel,
+          enabled: model.enabled === false ? "no" : "yes",
+          tls: model.insecureTls === undefined ? "inherit" : model.insecureTls ? "insecure" : "strict",
+          endpointType: model.endpointType,
+          baseUrl: model.baseUrl ?? "-",
+          aliases: (model.aliases ?? []).join(","),
+          free: model.free ? "yes" : "no",
+          livebench: model.benchmark?.livebench ?? "-",
+          status: healthMap[model.providerModelId]?.status ?? "-",
+          latency: formatLatency(healthMap[model.providerModelId]?.latencyMsEwma),
+          lastStatus: healthMap[model.providerModelId]?.lastStatusCode ?? "-",
+          lastError: healthMap[model.providerModelId]?.lastError ?? "-",
+        }))
+      : filtered.map((model) => ({
+          id: model.modelId,
+          enabled: model.enabled === false ? "no" : "yes",
+          tls: model.insecureTls === undefined ? "inherit" : model.insecureTls ? "insecure" : "strict",
+          type: model.endpointType,
+          aliases: (model.aliases ?? []).length,
+          livebench: model.benchmark?.livebench ?? "-",
+          status: healthMap[model.providerModelId]?.status ?? "-",
+          latency: formatLatency(healthMap[model.providerModelId]?.latencyMsEwma),
+          lastStatus: healthMap[model.providerModelId]?.lastStatusCode ?? "-",
+          lastError: healthMap[model.providerModelId]?.lastError ?? "-",
+        }));
+    console.table(rows);
+  });
+
+providerModel
+  .command("show")
+  .description("Show one model from a provider")
+  .argument("<providerId>")
+  .argument("<modelRef>")
+  .action(async (providerId, modelRef) => {
+    await ensureStorageDir(paths);
+    const model = await getProviderModel(paths, providerId, modelRef);
+    if (!model) {
+      console.error("Model not found");
+      process.exitCode = 1;
+      return;
+    }
+    console.log(JSON.stringify(model, null, 2));
+  });
+
+providerModel
+  .command("add")
+  .description("Add a model under a provider")
+  .argument("<providerId>")
+  .requiredOption("--model-id <id>", "Provider model ID suffix")
+  .requiredOption("--upstream <name>", "Upstream model name")
+  .requiredOption("--base-url <url>", "Base URL for this model")
+  .option("--api-key <key>", "API key for this model")
+  .option("--insecure-tls", "Allow self-signed TLS certificates for this model")
+  .option("--endpoint-type <type>", "Endpoint type (llm|diffusion|audio|embedding)", "llm")
+  .option("--capability <spec...>", "Capability spec, e.g. text->text or text+image->text")
+  .option("--alias <alias...>", "Legacy/public aliases")
+  .option("--free", "Mark model as free")
+  .option("--no-free", "Mark model as not free")
+  .option("--disabled", "Add model in disabled state")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, options) => {
+    await ensureStorageDir(paths);
+    const providerRecord = await getProviderById(paths, providerId);
+    if (!providerRecord) {
+      console.error("Provider not found");
+      process.exitCode = 1;
+      return;
+    }
+
+    const endpointType = normalizeType(options.endpointType);
+    const capabilities = options.capability
+      ? parseCapabilitySpecs(options.capability)
+      : defaultCapabilitiesForEndpointType(endpointType);
+    const modelId = String(options.modelId).trim();
+    const providerModelId = canonicalProviderModelId(providerId, modelId);
+    const modelRecord: ProviderModelRecord = {
+      providerModelId,
+      providerId,
+      modelId,
+      upstreamModel: String(options.upstream).trim(),
+      baseUrl: String(options.baseUrl).trim(),
+      apiKey: options.apiKey,
+      insecureTls: options.insecureTls ? true : undefined,
+      enabled: options.disabled ? false : true,
+      aliases: normalizeAliasList(options.alias ?? []),
+      free: options.free !== false,
+      modalities: capabilitiesToModalities(capabilities),
+      capabilities,
+      endpointType,
+    };
+    const result = await upsertProviderModel(paths, providerId, modelRecord);
+    if (!result) {
+      console.error("Failed to add model");
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Model ${result.created ? "added" : "updated"}: ${providerModelId}`);
+  });
+
+providerModel
+  .command("update")
+  .description("Update a provider model")
+  .argument("<providerId>")
+  .argument("<modelRef>")
+  .option("--upstream <name>", "Set upstream model")
+  .option("--base-url <url>", "Set base URL")
+  .option("--clear-base-url", "Clear model-specific base URL override")
+  .option("--api-key <key>", "Set API key")
+  .option("--clear-api-key", "Clear model-specific API key")
+  .option("--insecure-tls", "Enable insecure TLS for this model")
+  .option("--clear-insecure-tls", "Clear model TLS override and inherit provider setting")
+  .option("--endpoint-type <type>", "Endpoint type")
+  .option("--capability <spec...>", "Replace capabilities")
+  .option("--alias <alias...>", "Set aliases")
+  .option("--free", "Set free=true")
+  .option("--not-free", "Set free=false")
+  .option("--enabled", "Set enabled=true")
+  .option("--disabled", "Set enabled=false")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, modelRef, options) => {
+    await ensureStorageDir(paths);
+    const patch: Partial<ProviderModelRecord> = {};
+    if (typeof options.upstream === "string") {
+      patch.upstreamModel = options.upstream.trim();
+    }
+    if (typeof options.baseUrl === "string") {
+      patch.baseUrl = options.baseUrl.trim();
+    }
+    if (options.clearBaseUrl) {
+      patch.baseUrl = undefined;
+    }
+    if (typeof options.apiKey === "string") {
+      patch.apiKey = options.apiKey;
+    }
+    if (options.clearApiKey) {
+      patch.apiKey = undefined;
+    }
+    if (options.insecureTls) {
+      patch.insecureTls = true;
+    }
+    if (options.clearInsecureTls) {
+      patch.insecureTls = undefined;
+    }
+    if (typeof options.endpointType === "string") {
+      patch.endpointType = normalizeType(options.endpointType);
+    }
+    if (options.capability) {
+      const capabilities = parseCapabilitySpecs(options.capability);
+      patch.capabilities = capabilities;
+      patch.modalities = capabilitiesToModalities(capabilities);
+    }
+    if (options.alias) {
+      patch.aliases = normalizeAliasList(options.alias);
+    }
+    if (options.free) {
+      patch.free = true;
+    }
+    if (options.notFree) {
+      patch.free = false;
+    }
+    if (options.enabled) {
+      patch.enabled = true;
+    }
+    if (options.disabled) {
+      patch.enabled = false;
+    }
+    if (Object.keys(patch).length === 0) {
+      console.error("No changes requested.");
+      process.exitCode = 1;
+      return;
+    }
+
+    const updated = await updateProviderModel(paths, providerId, modelRef, patch);
+    if (!updated) {
+      console.error("Model not found");
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Updated model: ${updated.providerModelId}`);
+  });
+
+providerModel
+  .command("rm")
+  .description("Remove a provider model")
+  .argument("<providerId>")
+  .argument("<modelRef>")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, modelRef, options) => {
+    await ensureStorageDir(paths);
+    const removed = await deleteProviderModel(paths, providerId, modelRef);
+    if (!removed) {
+      console.error("Model not found");
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Removed model: ${removed.providerModelId}`);
+  });
+
+providerModel
+  .command("enable")
+  .description("Enable a provider model")
+  .argument("<providerId>")
+  .argument("<modelRef>")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, modelRef, options) => {
+    await ensureStorageDir(paths);
+    const model = await setProviderModelEnabled(paths, providerId, modelRef, true);
+    if (!model) {
+      console.error("Model not found");
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Enabled model: ${model.providerModelId}`);
+  });
+
+providerModel
+  .command("disable")
+  .description("Disable a provider model")
+  .argument("<providerId>")
+  .argument("<modelRef>")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, modelRef, options) => {
+    await ensureStorageDir(paths);
+    const model = await setProviderModelEnabled(paths, providerId, modelRef, false);
+    if (!model) {
+      console.error("Model not found");
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Disabled model: ${model.providerModelId}`);
+  });
+
+providerModel
+  .command("set-key")
+  .description("Set plaintext API key for a provider model")
+  .argument("<providerId>")
+  .argument("<modelRef>")
+  .option("--api-key <key>", "API key value")
+  .option("--env-var <name>", "Read API key from environment variable")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, modelRef, options) => {
+    await ensureStorageDir(paths);
+    let apiKey: string | undefined = options.apiKey;
+    if (!apiKey && options.envVar) {
+      apiKey = process.env[String(options.envVar)] ?? undefined;
+      if (!apiKey) {
+        console.error(`Environment variable '${options.envVar}' is not set.`);
+        process.exitCode = 1;
+        return;
+      }
+    }
+    if (!apiKey) {
+      console.error("Provide --api-key or --env-var.");
+      process.exitCode = 1;
+      return;
+    }
+    const model = await setProviderModelApiKey(paths, providerId, modelRef, apiKey);
+    if (!model) {
+      console.error("Model not found");
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Updated key for model: ${model.providerModelId}`);
+  });
+
+provider
+  .command("enable")
+  .description("Enable a provider")
+  .argument("<providerId>")
+  .action(async (providerId) => {
+    await ensureStorageDir(paths);
+    const updated = await setProviderEnabled(paths, providerId, true);
+    if (!updated) {
+      console.error("Provider not found");
+      process.exitCode = 1;
+      return;
+    }
+    await rebuildDefaultPools(paths);
+    console.log(`Enabled provider: ${updated.id}`);
+  });
+
+provider
+  .command("disable")
+  .description("Disable a provider")
+  .argument("<providerId>")
+  .action(async (providerId) => {
+    await ensureStorageDir(paths);
+    const updated = await setProviderEnabled(paths, providerId, false);
+    if (!updated) {
+      console.error("Provider not found");
+      process.exitCode = 1;
+      return;
+    }
+    await rebuildDefaultPools(paths);
+    console.log(`Disabled provider: ${updated.id}`);
+  });
+
+provider
+  .command("migrate-endpoints")
+  .description("Copy matching endpoints into a provider and disable source endpoints")
+  .requiredOption("--provider <id>", "Destination provider ID (e.g. pcai)")
+  .option("--match-domain <domain>", "Hostname suffix to migrate (e.g. ai-application.stjude.org)")
+  .option("--all", "Migrate all endpoints (ignore domain filter)")
+  .option("--protocol <protocol>", "Protocol for destination provider", "openai")
+  .action(async (options) => {
+    await ensureStorageDir(paths);
+
+    const providerId = String(options.provider).trim();
+    const domain = typeof options.matchDomain === "string" ? options.matchDomain.trim().toLowerCase() : "";
+    const includeAll = options.all === true;
+    const protocol = normalizeProviderProtocol(String(options.protocol));
+    const now = new Date().toISOString();
+    const warnings: string[] = [];
+    let skippedEndpoints = 0;
+    let migratedModels = 0;
+    let createdModels = 0;
+    let updatedModels = 0;
+    let disabledEndpoints = 0;
+    const endpointIdsToDisable = new Set<string>();
+
+    if (!providerId) {
+      console.error("--provider is required");
+      process.exitCode = 1;
+      return;
+    }
+    if (!includeAll && !domain) {
+      console.error("Provide --match-domain <domain> or use --all.");
+      process.exitCode = 1;
+      return;
+    }
+
+    const allEndpoints = await listEndpoints(paths);
+    const matchedEndpoints = allEndpoints.filter((endpoint) => {
+      if (includeAll) {
+        return true;
+      }
+      try {
+        const host = new URL(endpoint.baseUrl).hostname.toLowerCase();
+        return hostMatchesDomain(host, domain);
+      } catch (error) {
+        warnings.push(`Skipped endpoint '${endpoint.name}': invalid baseUrl (${(error as Error).message})`);
+        skippedEndpoints += 1;
+        return false;
+      }
+    });
+
+    if (matchedEndpoints.length === 0) {
+      console.log(
+        includeAll
+          ? "No endpoints found to migrate."
+          : `No endpoints matched domain suffix '${domain}'.`
+      );
+      return;
+    }
+
+    const existingProvider = await getProviderById(paths, providerId);
+    const providerSeed: ProviderRecord = {
+      id: providerId,
+      name: existingProvider?.name ?? providerId.toUpperCase(),
+      description: existingProvider?.description ?? `Migrated endpoints for ${includeAll ? "all legacy endpoints" : domain}`,
+      docs: existingProvider?.docs,
+      protocol,
+      protocolRaw: options.protocol,
+      protocolConfig: existingProvider?.protocolConfig,
+      baseUrl: existingProvider?.baseUrl ?? matchedEndpoints[0].baseUrl,
+      enabled: existingProvider?.enabled ?? true,
+      supportsRouting: hasProtocolAdapter(protocol),
+      auth: existingProvider?.auth ?? { type: "bearer" },
+      envVar: existingProvider?.envVar,
+      apiKey: existingProvider?.apiKey,
+      limits: existingProvider?.limits,
+      models: existingProvider?.models ?? [],
+      warnings: existingProvider?.warnings,
+      importedAt: existingProvider?.importedAt ?? now,
+    };
+
+    await upsertProvider(paths, providerSeed);
+
+    for (const endpoint of matchedEndpoints) {
+      if (endpoint.models.length === 0) {
+        warnings.push(`Endpoint '${endpoint.name}' has no models; skipped.`);
+        skippedEndpoints += 1;
+        continue;
+      }
+
+      let migratedFromEndpoint = 0;
+      for (const mapping of endpoint.models) {
+        const capabilities = getModelCapabilitiesForEndpoint(endpoint.type, mapping);
+        const canonicalId = canonicalProviderModelId(providerId, mapping.publicName);
+        const aliases = normalizeAliasList([mapping.publicName, ...(existingProvider?.models ?? [])
+          .filter((m) => m.modelId === mapping.publicName)
+          .flatMap((m) => m.aliases ?? [])]);
+        const modelRecord: ProviderModelRecord = {
+          providerModelId: canonicalId,
+          providerId,
+          modelId: mapping.publicName,
+          upstreamModel: mapping.upstreamModel,
+          baseUrl: endpoint.baseUrl,
+          apiKey: endpoint.apiKey,
+          insecureTls: endpoint.insecureTls,
+          enabled: true,
+          aliases,
+          free: true,
+          modalities: capabilitiesToModalities(capabilities),
+          capabilities,
+          endpointType: endpoint.type,
+        };
+        const result = await upsertProviderModel(paths, providerId, modelRecord);
+        if (!result) {
+          warnings.push(`Failed to write model '${mapping.publicName}' into provider '${providerId}'.`);
+          continue;
+        }
+        migratedModels += 1;
+        migratedFromEndpoint += 1;
+        if (result.created) {
+          createdModels += 1;
+        } else {
+          updatedModels += 1;
+        }
+      }
+      if (migratedFromEndpoint > 0) {
+        endpointIdsToDisable.add(endpoint.id);
+      } else {
+        warnings.push(`Endpoint '${endpoint.name}' had no models migrated; left enabled.`);
+      }
+    }
+
+    for (const endpoint of matchedEndpoints) {
+      if (!endpointIdsToDisable.has(endpoint.id)) {
+        continue;
+      }
+      if (endpoint.disabled) {
+        continue;
+      }
+      const updatedEndpoint = await setEndpointDisabled(paths, endpoint.id, true);
+      if (updatedEndpoint) {
+        disabledEndpoints += 1;
+      }
+    }
+
+    const pools = await rebuildDefaultPools(paths);
+    const reportPath = writeMigrationReport(paths.baseDir, {
+      timestamp: now,
+      providerId,
+      includeAll,
+      domain: domain || undefined,
+      matchedEndpoints: matchedEndpoints.length,
+      migratedModels,
+      createdModels,
+      updatedModels,
+      disabledEndpoints,
+      skippedEndpoints,
+      warnings,
+    });
+
+    console.log(`Migrated provider: ${providerId}`);
+    console.log(`Matched endpoints: ${matchedEndpoints.length}`);
+    console.log(`Migrated models: ${migratedModels} (created ${createdModels}, updated ${updatedModels})`);
+    console.log(`Disabled source endpoints: ${disabledEndpoints}`);
+    console.log(`Rebuilt pools: ${pools.length}`);
+    console.log(`Migration report: ${reportPath}`);
+
+    if (warnings.length > 0) {
+      console.log("Warnings:");
+      for (const warning of warnings) {
+        console.log(`  - ${warning}`);
+      }
+    }
+    if (skippedEndpoints > 0) {
+      console.log(`Skipped endpoints: ${skippedEndpoints}`);
+    }
+  });
+
+provider
+  .command("pools")
+  .description("List smart pools")
+  .option("--json", "Output as JSON")
+  .action(async (options) => {
+    await ensureStorageDir(paths);
+    const pools = await listPools(paths);
+    if (options.json) {
+      console.log(JSON.stringify(pools, null, 2));
+      return;
+    }
+    if (pools.length === 0) {
+      console.log("No pools found.");
+      return;
+    }
+    console.table(
+      pools.map((pool) => ({
+        id: pool.id,
+        aliases: pool.aliases.join(","),
+        candidates: pool.candidates.length,
+        strategy: pool.strategy,
+      }))
+    );
   });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Default behavior: treat unknown commands as agent prompts
+// Benchmark Command
 // ─────────────────────────────────────────────────────────────────────────────
 
-// List of known subcommands to avoid treating them as prompts
-const knownCommands = new Set([
-  "add", "ls", "test", "rm", "edit", "stat", "status", "acct",
-  "service", "logs", "stats", "mcp", "run", "agent", "doctor", "help", "--help", "-h"
-]);
-
-// Check if the first argument is NOT a known command
-const firstArg = process.argv[2];
-const isAgentPrompt = firstArg && 
-  !firstArg.startsWith("-") && 
-  !knownCommands.has(firstArg);
-
-if (isAgentPrompt) {
-  // Treat all arguments as a prompt
-  const prompt = process.argv.slice(2).join(" ");
-  
-  (async () => {
-    const runner = new AgentRunner();
-    
+program
+  .command("bench")
+  .alias("benchmark")
+  .description("Run lightweight benchmarks (chat/agent/embeddings/images/audio)")
+  .option("--suite <name>", "Built-in suite to run")
+  .option("--scenario <path>", "Scenario file (.json, .jsonl, .yaml)")
+  .option("--model <name>", "Override model for all scenarios")
+  .option("--out <path>", "Output file path or directory for benchmark artifact")
+  .option("--config <path>", "Benchmark config file (YAML or JSON)")
+  .option("--profile <name>", "Benchmark profile (local|ci)")
+  .option("--baseline <path>", "Baseline benchmark JSON for regression comparison")
+  .action(async (options) => {
+    await ensureStorageDir(paths);
     try {
-      const result = await runner.run({
-        prompt,
-        onStdout: (data) => process.stdout.write(data),
-        onStderr: (data) => process.stderr.write(data),
+      const { report, artifactPath, textArtifactPath } = await runBenchmark(paths, {
+        suite: options.suite,
+        scenarioPath: options.scenario,
+        modelOverride: options.model,
+        outPath: options.out,
+        configPath: options.config,
+        profile: options.profile,
+        baselinePath: options.baseline,
       });
-      
-      process.exit(result.exitCode);
+
+      console.log("\n🏁 Benchmark complete");
+      console.log(`   Profile:     ${report.profile}`);
+      if (report.suite) {
+      console.log(`   Suite:       ${report.suite}`);
+      }
+      console.log(`   Scenarios:   ${report.total}`);
+      console.log(`   Executed:    ${report.executed}`);
+      console.log(`   Skipped:     ${report.skipped}`);
+      console.log(`   Success:     ${report.succeeded}`);
+      console.log(`   Failed:      ${report.failed}`);
+      console.log(`   SuccessRate: ${(report.successRate * 100).toFixed(1)}%`);
+      console.log(`   AvgLatency:  ${report.avgLatencyMs}ms`);
+      console.log(`   P95Latency:  ${report.p95LatencyMs}ms`);
+      console.log(`   Tokens:      ${report.totalTokens}`);
+      console.log(`   ToolCalls:   ${report.totalToolCalls}`);
+      console.log(`   Throughput:  ${report.avgThroughputTokensPerSec.toFixed(2)} t/s`);
+      console.log(`   Artifact:    ${artifactPath}\n`);
+      console.log(`   Summary:     ${textArtifactPath}\n`);
+
+      if (report.warnings.length > 0) {
+        console.log("Warnings:");
+        for (const warning of report.warnings) {
+          console.log(`  - ${warning}`);
+        }
+        console.log();
+      }
+
+      const skipped = report.results.filter((item) => item.status === "skipped");
+      if (skipped.length > 0) {
+        console.log("Skipped scenarios:");
+        console.table(
+          skipped.map((item) => ({
+            id: item.id,
+            mode: item.mode,
+            reason: item.skippedReason ?? "no compatible model",
+          }))
+        );
+      }
+
+      if (report.gateResults.soft.messages.length > 0) {
+        console.log("Soft gate warnings:");
+        for (const warning of report.gateResults.soft.messages) {
+          console.log(`  - ${warning}`);
+        }
+        console.log();
+      }
+
+      if (!report.gateResults.hard.passed) {
+        console.log("Hard gate failures:");
+        for (const failure of report.gateResults.hard.messages) {
+          console.log(`  - ${failure}`);
+        }
+        console.log();
+
+        const failed = report.results.filter((item) => !item.success);
+        if (failed.length > 0) {
+          console.log("Failed scenarios:");
+          console.table(
+            failed.map((item) => ({
+              id: item.id,
+              mode: item.mode,
+              model: item.model,
+              passRate: `${(item.passRate * 100).toFixed(1)}%`,
+              error: item.errorReasons[0] ?? "failed",
+            }))
+          );
+        }
+
+        process.exitCode = 1;
+      } else {
+        const failed = report.results.filter((item) => !item.success);
+        if (failed.length > 0) {
+          console.log("Scenarios below pass-rate threshold:");
+          console.table(
+            failed.map((item) => ({
+              id: item.id,
+              mode: item.mode,
+              model: item.model,
+              passRate: `${(item.passRate * 100).toFixed(1)}%`,
+              error: item.errorReasons[0] ?? "failed",
+            }))
+          );
+        }
+      }
+
+      if (report.gateResults.soft.messages.length > 0 && report.gateResults.hard.passed) {
+        console.log("Benchmark finished with soft warnings (exit code 0).");
+      }
     } catch (error) {
-      console.error(`Agent error: ${(error as Error).message}`);
-      process.exit(1);
+      console.error(`Benchmark failed: ${(error as Error).message}`);
+      process.exitCode = 1;
     }
-  })();
-} else {
-  program.parseAsync().catch((error) => {
-    console.error(error);
-    process.exit(1);
   });
+
+program.parseAsync().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+
+function compactEndpointUrl(value: string, maxLength = 36): string {
+  try {
+    const parsed = new URL(value);
+    return truncateText(`${parsed.protocol}//${parsed.host}`, maxLength);
+  } catch {
+    return truncateText(value, maxLength);
+  }
 }
 
-function parseMappings(values: string[]): { publicName: string; upstreamModel: string }[] {
-  return values.map((value) => {
-    const parts = value.split("=");
-    if (parts.length === 1) {
-      const name = parts[0].trim();
-      if (!name) {
-        throw new Error(`Invalid mapping: ${value}`);
-      }
-      return { publicName: name, upstreamModel: name };
+function truncateText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  if (maxLength <= 1) {
+    return value.slice(0, maxLength);
+  }
+  return `${value.slice(0, maxLength - 1)}…`;
+}
+
+function normalizeProviderProtocol(value: string): ProviderProtocol {
+  const normalized = canonicalizeProtocol(value);
+  if (normalized === "openai" || normalized === "inference_v2") {
+    return normalized;
+  }
+  return "unknown";
+}
+
+function hostMatchesDomain(hostname: string, domain: string): boolean {
+  const normalizedHost = hostname.toLowerCase();
+  const normalizedDomain = domain.replace(/^\*\./, "").toLowerCase();
+  return normalizedHost === normalizedDomain || normalizedHost.endsWith(`.${normalizedDomain}`);
+}
+
+function capabilitiesToModalities(capabilities: ModelCapabilities): string[] {
+  const modalities = new Set<string>();
+  const hasTextInput = capabilities.input.includes("text");
+  const hasImageInput = capabilities.input.includes("image");
+  const hasAudioInput = capabilities.input.includes("audio");
+  const hasTextOutput = capabilities.output.includes("text");
+  const hasImageOutput = capabilities.output.includes("image");
+  const hasAudioOutput = capabilities.output.includes("audio");
+  const hasEmbeddingOutput = capabilities.output.includes("embedding");
+
+  if (hasTextInput && hasTextOutput) {
+    modalities.add("text-to-text");
+  }
+  if (hasImageInput && hasTextOutput) {
+    modalities.add("image-to-text");
+  }
+  if (hasTextInput && hasImageOutput) {
+    modalities.add("text-to-image");
+  }
+  if (hasAudioInput && hasTextOutput) {
+    modalities.add("audio-to-text");
+  }
+  if (hasTextInput && hasAudioOutput) {
+    modalities.add("text-to-audio");
+  }
+  if (hasTextInput && hasEmbeddingOutput) {
+    modalities.add("text-to-embedding");
+  }
+
+  return Array.from(modalities);
+}
+
+function defaultCapabilitiesForEndpointType(
+  endpointType: "llm" | "diffusion" | "audio" | "embedding"
+): ModelCapabilities {
+  if (endpointType === "embedding") {
+    return { input: ["text"], output: ["embedding"], source: "configured" };
+  }
+  if (endpointType === "diffusion") {
+    return { input: ["text"], output: ["image"], source: "configured" };
+  }
+  if (endpointType === "audio") {
+    return { input: ["audio"], output: ["text"], source: "configured" };
+  }
+  return {
+    input: ["text"],
+    output: ["text"],
+    supportsTools: true,
+    supportsStreaming: true,
+    source: "configured",
+  };
+}
+
+function parseCapabilitySpecs(values: string[]): ModelCapabilities {
+  const input = new Set<ModelModality>();
+  const output = new Set<ModelModality>();
+  for (const value of values) {
+    const [inputSpec, outputSpec] = value.split("->").map((part) => part.trim());
+    if (!inputSpec || !outputSpec) {
+      throw new Error(`Invalid capability spec '${value}'. Use format input->output, e.g. text+image->text`);
     }
-    const [publicName, upstreamModel] = parts;
-    if (!publicName || !upstreamModel) {
-      throw new Error(`Invalid mapping: ${value}`);
+    for (const modality of inputSpec.split("+").map((item) => item.trim())) {
+      input.add(parseModality(modality));
     }
-    return { publicName: publicName.trim(), upstreamModel: upstreamModel.trim() };
-  });
+    for (const modality of outputSpec.split("+").map((item) => item.trim())) {
+      output.add(parseModality(modality));
+    }
+  }
+  if (input.size === 0 || output.size === 0) {
+    throw new Error("Capability spec must include at least one input and one output modality.");
+  }
+  return {
+    input: Array.from(input),
+    output: Array.from(output),
+    source: "configured",
+  };
+}
+
+function parseModality(value: string): ModelModality {
+  if (value === "text" || value === "image" || value === "audio" || value === "embedding") {
+    return value;
+  }
+  throw new Error(`Unsupported modality '${value}'. Use one of: text,image,audio,embedding.`);
+}
+
+function normalizeAliasList(values: string[]): string[] {
+  const seen = new Set<string>();
+  for (const value of values) {
+    const alias = value.trim();
+    if (alias.length > 0) {
+      seen.add(alias);
+    }
+  }
+  return Array.from(seen);
+}
+
+function writeMigrationReport(baseDir: string, payload: Record<string, unknown>): string {
+  const migrationsDir = path.join(baseDir, "migrations");
+  fs.mkdirSync(migrationsDir, { recursive: true });
+  const filePath = path.join(
+    migrationsDir,
+    `migrate-${new Date().toISOString().replace(/[:.]/g, "-")}.json`
+  );
+  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8");
+  return filePath;
 }
 
 function isImageModel(model: string): boolean {
@@ -873,6 +1709,11 @@ function isAudioModel(model: string): boolean {
 }
 
 async function resolveModelType(model: string): Promise<"llm" | "diffusion" | "audio" | "embedding"> {
+  const providerModels = await listModelsForApi(paths);
+  const providerMatch = providerModels.find((entry) => entry.id === model || entry.aliases.includes(model));
+  if (providerMatch) {
+    return providerMatch.endpoint_type;
+  }
   const endpoints = await listEndpoints(paths);
   const match = endpoints.find((endpoint) =>
     endpoint.models.some((entry) => entry.publicName === model)
@@ -938,6 +1779,31 @@ function isRunning(filePath: string): boolean {
   } catch {
     return false;
   }
+}
+
+function summarizeProviderHealth(
+  models: ProviderModelRecord[],
+  healthMap: Record<string, { status?: string }>
+): string {
+  const enabled = models.filter((model) => model.enabled !== false);
+  let up = 0;
+  let down = 0;
+  for (const model of enabled) {
+    const health = healthMap[model.providerModelId];
+    if (health?.status === "up") {
+      up += 1;
+    } else if (health?.status === "down") {
+      down += 1;
+    }
+  }
+  return `${up}/${down}/${enabled.length}`;
+}
+
+function formatLatency(latency?: number): string {
+  if (!latency || !Number.isFinite(latency)) {
+    return "-";
+  }
+  return `${Math.round(latency)}ms`;
 }
 
 async function startService(): Promise<void> {

@@ -1,9 +1,19 @@
 export type HealthStatus = "up" | "down";
 export type EndpointType = "llm" | "diffusion" | "audio" | "embedding";
+export type ModelModality = "text" | "image" | "audio" | "embedding";
+
+export interface ModelCapabilities {
+  input: ModelModality[];
+  output: ModelModality[];
+  supportsTools?: boolean;
+  supportsStreaming?: boolean;
+  source?: "configured" | "inferred";
+}
 
 export interface ModelMapping {
   publicName: string;
   upstreamModel: string;
+  capabilities?: ModelCapabilities;
 }
 
 export interface EndpointHealth {
@@ -16,6 +26,17 @@ export interface EndpointHealth {
   latencyMsEwma?: number;
 }
 
+export interface ProviderModelHealth {
+  status: HealthStatus;
+  lastCheckedAt?: Date;
+  lastSuccessAt?: Date;
+  lastFailureAt?: Date;
+  consecutiveFailures: number;
+  latencyMsEwma?: number;
+  lastStatusCode?: number;
+  lastError?: string;
+}
+
 export interface EndpointLimits {
   timeoutMs?: number;
   maxConcurrent?: number;
@@ -26,6 +47,7 @@ export interface EndpointDoc {
   name: string;
   baseUrl: string;
   apiKey?: string;
+  disabled?: boolean;
   insecureTls: boolean;
   priority: number;
   weight?: number;
@@ -70,6 +92,8 @@ export interface UpstreamError extends Error {
   type: string;
   statusCode?: number;
   retryable: boolean;
+  triedModels?: string[];
+  poolId?: string;
 }
 
 // ========================================
@@ -201,7 +225,7 @@ export interface StatsAggregation {
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system" | "tool";
-  content: string | null;
+  content: string | ChatContentPart[] | null;
   name?: string;
   tool_calls?: Array<{
     id: string;
@@ -209,14 +233,27 @@ export interface ChatMessage {
     function: { name: string; arguments: string };
   }>;
   tool_call_id?: string;
-  images?: string[]; // Local file paths for AIGC outputs or VL inputs
+  // Image references (data URLs in legacy sessions, cache URLs in v2+ sessions)
+  images?: string[];
   createdAt: Date;
 }
+
+export type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "input_audio"; input_audio: { url?: string; data?: string; format?: string } }
+  | { type: "audio"; audio: { url?: string; data?: string; format?: string } };
 
 export interface ChatSession {
   id: string;
   name: string;
   model?: string;
+  titleStatus?: "pending" | "generated" | "manual" | "failed";
+  titleUpdatedAt?: Date;
+  // Storage schema version:
+  // 1 = legacy sessions (inline data URLs)
+  // 2 = cache-backed image references
+  storageVersion: number;
   messages: ChatMessage[];
   createdAt: Date;
   updatedAt: Date;

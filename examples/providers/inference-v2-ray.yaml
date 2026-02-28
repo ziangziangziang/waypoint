@@ -1,0 +1,29 @@
+$id: ray-gateway
+name: Ray Gateway Router
+description: Example provider using /v2/models/{router}/infer protocol
+docs: https://ray.io/
+endpoint:
+  baseUrl: https://svltgpt01a.stjude.org
+  protocol: inference_v2
+  router: ray_gateway_router
+  responseTextPaths:
+    - outputs.0.outputs.text
+    - outputs.0.text
+auth:
+  type: bearer
+  keyParam: Authorization
+env: RAY_GATEWAY_API_KEY
+models:
+  - id: qwen3-vl-30b
+    upstream: qwen3-VL-30B-A3B-Thinking-vllm
+    free: false
+    modalities:
+      - text-to-text
+      - image-to-text
+    capabilities:
+      streaming: false
+      tools: false
+      vision: true
+    benchmark:
+      livebench: 52.0
+

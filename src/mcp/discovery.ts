@@ -57,8 +57,11 @@ export async function discoverServerTools(
 
     return tools;
   } catch (error) {
-    const summary = formatDiscoveryError(error);
-    console.error(`Failed to discover tools from ${server.name}: ${summary}`);
+    const summary = summarizeMcpError(error);
+    console.error(`[waypoint] MCP discovery failed for ${server.name}: ${summary}`);
+    if (process.env.WAYPOINT_DEBUG_ERRORS === "1") {
+      console.error(error);
+    }
     await updateMcpServerStatus(paths, server.id, "error");
     toolsCache.delete(server.id);
     return [];
@@ -88,7 +91,7 @@ export async function discoverAllTools(paths: StoragePaths): Promise<DiscoveredT
   return allTools;
 }
 
-function formatDiscoveryError(error: unknown): string {
+export function summarizeMcpError(error: unknown): string {
   if (error instanceof McpError) {
     return error.message;
   }

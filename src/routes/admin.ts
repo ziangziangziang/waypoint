@@ -1,24 +1,46 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { listEndpoints, createEndpoint, updateEndpoint, getEndpointByIdOrName } from "../storage/repositories";
-import { EndpointDoc, ModelMapping } from "../types";
-import { Agent, request } from "undici";
 import { StoragePaths } from "../storage/files";
-import { resolveModelMappings } from "../utils/modelDiscovery";
+import {
+  deleteProviderModel,
+  getProviderById,
+  listProviderModels,
+  listProviders,
+  setProviderModelEnabled,
+  updateProviderModel,
+  upsertProviderModel,
+} from "../providers/repository";
+import { ProviderModelRecord } from "../providers/types";
+import { listPools } from "../pools/repository";
+import { rebuildDefaultPools } from "../pools/builder";
+import { BenchmarkCliOptions } from "../benchmark/types";
+import {
+  getArtifactBenchmarkRun,
+  getBenchmarkRun,
+  hasRunningBenchmarkRun,
+  listBenchmarkRunEvents,
+  listBenchmarkRuns,
+  startBenchmarkRun,
+  subscribeBenchmarkRunEvents,
+} from "../benchmark/jobs";
 
 interface AdminEnv {
   adminToken?: string;
+  version?: string;
 }
 
-interface EndpointPayload {
-  name: string;
-  baseUrl: string;
+interface ProviderModelPayload {
+  providerModelId?: string;
+  modelId?: string;
+  upstreamModel?: string;
+  baseUrl?: string;
   apiKey?: string;
   insecureTls?: boolean;
-  priority?: number;
-  weight?: number;
-  type?: EndpointDoc["type"];
-  models?: ModelMapping[];
-  limits?: EndpointDoc["limits"];
+  enabled?: boolean;
+  aliases?: string[];
+  free?: boolean;
+  modalities?: string[];
+  capabilities?: ProviderModelRecord["capabilities"];
+  endpointType?: ProviderModelRecord["endpointType"];
 }
 
 export async function registerAdminRoutes(app: FastifyInstance, paths: StoragePaths, env: AdminEnv): Promise<void> {
@@ -32,92 +54,221 @@ export async function registerAdminRoutes(app: FastifyInstance, paths: StoragePa
     }
   });
 
-  app.get("/admin/endpoints", async (_req, reply) => {
-    const endpoints = await listEndpoints(paths);
-    reply.send(endpoints);
+  app.get("/admin/meta", async (_req, reply) => {
+    reply.send({
+      name: "waypoint",
+      version: env.version ?? "0.0.0",
+      now: new Date().toISOString(),
+    });
   });
 
-  app.post("/admin/endpoints", async (req, reply) => {
-    const body = req.body as EndpointPayload | undefined;
-    if (!body?.name || !body.baseUrl) {
-      reply.code(400).send({ error: { message: "name and baseUrl are required" } });
+  app.get("/admin/providers", async (_req, reply) => {
+    const providers = await listProviders(paths);
+    reply.send(providers);
+  });
+
+  app.get("/admin/providers/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const provider = await getProviderById(paths, id);
+    if (!provider) {
+      reply.code(404).send({ error: { message: "provider not found" } });
       return;
     }
-    const models = await resolveModelMappings(
-      {
-        baseUrl: body.baseUrl,
-        apiKey: body.apiKey,
-        insecureTls: body.insecureTls ?? false
-      },
-      body.models ?? []
-    );
-    const endpoint = await createEndpoint(paths, {
-      name: body.name,
-      baseUrl: body.baseUrl,
-      apiKey: body.apiKey,
-      insecureTls: body.insecureTls ?? false,
-      priority: body.priority ?? 0,
-      weight: body.weight,
-      type: body.type ?? "llm",
-      models,
-      limits: body.limits
-    });
-    reply.code(201).send(endpoint);
+    reply.send(provider);
   });
 
-  app.patch("/admin/endpoints/:id", async (req, reply) => {
+  app.get("/admin/providers/:id/models", async (req, reply) => {
     const { id } = req.params as { id: string };
-    const body = req.body as Partial<EndpointPayload> | undefined;
+    const models = await listProviderModels(paths, id);
+    if (!models) {
+      reply.code(404).send({ error: { message: "provider not found" } });
+      return;
+    }
+    reply.send(models);
+  });
+
+  app.post("/admin/providers/:id/models", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = req.body as ProviderModelPayload | undefined;
+    if (!body?.modelId || !body?.upstreamModel || !body?.baseUrl || !body?.endpointType || !body?.capabilities) {
+      reply.code(400).send({
+        error: {
+          message:
+            "modelId, upstreamModel, baseUrl, endpointType, and capabilities are required",
+        },
+      });
+      return;
+    }
+    const provider = await getProviderById(paths, id);
+    if (!provider) {
+      reply.code(404).send({ error: { message: "provider not found" } });
+      return;
+    }
+    const record: ProviderModelRecord = {
+      providerModelId: body.providerModelId ?? `${id}/${body.modelId}`,
+      providerId: id,
+      modelId: body.modelId,
+      upstreamModel: body.upstreamModel,
+      baseUrl: body.baseUrl,
+      apiKey: body.apiKey,
+      insecureTls: body.insecureTls,
+      enabled: body.enabled ?? true,
+      aliases: body.aliases ?? [],
+      free: body.free ?? true,
+      modalities: body.modalities ?? [],
+      capabilities: body.capabilities,
+      endpointType: body.endpointType,
+    };
+    const result = await upsertProviderModel(paths, id, record);
+    if (!result) {
+      reply.code(500).send({ error: { message: "failed to add model" } });
+      return;
+    }
+    await rebuildDefaultPools(paths);
+    reply.code(result.created ? 201 : 200).send(record);
+  });
+
+  app.patch("/admin/providers/:id/models/:modelRef", async (req, reply) => {
+    const { id, modelRef } = req.params as { id: string; modelRef: string };
+    const body = req.body as ProviderModelPayload | undefined;
     if (!body) {
       reply.code(400).send({ error: { message: "payload required" } });
       return;
     }
-    const endpoint = await updateEndpoint(paths, id, body as Partial<EndpointDoc>);
-    if (!endpoint) {
-      reply.code(404).send({ error: { message: "endpoint not found" } });
+    const updated = await updateProviderModel(paths, id, modelRef, body as Partial<ProviderModelRecord>);
+    if (!updated) {
+      reply.code(404).send({ error: { message: "model not found" } });
       return;
     }
-    reply.send(endpoint);
+    await rebuildDefaultPools(paths);
+    reply.send(updated);
   });
 
-  app.post("/admin/endpoints/:id/test", async (req, reply) => {
-    const { id } = req.params as { id: string };
-    const endpoint = await getEndpointByIdOrName(paths, id);
-    if (!endpoint) {
-      reply.code(404).send({ error: { message: "endpoint not found" } });
+  app.delete("/admin/providers/:id/models/:modelRef", async (req, reply) => {
+    const { id, modelRef } = req.params as { id: string; modelRef: string };
+    const removed = await deleteProviderModel(paths, id, modelRef);
+    if (!removed) {
+      reply.code(404).send({ error: { message: "model not found" } });
       return;
     }
-    const start = Date.now();
-    try {
-      const dispatcher = endpoint.insecureTls
-        ? new Agent({ connect: { rejectUnauthorized: false } })
-        : undefined;
-      const response = await request(new URL("/v1/models", endpoint.baseUrl).toString(), {
-        method: "GET",
-        headersTimeout: 3000,
-        bodyTimeout: 3000,
-        dispatcher
+    await rebuildDefaultPools(paths);
+    reply.send({ deleted: removed.providerModelId });
+  });
+
+  app.post("/admin/providers/:id/models/:modelRef/enable", async (req, reply) => {
+    const { id, modelRef } = req.params as { id: string; modelRef: string };
+    const model = await setProviderModelEnabled(paths, id, modelRef, true);
+    if (!model) {
+      reply.code(404).send({ error: { message: "model not found" } });
+      return;
+    }
+    await rebuildDefaultPools(paths);
+    reply.send(model);
+  });
+
+  app.post("/admin/providers/:id/models/:modelRef/disable", async (req, reply) => {
+    const { id, modelRef } = req.params as { id: string; modelRef: string };
+    const model = await setProviderModelEnabled(paths, id, modelRef, false);
+    if (!model) {
+      reply.code(404).send({ error: { message: "model not found" } });
+      return;
+    }
+    await rebuildDefaultPools(paths);
+    reply.send(model);
+  });
+
+  app.get("/admin/pools", async (_req, reply) => {
+    const pools = await listPools(paths);
+    reply.send(pools);
+  });
+
+  app.post("/admin/pools/rebuild", async (_req, reply) => {
+    const pools = await rebuildDefaultPools(paths);
+    reply.send({ rebuilt: pools.length, pools });
+  });
+
+  app.post(
+    "/admin/benchmarks/runs",
+    async (req: FastifyRequest<{ Body: BenchmarkCliOptions }>, reply: FastifyReply) => {
+      if (hasRunningBenchmarkRun()) {
+        reply.code(409).send({
+          error: { message: "A benchmark run is already in progress" },
+        });
+        return;
+      }
+      const body = req.body ?? {};
+      const run = await startBenchmarkRun(paths, {
+        suite: body.suite,
+        scenarioPath: body.scenarioPath,
+        modelOverride: body.modelOverride,
+        outPath: body.outPath,
+        configPath: body.configPath,
+        profile: body.profile,
+        baselinePath: body.baselinePath,
       });
-      response.body.resume();
-      const latency = Date.now() - start;
-      reply.send({ status: response.statusCode, latencyMs: latency });
-    } catch (error) {
-      reply.code(502).send({ error: { message: (error as Error).message } });
+      reply.code(202).send(run);
     }
+  );
+
+  app.get("/admin/benchmarks/runs", async (_req, reply) => {
+    const items = await listBenchmarkRuns(paths);
+    reply.send({
+      object: "list",
+      data: items,
+    });
   });
 
-  app.get("/admin/health", async (_req, reply) => {
-    const endpoints = await listEndpoints(paths);
-    reply.send(
-      endpoints.map((endpoint) => ({
-        id: endpoint.id,
-        name: endpoint.name,
-        status: endpoint.health.status,
-        downUntil: endpoint.health.downUntil,
-        lastCheckedAt: endpoint.health.lastCheckedAt,
-        latencyMsEwma: endpoint.health.latencyMsEwma
-      }))
-    );
+  app.get("/admin/benchmarks/runs/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const run = getBenchmarkRun(id);
+    if (run) {
+      reply.send(run);
+      return;
+    }
+    const historical = await getArtifactBenchmarkRun(paths, id);
+    if (!historical) {
+      reply.code(404).send({ error: { message: "benchmark run not found" } });
+      return;
+    }
+    reply.send(historical);
+  });
+
+  app.get("/admin/benchmarks/runs/:id/events", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const run = getBenchmarkRun(id);
+    if (!run) {
+      reply.code(404).send({ error: { message: "benchmark run not found" } });
+      return;
+    }
+
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    const sendEvent = (event: unknown): void => {
+      reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+
+    for (const event of listBenchmarkRunEvents(id)) {
+      sendEvent(event);
+    }
+
+    const unsubscribe = subscribeBenchmarkRunEvents(id, (event) => {
+      sendEvent(event);
+    });
+
+    const heartbeat = setInterval(() => {
+      reply.raw.write(": ping\n\n");
+    }, 15_000);
+
+    req.raw.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      reply.raw.end();
+    });
   });
 }
 

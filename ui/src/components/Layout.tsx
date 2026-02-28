@@ -3,31 +3,47 @@ import {
   MessageSquare, 
   LayoutDashboard, 
   Settings as SettingsIcon,
-  Radio
+  Radio,
+  Gauge
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useEffect, useState } from 'react'
-import { getEndpointHealth, EndpointHealth } from '@/api/client'
+import { getAdminMeta, listProviders } from '@/api/client'
 
 const navItems = [
   { to: '/playground', icon: MessageSquare, label: 'Playground' },
+  { to: '/benchmark', icon: Gauge, label: 'Benchmark' },
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/settings', icon: SettingsIcon, label: 'Settings' },
 ]
 
 export function Layout() {
   const [healthStatus, setHealthStatus] = useState<'live' | 'degraded' | 'down'>('down')
+  const [version, setVersion] = useState<string>('0.0.0')
 
   useEffect(() => {
     async function checkHealth() {
       try {
-        const health = await getEndpointHealth()
-        const statuses = Object.values(health) as EndpointHealth[]
-        if (statuses.length === 0) {
+        const [providers, meta] = await Promise.all([
+          listProviders(),
+          getAdminMeta(),
+        ])
+        setVersion(meta.version)
+
+        if (providers.length === 0) {
           setHealthStatus('down')
-        } else if (statuses.every(s => s.status === 'up')) {
+          return
+        }
+
+        const enabledProviders = providers.filter((provider) => provider.enabled)
+        const enabledModels = providers.reduce(
+          (sum, provider) => sum + provider.models.filter((model) => model.enabled !== false).length,
+          0
+        )
+
+        if (enabledProviders.length === providers.length && enabledModels > 0) {
           setHealthStatus('live')
-        } else if (statuses.some(s => s.status === 'up')) {
+        } else if (enabledModels > 0) {
           setHealthStatus('degraded')
         } else {
           setHealthStatus('down')
@@ -53,7 +69,7 @@ export function Layout() {
           </div>
           <div>
             <h1 className="font-mono font-semibold text-sm tracking-tight">WAYPOINT</h1>
-            <p className="text-2xs text-muted-foreground font-mono">v0.2.0</p>
+            <p className="text-2xs text-muted-foreground font-mono">v{version}</p>
           </div>
         </div>
 

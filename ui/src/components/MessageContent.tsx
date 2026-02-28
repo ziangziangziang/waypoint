@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import mermaid from 'mermaid'
 import { Copy, Check, ChevronDown, ChevronUp, Brain } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { parseMessageContent } from './messageContentParser'
 
 // Initialize mermaid with dark theme
 mermaid.initialize({
@@ -166,65 +167,6 @@ const CopyButton = ({ text, className }: { text: string; className?: string }) =
   )
 }
 
-// Parse content to extract thinking blocks
-// Handles multiple formats:
-// 1. <think>...</think> - standard format
-// 2. ...content...</think> - missing opening tag (common with some models)
-// 3. <think>... - unclosed tag (during streaming)
-function parseContent(content: string): Array<{ type: 'text' | 'thinking'; content: string }> {
-  const parts: Array<{ type: 'text' | 'thinking'; content: string }> = []
-  
-  // First, check if content starts without <think> but has </think>
-  // This handles the case where model outputs thinking without opening tag
-  const hasClosingWithoutOpening = !content.trimStart().startsWith('<think>') && content.includes('</think>')
-  
-  let processedContent = content
-  if (hasClosingWithoutOpening) {
-    // Find the first </think> and treat everything before it as thinking
-    const closeIndex = content.indexOf('</think>')
-    const thinkingContent = content.slice(0, closeIndex)
-    const remainingContent = content.slice(closeIndex + '</think>'.length)
-    
-    parts.push({ type: 'thinking', content: thinkingContent.trim() })
-    processedContent = remainingContent
-  }
-  
-  // Now process remaining content for standard <think>...</think> blocks
-  const thinkRegex = /<think>([\s\S]*?)<\/think>/gi
-  
-  let lastIndex = 0
-  let match
-  
-  while ((match = thinkRegex.exec(processedContent)) !== null) {
-    // Add text before the thinking block
-    if (match.index > lastIndex) {
-      const text = processedContent.slice(lastIndex, match.index).trim()
-      if (text) {
-        parts.push({ type: 'text', content: text })
-      }
-    }
-    
-    // Add the thinking block
-    parts.push({ type: 'thinking', content: match[1] })
-    lastIndex = match.index + match[0].length
-  }
-  
-  // Add remaining text
-  if (lastIndex < processedContent.length) {
-    const text = processedContent.slice(lastIndex).trim()
-    if (text) {
-      parts.push({ type: 'text', content: text })
-    }
-  }
-  
-  // If no parts were found, treat entire content as text
-  if (parts.length === 0 && content.trim()) {
-    parts.push({ type: 'text', content: content.trim() })
-  }
-  
-  return parts
-}
-
 // Code block component with copy and mermaid support
 const CodeBlock = ({ 
   className, 
@@ -318,7 +260,7 @@ const CodeBlock = ({
 }
 
 export const MessageContent = memo(function MessageContent({ content, className }: MessageContentProps) {
-  const parts = parseContent(content)
+  const parts = parseMessageContent(content)
   
   return (
     <div className={cn('relative group', className)}>

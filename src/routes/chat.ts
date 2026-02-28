@@ -2,9 +2,12 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { randomUUID } from "crypto";
 import { pipeline } from "stream";
 import { routeRequest } from "../routing/router";
-import { listEligibleEndpoints, logRequest, sortEndpointsForRouting } from "../storage/repositories";
+import { logRequest } from "../storage/repositories";
 import { RequestLog } from "../types";
 import { StoragePaths } from "../storage/files";
+import { selectPoolCandidates } from "../pools/scheduler";
+import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
+import { normalizeMessagesForUpstream, scanMessageModalities } from "../utils/messageMedia";
 
 interface ChatBody {
   model: string;
@@ -32,13 +35,30 @@ export async function registerChatRoutes(app: FastifyInstance, paths: StoragePat
     req.raw.on("close", () => controller.abort());
 
     try {
+      const messages = (body as unknown as { messages?: unknown }).messages;
+      const normalizedMessages = await normalizeMessagesForUpstream(paths, messages);
+      const bodyWithNormalizedMessages: Record<string, unknown> = {
+        ...(body as Record<string, unknown>),
+        messages: normalizedMessages,
+      };
+      const media = scanMessageModalities(normalizedMessages);
       const outcome = await routeRequest(
         paths,
         body.model,
         "/v1/chat/completions",
-        body as Record<string, unknown>,
+        bodyWithNormalizedMessages,
         req.headers as Record<string, string | string[] | undefined>,
-        controller.signal
+        controller.signal,
+        {
+          requiredInput: media.hasAudio
+            ? media.hasImage
+              ? ["text", "image", "audio"]
+              : ["text", "audio"]
+            : media.hasImage
+              ? ["text", "image"]
+              : ["text"],
+          requiredOutput: ["text"],
+        }
       );
 
       if (body.stream) {
@@ -69,19 +89,47 @@ export async function registerChatRoutes(app: FastifyInstance, paths: StoragePat
         reply.raw.end();
         return;
       }
-      const status = errorType === "no_endpoints" ? 400 : 502;
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message } });
+        return;
+      }
       reply.code(status).send({ error: { message: "Upstream unavailable" } });
     }
   });
 }
 
 async function pickDefaultModel(paths: StoragePaths): Promise<string | null> {
-  const endpoints = sortEndpointsForRouting(await listEligibleEndpoints(paths));
-  for (const endpoint of endpoints) {
-    const model = endpoint.models[0]?.publicName;
-    if (model) {
-      return model;
-    }
+  const smart = await selectPoolCandidates(paths, "smart", {
+    requiredInput: ["text"],
+    requiredOutput: ["text"],
+  }, {
+    operation: "chat_completions",
+    stream: false,
+  });
+  if (smart && smart.candidates.length > 0) {
+    return "smart";
+  }
+
+  const byCapabilities = await pickBestProviderModelByCapabilities(
+    paths,
+    { requiredInput: ["text"], requiredOutput: ["text"] },
+    "llm"
+  );
+  if (byCapabilities) {
+    return byCapabilities;
   }
   return null;
 }

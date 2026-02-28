@@ -2,9 +2,12 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { randomUUID } from "crypto";
 import { pipeline } from "stream";
 import { routeRequest } from "../routing/router";
-import { logRequest, listEligibleEndpoints, sortEndpointsForRouting } from "../storage/repositories";
+import { logRequest } from "../storage/repositories";
 import { RequestLog, ResponsesApiRequest } from "../types";
 import { StoragePaths } from "../storage/files";
+import { selectPoolCandidates } from "../pools/scheduler";
+import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
+import { normalizeMessagesForUpstream, scanMessageModalities } from "../utils/messageMedia";
 
 /**
  * Responses API compatibility shim.
@@ -20,22 +23,6 @@ import { StoragePaths } from "../storage/files";
 export async function registerResponsesRoutes(app: FastifyInstance, paths: StoragePaths): Promise<void> {
   app.post("/v1/responses", async (req: FastifyRequest, reply: FastifyReply) => {
     const body = req.body as ResponsesApiRequest | undefined;
-    
-    // DEBUG: Log request details
-    console.log("[responses] Request:", {
-      model: body?.model,
-      hasTools: !!body?.tools,
-      toolCount: body?.tools?.length,
-      stream: body?.stream,
-      inputType: typeof body?.input,
-      inputIsArray: Array.isArray(body?.input),
-      inputLength: Array.isArray(body?.input) ? body.input.length : (typeof body?.input === 'string' ? 1 : 0)
-    });
-    
-    // Log first few input items for debugging multi-turn
-    if (Array.isArray(body?.input)) {
-      console.log("[responses] Input items:", JSON.stringify(body.input.slice(0, 5), null, 2).substring(0, 1000));
-    }
     
     if (!body?.model) {
       const fallback = await pickDefaultModel(paths);
@@ -54,28 +41,17 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
     // Transform to chat completions format
     const messages = transformToMessages(body);
     
-    // DEBUG: Log transformed messages for multi-turn debugging
-    console.log("[responses] Transformed messages count:", messages.length);
-    console.log("[responses] Messages:", JSON.stringify(messages.slice(0, 5), null, 2).substring(0, 2000));
-    
-    // DEBUG: Log incoming tools
-    if (body.tools) {
-      console.log("[responses] Incoming tools:", JSON.stringify(body.tools).substring(0, 500));
-    }
-    
     const transformedTools = body.tools ? transformTools(body.tools) : undefined;
-    
-    // DEBUG: Log transformed tools
-    if (transformedTools) {
-      console.log("[responses] Transformed tools:", JSON.stringify(transformedTools).substring(0, 500));
-    }
     
     // Track if client wants streaming
     const clientWantsStreaming = body.stream ?? false;
     
+    const normalizedMessages = await normalizeMessagesForUpstream(paths, messages);
+    const media = scanMessageModalities(normalizedMessages);
+
     const chatPayload = {
       model: body.model,
-      messages,
+      messages: normalizedMessages,
       stream: clientWantsStreaming, // Pass through streaming preference
       temperature: body.temperature,
       max_tokens: body.max_tokens,
@@ -96,7 +72,17 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
         "/v1/chat/completions",
         chatPayload as Record<string, unknown>,
         req.headers as Record<string, string | string[] | undefined>,
-        controller.signal
+        controller.signal,
+        {
+          requiredInput: media.hasAudio
+            ? media.hasImage
+              ? ["text", "image", "audio"]
+              : ["text", "audio"]
+            : media.hasImage
+              ? ["text", "image"]
+              : ["text"],
+          requiredOutput: ["text"],
+        }
       );
 
       // Handle streaming response
@@ -116,14 +102,8 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
       // Non-streaming response
       const upstreamBody = await readBody(outcome.attempt.response);
       
-      // DEBUG: Log upstream response
-      console.log("[responses] Upstream response:", JSON.stringify(upstreamBody.payload).substring(0, 1500));
-      
       // Transform response to Responses API format
       const responsesFormat = transformToResponsesFormat(upstreamBody.payload, requestId);
-      
-      // DEBUG: Log transformed response
-      console.log("[responses] Transformed response:", JSON.stringify(responsesFormat).substring(0, 1000));
       
       setHeaders(reply, outcome.attempt.response.headers);
       reply.code(outcome.attempt.response.statusCode).send(responsesFormat);
@@ -151,16 +131,32 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
         reply.raw.end();
         return;
       }
-      const status = errorType === "no_endpoints" ? 400 : 502;
+      if (errorType === "invalid_request") {
+        reply.code(400).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      if (errorType === "tls_verify_failed") {
+        reply.code(502).send({ error: { message: (error as Error).message } });
+        return;
+      }
+      const status =
+        errorType === "no_endpoints" ||
+        errorType === "protocol_stream_unsupported" ||
+        errorType === "unsupported_protocol" ||
+        errorType === "invalid_protocol_config"
+          ? 400
+          : errorType === "rate_limited"
+            ? 429
+            : 502;
       reply.code(status).send({ error: { message: "Upstream unavailable" } });
     }
   });
 }
 
 /**
- * Transform Codex Responses API input to OpenAI chat completions messages.
+ * Transform Responses-style input to OpenAI chat completions messages.
  * 
- * Codex sends a variety of item types:
+ * Some clients send a variety of item types:
  * - { type: "message", role: "user/assistant/developer", content: [...] }
  * - { type: "function_call", name: "...", arguments: "...", call_id: "..." }
  * - { type: "function_call_output", call_id: "...", output: "..." }
@@ -258,9 +254,9 @@ function transformToMessages(body: ResponsesApiRequest): Array<Record<string, un
 }
 
 /**
- * Transform message content, fixing Codex content part types to OpenAI format.
- * Codex sends: { type: "input_text", text: "..." } for user messages
- * Codex sends: { type: "output_text", text: "..." } for assistant messages
+ * Transform message content, normalizing response content part types to OpenAI format.
+ * Some clients send: { type: "input_text", text: "..." } for user messages
+ * Some clients send: { type: "output_text", text: "..." } for assistant messages
  * OpenAI expects: { type: "text", text: "..." }
  */
 function transformMessageContent(content: unknown): string | unknown[] {
@@ -272,10 +268,17 @@ function transformMessageContent(content: unknown): string | unknown[] {
     return content.map(part => {
       if (part && typeof part === "object") {
         const p = part as Record<string, unknown>;
-        // Fix Codex input_text/output_text → OpenAI text
-        // Codex uses input_text for user messages, output_text for assistant messages
+        // Normalize input_text/output_text to OpenAI text
+        // input_text is typically user content, output_text assistant content
         if (p.type === "input_text" || p.type === "output_text") {
           return { ...p, type: "text" };
+        }
+        if (p.type === "input_image" && p.image_url) {
+          return { ...p, type: "image_url" };
+        }
+        // Accept shorthand {type:\"audio\", audio:\"...\"} and normalize downstream
+        if (p.type === "input_audio" || p.type === "audio" || p.type === "video") {
+          return p;
         }
       }
       return part;
@@ -287,9 +290,9 @@ function transformMessageContent(content: unknown): string | unknown[] {
 }
 
 /**
- * Transform Codex-style tools to OpenAI function calling format.
+ * Transform Responses-style tools to OpenAI function-calling format.
  * 
- * Codex sends tools like:
+ * Some clients send tools like:
  *   { type: "function", name: "...", description: "...", parameters: {...} }
  * 
  * OpenAI expects:
@@ -406,7 +409,7 @@ function transformToResponsesFormat(chatResponse: unknown, requestId: string): R
     output.push({
       type: "message",
       role: message?.role ?? "assistant",
-      // Codex expects "output_text" type, not "text"
+      // Responses-style clients may expect output_text instead of text
       content: [{ type: "output_text", text: textContent }]
     });
   }
@@ -429,7 +432,7 @@ function transformToResponsesFormat(chatResponse: unknown, requestId: string): R
  * Stream chat completions response and transform to Responses API SSE format.
  * 
  * This reads the upstream SSE stream (chat.completion.chunk format) and
- * transforms it to Codex Responses API format in real-time.
+ * transforms it to Responses API format in real-time.
  */
 async function streamResponsesAPI(
   reply: FastifyReply, 
@@ -643,9 +646,9 @@ async function streamResponsesAPI(
 }
 
 /**
- * Send response as Server-Sent Events in Codex format.
+ * Send response as Server-Sent Events in Responses format.
  * 
- * Codex expects:
+ * Responses-style clients expect:
  * - event: response.created
  * - event: response.output_item.done (for each output item)
  * - event: response.completed
@@ -707,12 +710,24 @@ async function sendAsSSE(reply: FastifyReply, response: ResponsesApiResponse): P
 }
 
 async function pickDefaultModel(paths: StoragePaths): Promise<string | null> {
-  const endpoints = sortEndpointsForRouting(await listEligibleEndpoints(paths));
-  for (const endpoint of endpoints) {
-    if (endpoint.type === "llm") {
-      const model = endpoint.models[0]?.publicName;
-      if (model) return model;
-    }
+  const smart = await selectPoolCandidates(paths, "smart", {
+    requiredInput: ["text"],
+    requiredOutput: ["text"],
+  }, {
+    operation: "chat_completions",
+    stream: false,
+  });
+  if (smart && smart.candidates.length > 0) {
+    return "smart";
+  }
+
+  const byCapabilities = await pickBestProviderModelByCapabilities(
+    paths,
+    { requiredInput: ["text"], requiredOutput: ["text"] },
+    "llm"
+  );
+  if (byCapabilities) {
+    return byCapabilities;
   }
   return null;
 }

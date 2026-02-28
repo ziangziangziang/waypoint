@@ -1,0 +1,26 @@
+version: 1
+
+defaults:
+  requestTimeoutMs: 120000
+  toolTimeoutMs: 15000
+  maxIterations: 6
+  temperature: 0
+  max_tokens: 512
+  concurrency: 1
+
+profiles:
+  local:
+    warmupRuns: 1
+    measuredRuns: 3
+    minScenarioPassRate: 1.0
+  ci:
+    warmupRuns: 2
+    measuredRuns: 5
+    minScenarioPassRate: 1.0
+
+gates:
+  hard:
+    smokeMinSuccessRate: 1.0
+  soft:
+    maxP95RegressionPct: 20
+    maxThroughputDropPct: 20
