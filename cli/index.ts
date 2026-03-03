@@ -40,8 +40,16 @@ import { listPools } from "../src/pools/repository";
 import { canonicalizeProtocol, hasProtocolAdapter, listAdapterOperations } from "../src/protocols/registry";
 import { ProviderModelRecord, ProviderProtocol, ProviderRecord } from "../src/providers/types";
 import { ModelCapabilities, ModelModality } from "../src/types";
+import { rewriteLegacyArgv, LegacyRewriteResult } from "./legacyRewrite";
+import { parseModelRef } from "./modelRef";
 
 const program = new Command();
+
+type CanonicalCommandContext = {
+  json?: boolean;
+  quiet?: boolean;
+  noColor?: boolean;
+};
 
 const paths = resolveStoragePaths();
 const pidFile = path.join(paths.baseDir, "waypoint.pid");
@@ -103,10 +111,51 @@ async function refreshHealthStatus(): Promise<void> {
   );
 }
 
+function printJson(payload: unknown): void {
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+function printWarning(message: string): void {
+  console.error(message);
+}
+
+function printErrorWithSuggestion(message: string, suggestions: string[] = []): void {
+  console.error(message);
+  for (const suggestion of suggestions) {
+    console.error(suggestion);
+  }
+}
+
+function warnLegacyRewrite(result: LegacyRewriteResult): void {
+  if (!result.legacyUsed || process.env.WAYPOINT_NO_WARN === "1") {
+    return;
+  }
+  const oldCmd = result.oldCmd ?? "";
+  const newCmd = result.newCmd ? `waypoint ${result.newCmd}` : "waypoint --help";
+  printWarning(`Deprecated command: ${oldCmd}`);
+  printWarning(`Use instead: ${newCmd}`);
+}
+
 program
   .name("waypoint")
   .description("Waypoint proxy and operations CLI")
-  .version("0.5.3");
+  .version("0.5.3")
+  .option("--json", "Machine-readable JSON output where supported")
+  .option("--quiet", "Suppress non-essential output")
+  .option("--no-color", "Disable ANSI color output");
+
+program.addHelpText(
+  "after",
+  `
+Examples:
+  waypoint providers
+  waypoint models
+  waypoint models show provider-id/model-id
+  waypoint service
+  waypoint logs -f
+  waypoint bench --suite smoke
+`
+);
 
 program
   .command("add")
@@ -338,7 +387,17 @@ program
 
 const service = program
   .command("service")
-  .description("Manage the Waypoint service process");
+  .alias("srv")
+  .description("Manage the Waypoint service process")
+  .action(async () => {
+    await ensureStorageDir(paths);
+    const pid = readPid(pidFile);
+    if (pid && isRunning(pidFile)) {
+      console.log(`Waypoint is running (pid ${pid}).`);
+      return;
+    }
+    console.log("Waypoint is not running.");
+  });
 
 service
   .command("start")
@@ -508,9 +567,43 @@ program
 // MCP Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
+async function listMcpServersAction(options: { json?: boolean } = {}): Promise<void> {
+  await ensureStorageDir(paths);
+  try {
+    const servers = await listMcpServers(paths);
+
+    if (servers.length === 0) {
+      console.log("No MCP servers configured.");
+      return;
+    }
+
+    if (options.json) {
+      printJson(servers);
+      return;
+    }
+
+    console.table(
+      servers.map((s) => ({
+        id: s.id.slice(0, 8),
+        name: s.name,
+        url: s.url,
+        status: s.status,
+        enabled: s.enabled ? "✓" : "✗",
+        tools: s.toolCount ?? 0
+      }))
+    );
+  } catch (error) {
+    console.error(`Failed to list servers: ${(error as Error).message}`);
+    process.exitCode = 1;
+  }
+}
+
 const mcp = program
   .command("mcp")
-  .description("Manage MCP servers for agentic workflows");
+  .description("Manage MCP servers for agentic workflows")
+  .action(async () => {
+    await listMcpServersAction();
+  });
 
 mcp
   .command("add")
@@ -540,34 +633,7 @@ mcp
   .description("List all MCP servers")
   .option("--json", "Output as JSON")
   .action(async (options) => {
-    await ensureStorageDir(paths);
-    try {
-      const servers = await listMcpServers(paths);
-      
-      if (servers.length === 0) {
-        console.log("No MCP servers configured.");
-        return;
-      }
-      
-      if (options.json) {
-        console.log(JSON.stringify(servers, null, 2));
-        return;
-      }
-      
-      console.table(
-        servers.map((s) => ({
-          id: s.id.slice(0, 8),
-          name: s.name,
-          url: s.url,
-          status: s.status,
-          enabled: s.enabled ? "✓" : "✗",
-          tools: s.toolCount ?? 0
-        }))
-      );
-    } catch (error) {
-      console.error(`Failed to list servers: ${(error as Error).message}`);
-      process.exitCode = 1;
-    }
+    await listMcpServersAction(options);
   });
 
 mcp
@@ -653,13 +719,78 @@ mcp
 // Provider Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
+async function listProvidersAction(options: { json?: boolean; verbose?: boolean; check?: boolean } = {}): Promise<void> {
+  await ensureStorageDir(paths);
+  if (options.check !== false) {
+    await probeProviderModels(paths);
+  }
+  const providers = await listProviders(paths);
+  if (options.json) {
+    printJson(providers);
+    return;
+  }
+  if (providers.length === 0) {
+    console.log("No providers imported.");
+    return;
+  }
+  const healthMap = await getProviderModelHealthMap(paths);
+  const rows = options.verbose
+    ? providers.map((provider) => ({
+        protocol: provider.protocolRaw ?? provider.protocol,
+        operations:
+          listAdapterOperations(provider.protocol)?.operations.join(",") ?? "-",
+        streamOps:
+          listAdapterOperations(provider.protocol)?.streamOperations.join(",") ?? "-",
+        id: provider.id,
+        name: provider.name,
+        enabled: provider.enabled ? "yes" : "no",
+        tls: provider.insecureTls ? "insecure" : "strict",
+        autoInsecureDomains: provider.autoInsecureTlsDomains?.length ?? 0,
+        routable: provider.supportsRouting ? "yes" : "no",
+        models: provider.models.length,
+        scored: provider.models.filter((model) => typeof model.benchmark?.livebench === "number")
+          .length,
+        hasKey: provider.apiKey || provider.models.some((model) => Boolean(model.apiKey)) ? "yes" : "no",
+        health: summarizeProviderHealth(provider.models, healthMap),
+      }))
+    : providers.map((provider) => ({
+        id: provider.id,
+        protocol: provider.protocolRaw ?? provider.protocol,
+        enabled: provider.enabled ? "yes" : "no",
+        tls: provider.insecureTls ? "insecure" : "strict",
+        autoInsecureDomains: provider.autoInsecureTlsDomains?.length ?? 0,
+        models: provider.models.length,
+        scored: provider.models.filter((model) => typeof model.benchmark?.livebench === "number")
+          .length,
+        hasKey: provider.apiKey || provider.models.some((model) => Boolean(model.apiKey)) ? "yes" : "no",
+        health: summarizeProviderHealth(provider.models, healthMap),
+      }));
+  console.table(rows);
+}
+
 const provider = program
-  .command("provider")
-  .description("Manage provider catalog and smart pools");
+  .command("providers")
+  .alias("provider")
+  .alias("prov")
+  .description("Manage provider catalog and smart pools")
+  .action(async () => {
+    await listProvidersAction();
+  });
+
+provider.addHelpText(
+  "after",
+  `
+Default: \`waypoint providers\` runs \`providers list\`.
+Examples:
+  waypoint providers
+  waypoint providers show provider-id
+  waypoint providers import --registry ./providers/registry.yaml -f .env
+`
+);
 
 provider
   .command("import")
-  .description("Import providers from free-llm-api registry and load credentials")
+  .description("Import providers from a registry and load credentials")
   .option(
     "--registry <path>",
     "Path to providers registry yaml",
@@ -706,52 +837,7 @@ provider
   .option("--verbose", "Show protocol operation details")
   .option("--no-check", "Skip health check for faster listing")
   .action(async (options) => {
-    await ensureStorageDir(paths);
-    if (options.check !== false) {
-      await probeProviderModels(paths);
-    }
-    const providers = await listProviders(paths);
-    if (options.json) {
-      console.log(JSON.stringify(providers, null, 2));
-      return;
-    }
-    if (providers.length === 0) {
-      console.log("No providers imported.");
-      return;
-    }
-    const healthMap = await getProviderModelHealthMap(paths);
-    const rows = options.verbose
-      ? providers.map((provider) => ({
-          protocol: provider.protocolRaw ?? provider.protocol,
-          operations:
-            listAdapterOperations(provider.protocol)?.operations.join(",") ?? "-",
-          streamOps:
-            listAdapterOperations(provider.protocol)?.streamOperations.join(",") ?? "-",
-          id: provider.id,
-          name: provider.name,
-          enabled: provider.enabled ? "yes" : "no",
-          tls: provider.insecureTls ? "insecure" : "strict",
-          autoInsecureDomains: provider.autoInsecureTlsDomains?.length ?? 0,
-          routable: provider.supportsRouting ? "yes" : "no",
-          models: provider.models.length,
-          scored: provider.models.filter((model) => typeof model.benchmark?.livebench === "number")
-            .length,
-          hasKey: provider.apiKey || provider.models.some((model) => Boolean(model.apiKey)) ? "yes" : "no",
-          health: summarizeProviderHealth(provider.models, healthMap),
-        }))
-      : providers.map((provider) => ({
-          id: provider.id,
-          protocol: provider.protocolRaw ?? provider.protocol,
-          enabled: provider.enabled ? "yes" : "no",
-          tls: provider.insecureTls ? "insecure" : "strict",
-          autoInsecureDomains: provider.autoInsecureTlsDomains?.length ?? 0,
-          models: provider.models.length,
-          scored: provider.models.filter((model) => typeof model.benchmark?.livebench === "number")
-            .length,
-          hasKey: provider.apiKey || provider.models.some((model) => Boolean(model.apiKey)) ? "yes" : "no",
-          health: summarizeProviderHealth(provider.models, healthMap),
-        }));
-    console.table(rows);
+    await listProvidersAction(options);
   });
 
 provider
@@ -1431,6 +1517,502 @@ provider
     );
   });
 
+type ResolvedModelTarget = {
+  providerId: string;
+  modelId: string;
+  model: ProviderModelRecord;
+};
+
+async function resolveModelTarget(modelRef: string): Promise<ResolvedModelTarget | null> {
+  const parsed = parseModelRef(modelRef);
+  if (parsed.providerId) {
+    const model = await getProviderModel(paths, parsed.providerId, parsed.modelId);
+    if (!model) {
+      printErrorWithSuggestion(
+        `Model not found: ${parsed.providerId}/${parsed.modelId}`,
+        [
+          `Try: waypoint models ${parsed.providerId}`,
+          "List providers: waypoint providers",
+        ]
+      );
+      process.exitCode = 1;
+      return null;
+    }
+    return {
+      providerId: parsed.providerId,
+      modelId: parsed.modelId,
+      model,
+    };
+  }
+
+  const providers = await listProviders(paths);
+  const matches: ResolvedModelTarget[] = [];
+  for (const providerEntry of providers) {
+    for (const model of providerEntry.models) {
+      if (
+        model.modelId === parsed.modelId ||
+        model.providerModelId === parsed.modelId ||
+        (model.aliases ?? []).includes(parsed.modelId)
+      ) {
+        matches.push({
+          providerId: providerEntry.id,
+          modelId: model.modelId,
+          model,
+        });
+      }
+    }
+  }
+
+  if (matches.length === 0) {
+    printErrorWithSuggestion(
+      `Unknown model '${parsed.modelId}'`,
+      [
+        "Try: waypoint models",
+        "List providers: waypoint providers",
+      ]
+    );
+    process.exitCode = 1;
+    return null;
+  }
+
+  if (matches.length > 1) {
+    const candidates = matches
+      .map((entry) => `  - waypoint models show ${entry.providerId}/${entry.modelId}`)
+      .slice(0, 10);
+    printErrorWithSuggestion(
+      `Model '${parsed.modelId}' is ambiguous across providers.`,
+      [
+        "Use a provider-qualified model reference:",
+        ...candidates,
+      ]
+    );
+    process.exitCode = 1;
+    return null;
+  }
+
+  return matches[0];
+}
+
+async function listModelsAction(
+  providerId: string | undefined,
+  options: {
+    json?: boolean;
+    enabled?: boolean;
+    modality?: string;
+    verbose?: boolean;
+    check?: boolean;
+  }
+): Promise<void> {
+  await ensureStorageDir(paths);
+  if (options.check !== false) {
+    await probeProviderModels(paths);
+  }
+  const healthMap = await getProviderModelHealthMap(paths);
+  const modality = typeof options.modality === "string" ? options.modality.trim() : undefined;
+
+  if (providerId) {
+    const models = await listProviderModels(paths, providerId);
+    if (!models) {
+      printErrorWithSuggestion(
+        `Provider not found: ${providerId}`,
+        ["List providers: waypoint providers"]
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const filtered = models.filter((model) => {
+      if (options.enabled && model.enabled === false) {
+        return false;
+      }
+      if (modality && !model.modalities.includes(modality)) {
+        return false;
+      }
+      return true;
+    });
+    if (options.json) {
+      printJson(filtered);
+      return;
+    }
+    const rows = options.verbose
+      ? filtered.map((model) => ({
+          provider: providerId,
+          providerModelId: model.providerModelId,
+          modelId: model.modelId,
+          upstreamModel: model.upstreamModel,
+          enabled: model.enabled === false ? "no" : "yes",
+          tls: model.insecureTls === undefined ? "inherit" : model.insecureTls ? "insecure" : "strict",
+          endpointType: model.endpointType,
+          baseUrl: model.baseUrl ?? "-",
+          aliases: (model.aliases ?? []).join(","),
+          free: model.free ? "yes" : "no",
+          livebench: model.benchmark?.livebench ?? "-",
+          status: healthMap[model.providerModelId]?.status ?? "-",
+          latency: formatLatency(healthMap[model.providerModelId]?.latencyMsEwma),
+          lastStatus: healthMap[model.providerModelId]?.lastStatusCode ?? "-",
+          lastError: healthMap[model.providerModelId]?.lastError ?? "-",
+        }))
+      : filtered.map((model) => ({
+          provider: providerId,
+          id: model.modelId,
+          enabled: model.enabled === false ? "no" : "yes",
+          tls: model.insecureTls === undefined ? "inherit" : model.insecureTls ? "insecure" : "strict",
+          type: model.endpointType,
+          aliases: (model.aliases ?? []).length,
+          livebench: model.benchmark?.livebench ?? "-",
+          status: healthMap[model.providerModelId]?.status ?? "-",
+          latency: formatLatency(healthMap[model.providerModelId]?.latencyMsEwma),
+        }));
+    console.table(rows);
+    return;
+  }
+
+  const providers = await listProviders(paths);
+  const flattened = providers.flatMap((providerEntry) =>
+    providerEntry.models.map((model) => ({ providerId: providerEntry.id, model }))
+  );
+  const filtered = flattened.filter(({ model }) => {
+    if (options.enabled && model.enabled === false) {
+      return false;
+    }
+    if (modality && !model.modalities.includes(modality)) {
+      return false;
+    }
+    return true;
+  });
+  if (options.json) {
+    printJson(
+      filtered.map(({ providerId, model }) => ({
+        ...model,
+        providerId,
+      }))
+    );
+    return;
+  }
+  const rows = filtered.map(({ providerId, model }) => ({
+    provider: providerId,
+    model: model.modelId,
+    enabled: model.enabled === false ? "no" : "yes",
+    type: model.endpointType,
+    aliases: (model.aliases ?? []).length,
+    livebench: model.benchmark?.livebench ?? "-",
+    status: healthMap[model.providerModelId]?.status ?? "-",
+    latency: formatLatency(healthMap[model.providerModelId]?.latencyMsEwma),
+  }));
+  console.table(rows);
+}
+
+const models = program
+  .command("models")
+  .alias("model")
+  .description("List and manage provider-owned models")
+  .argument("[providerId]")
+  .option("--json", "Output as JSON")
+  .option("--enabled", "Only show enabled models")
+  .option("--modality <modality>", "Filter by modality (e.g. text-to-text,image-to-text)")
+  .option("--verbose", "Show full model metadata")
+  .option("--no-check", "Skip health check for faster listing")
+  .action(async (providerId, options) => {
+    await listModelsAction(providerId, options);
+  });
+
+models.addHelpText(
+  "after",
+  `
+Default: \`waypoint models [providerId]\` runs \`models list [providerId]\`.
+Examples:
+  waypoint models
+  waypoint models provider-id
+  waypoint models show provider-id/model-id
+`
+);
+
+models
+  .command("list")
+  .alias("ls")
+  .description("List models, optionally filtered by provider")
+  .argument("[providerId]")
+  .option("--json", "Output as JSON")
+  .option("--enabled", "Only show enabled models")
+  .option("--modality <modality>", "Filter by modality (e.g. text-to-text,image-to-text)")
+  .option("--verbose", "Show full model metadata")
+  .option("--no-check", "Skip health check for faster listing")
+  .action(async (providerId, options) => {
+    await listModelsAction(providerId, options);
+  });
+
+models
+  .command("show")
+  .description("Show one model (provider/model preferred)")
+  .argument("<modelRef>")
+  .action(async (modelRef) => {
+    await ensureStorageDir(paths);
+    const resolved = await resolveModelTarget(modelRef);
+    if (!resolved) {
+      return;
+    }
+    printJson({
+      ...resolved.model,
+      providerId: resolved.providerId,
+      modelId: resolved.modelId,
+    });
+  });
+
+models
+  .command("enable")
+  .description("Enable a provider model")
+  .argument("<modelRef>")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (modelRef, options) => {
+    await ensureStorageDir(paths);
+    const resolved = await resolveModelTarget(modelRef);
+    if (!resolved) {
+      return;
+    }
+    const model = await setProviderModelEnabled(paths, resolved.providerId, resolved.modelId, true);
+    if (!model) {
+      printErrorWithSuggestion(`Model not found: ${modelRef}`, ["Try: waypoint models"]);
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Enabled model: ${model.providerModelId}`);
+  });
+
+models
+  .command("disable")
+  .description("Disable a provider model")
+  .argument("<modelRef>")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (modelRef, options) => {
+    await ensureStorageDir(paths);
+    const resolved = await resolveModelTarget(modelRef);
+    if (!resolved) {
+      return;
+    }
+    const model = await setProviderModelEnabled(paths, resolved.providerId, resolved.modelId, false);
+    if (!model) {
+      printErrorWithSuggestion(`Model not found: ${modelRef}`, ["Try: waypoint models"]);
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Disabled model: ${model.providerModelId}`);
+  });
+
+models
+  .command("set-key")
+  .description("Set plaintext API key for a provider model")
+  .argument("<modelRef>")
+  .option("--api-key <key>", "API key value")
+  .option("--env-var <name>", "Read API key from environment variable")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (modelRef, options) => {
+    await ensureStorageDir(paths);
+    const resolved = await resolveModelTarget(modelRef);
+    if (!resolved) {
+      return;
+    }
+    let apiKey: string | undefined = options.apiKey;
+    if (!apiKey && options.envVar) {
+      apiKey = process.env[String(options.envVar)] ?? undefined;
+      if (!apiKey) {
+        printErrorWithSuggestion(`Environment variable '${options.envVar}' is not set.`, [
+          "Provide --api-key <key> or set the environment variable.",
+        ]);
+        process.exitCode = 1;
+        return;
+      }
+    }
+    if (!apiKey) {
+      printErrorWithSuggestion("Provide --api-key or --env-var.", [
+        "Try: waypoint models set-key provider/model --env-var API_KEY",
+      ]);
+      process.exitCode = 1;
+      return;
+    }
+    const model = await setProviderModelApiKey(paths, resolved.providerId, resolved.modelId, apiKey);
+    if (!model) {
+      printErrorWithSuggestion(`Model not found: ${modelRef}`, ["Try: waypoint models"]);
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Updated key for model: ${model.providerModelId}`);
+  });
+
+models
+  .command("add")
+  .description("Add a model under a provider")
+  .argument("<providerId>")
+  .requiredOption("--model-id <id>", "Provider model ID suffix")
+  .requiredOption("--upstream <name>", "Upstream model name")
+  .requiredOption("--base-url <url>", "Base URL for this model")
+  .option("--api-key <key>", "API key for this model")
+  .option("--insecure-tls", "Allow self-signed TLS certificates for this model")
+  .option("--endpoint-type <type>", "Endpoint type (llm|diffusion|audio|embedding)", "llm")
+  .option("--capability <spec...>", "Capability spec, e.g. text->text or text+image->text")
+  .option("--alias <alias...>", "Legacy/public aliases")
+  .option("--free", "Mark model as free")
+  .option("--no-free", "Mark model as not free")
+  .option("--disabled", "Add model in disabled state")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, options) => {
+    await ensureStorageDir(paths);
+    const providerRecord = await getProviderById(paths, providerId);
+    if (!providerRecord) {
+      printErrorWithSuggestion(`Provider not found: ${providerId}`, ["List providers: waypoint providers"]);
+      process.exitCode = 1;
+      return;
+    }
+    const endpointType = normalizeType(options.endpointType);
+    const capabilities = options.capability
+      ? parseCapabilitySpecs(options.capability)
+      : defaultCapabilitiesForEndpointType(endpointType);
+    const modelId = String(options.modelId).trim();
+    const providerModelId = canonicalProviderModelId(providerId, modelId);
+    const modelRecord: ProviderModelRecord = {
+      providerModelId,
+      providerId,
+      modelId,
+      upstreamModel: String(options.upstream).trim(),
+      baseUrl: String(options.baseUrl).trim(),
+      apiKey: options.apiKey,
+      insecureTls: options.insecureTls ? true : undefined,
+      enabled: options.disabled ? false : true,
+      aliases: normalizeAliasList(options.alias ?? []),
+      free: options.free !== false,
+      modalities: capabilitiesToModalities(capabilities),
+      capabilities,
+      endpointType,
+    };
+    const result = await upsertProviderModel(paths, providerId, modelRecord);
+    if (!result) {
+      console.error("Failed to add model");
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Model ${result.created ? "added" : "updated"}: ${providerModelId}`);
+  });
+
+models
+  .command("update")
+  .description("Update a provider model")
+  .argument("<providerId>")
+  .argument("<modelRef>")
+  .option("--upstream <name>", "Set upstream model")
+  .option("--base-url <url>", "Set base URL")
+  .option("--clear-base-url", "Clear model-specific base URL override")
+  .option("--api-key <key>", "Set API key")
+  .option("--clear-api-key", "Clear model-specific API key")
+  .option("--insecure-tls", "Enable insecure TLS for this model")
+  .option("--clear-insecure-tls", "Clear model TLS override and inherit provider setting")
+  .option("--endpoint-type <type>", "Endpoint type")
+  .option("--capability <spec...>", "Replace capabilities")
+  .option("--alias <alias...>", "Set aliases")
+  .option("--free", "Set free=true")
+  .option("--not-free", "Set free=false")
+  .option("--enabled", "Set enabled=true")
+  .option("--disabled", "Set enabled=false")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, modelRef, options) => {
+    await ensureStorageDir(paths);
+    const patch: Partial<ProviderModelRecord> = {};
+    if (typeof options.upstream === "string") {
+      patch.upstreamModel = options.upstream.trim();
+    }
+    if (typeof options.baseUrl === "string") {
+      patch.baseUrl = options.baseUrl.trim();
+    }
+    if (options.clearBaseUrl) {
+      patch.baseUrl = undefined;
+    }
+    if (typeof options.apiKey === "string") {
+      patch.apiKey = options.apiKey;
+    }
+    if (options.clearApiKey) {
+      patch.apiKey = undefined;
+    }
+    if (options.insecureTls) {
+      patch.insecureTls = true;
+    }
+    if (options.clearInsecureTls) {
+      patch.insecureTls = undefined;
+    }
+    if (typeof options.endpointType === "string") {
+      patch.endpointType = normalizeType(options.endpointType);
+    }
+    if (options.capability) {
+      const capabilities = parseCapabilitySpecs(options.capability);
+      patch.capabilities = capabilities;
+      patch.modalities = capabilitiesToModalities(capabilities);
+    }
+    if (options.alias) {
+      patch.aliases = normalizeAliasList(options.alias);
+    }
+    if (options.free) {
+      patch.free = true;
+    }
+    if (options.notFree) {
+      patch.free = false;
+    }
+    if (options.enabled) {
+      patch.enabled = true;
+    }
+    if (options.disabled) {
+      patch.enabled = false;
+    }
+    if (Object.keys(patch).length === 0) {
+      printErrorWithSuggestion("No changes requested.", [
+        "Try: waypoint models update <providerId> <modelRef> --upstream <name>",
+      ]);
+      process.exitCode = 1;
+      return;
+    }
+    const updated = await updateProviderModel(paths, providerId, modelRef, patch);
+    if (!updated) {
+      printErrorWithSuggestion(`Model not found: ${providerId}/${modelRef}`, [
+        `Try: waypoint models ${providerId}`,
+      ]);
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Updated model: ${updated.providerModelId}`);
+  });
+
+models
+  .command("rm")
+  .description("Remove a provider model")
+  .argument("<providerId>")
+  .argument("<modelRef>")
+  .option("--no-rebuild", "Skip automatic pool rebuild")
+  .action(async (providerId, modelRef, options) => {
+    await ensureStorageDir(paths);
+    const removed = await deleteProviderModel(paths, providerId, modelRef);
+    if (!removed) {
+      printErrorWithSuggestion(`Model not found: ${providerId}/${modelRef}`, [
+        `Try: waypoint models ${providerId}`,
+      ]);
+      process.exitCode = 1;
+      return;
+    }
+    if (options.rebuild !== false) {
+      await rebuildDefaultPools(paths);
+    }
+    console.log(`Removed model: ${removed.providerModelId}`);
+  });
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Benchmark Command
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1553,7 +2135,11 @@ program
     }
   });
 
-program.parseAsync().catch((error) => {
+const rawArgv = process.argv.slice(2);
+const rewriteResult = rewriteLegacyArgv(rawArgv);
+warnLegacyRewrite(rewriteResult);
+
+program.parseAsync(["node", "waypoint", ...rewriteResult.argv]).catch((error) => {
   console.error(error);
   process.exit(1);
 });

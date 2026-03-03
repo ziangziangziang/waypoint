@@ -258,25 +258,26 @@ waypoint mcp enable <id|name>         # Enable server
 waypoint mcp disable <id|name>        # Disable server
 
 # Provider catalog + smart pools
-waypoint provider import -f .env      # Import providers and credentials, rebuild pools
-waypoint provider ls                  # List providers
-waypoint provider show <providerId>   # Show one provider
-waypoint provider update <providerId> --insecure-tls|--strict-tls
-waypoint provider update <providerId> --auto-insecure-domain ai-application.stjude.org
-waypoint provider models <providerId> # List provider models
-waypoint provider enable <providerId> # Enable provider
-waypoint provider disable <providerId># Disable provider
-waypoint provider migrate-endpoints --provider pcai --match-domain ai-application.stjude.org --protocol openai
-waypoint provider model ls <providerId>
-waypoint provider model show <providerId> <modelRef>
-waypoint provider model add <providerId> --model-id <id> --upstream <name> --base-url <url>
-waypoint provider model update <providerId> <modelRef> [patch options]
-waypoint provider model update <providerId> <modelRef> --clear-insecure-tls
-waypoint provider model rm <providerId> <modelRef>
-waypoint provider model enable <providerId> <modelRef>
-waypoint provider model disable <providerId> <modelRef>
-waypoint provider model set-key <providerId> <modelRef> --api-key <key>|--env-var <ENV>
-waypoint provider pools               # List smart pools
+waypoint providers                    # List providers (canonical)
+waypoint providers import -f .env     # Import providers and credentials, rebuild pools
+waypoint providers show <providerId>  # Show one provider
+waypoint providers update <providerId> --insecure-tls|--strict-tls
+waypoint providers update <providerId> --auto-insecure-domain ai-application.stjude.org
+waypoint providers enable <providerId> # Enable provider
+waypoint providers disable <providerId># Disable provider
+waypoint providers migrate-endpoints --provider pcai --match-domain ai-application.stjude.org --protocol openai
+waypoint providers pools              # List smart pools
+
+# Models (one-hop by provider)
+waypoint models                       # List models across providers
+waypoint models pcai                  # List models for provider
+waypoint models show pcai/gpt-4o      # Show one model
+waypoint models add <providerId> --model-id <id> --upstream <name> --base-url <url>
+waypoint models update <providerId> <modelRef> [patch options]
+waypoint models rm <providerId> <modelRef>
+waypoint models enable pcai/gpt-4o
+waypoint models disable pcai/gpt-4o
+waypoint models set-key pcai/gpt-4o --api-key <key>|--env-var <ENV>
 
 # Lightweight benchmark
 waypoint bench                        # Built-in smoke benchmark
@@ -287,8 +288,10 @@ waypoint bench --baseline ./bench-prev.json
 waypoint bench --suite pool_smoke     # Validate smart pool routing/failover
 ```
 
-Provider credentials imported with `waypoint provider import -f .env` are stored in plaintext at
+Provider credentials imported with `waypoint providers import -f .env` are stored in plaintext at
 `$WAYPOINT_DIR/providers.json` by design for local operation.
+
+Legacy `waypoint provider ...` and `waypoint provider model ...` forms are rewritten to canonical commands with a deprecation warning. Set `WAYPOINT_NO_WARN=1` to suppress legacy rewrite warnings in scripts.
 
 TLS policy is provider-first:
 - Provider `insecureTls` is the default for all provider models.

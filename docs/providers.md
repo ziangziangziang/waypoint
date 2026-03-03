@@ -10,28 +10,30 @@ External clients still use OpenAI-compatible `/v1/*` endpoints; adapters transla
    - `endpoint.baseUrl`
    - protocol-specific config (for `inference_v2`: `endpoint.router`)
 2. Import with:
-   - `waypoint provider import --registry <registry.yaml> --env-file .env`
+   - `waypoint providers import --registry <registry.yaml> --env-file .env`
 3. Rebuild pools:
-   - `waypoint provider import ...` (default auto rebuild) or `POST /admin/pools/rebuild`
+   - `waypoint providers import ...` (default auto rebuild) or `POST /admin/pools/rebuild`
 4. Verify:
-   - `waypoint provider ls`
-   - `waypoint provider show <id>`
-   - `waypoint provider model ls <id>`
+   - `waypoint providers`
+   - `waypoint providers show <id>`
+   - `waypoint models <id>`
 5. Optional TLS policy:
-   - `waypoint provider update <id> --insecure-tls|--strict-tls`
-   - `waypoint provider update <id> --auto-insecure-domain <suffix...>`
+   - `waypoint providers update <id> --insecure-tls|--strict-tls`
+   - `waypoint providers update <id> --auto-insecure-domain <suffix...>`
 
 ## Provider model CRUD
 
 Use provider-first model management:
 
-- `waypoint provider model add <providerId> --model-id <id> --upstream <name> --base-url <url>`
-- `waypoint provider model update <providerId> <modelRef> ...`
-- `waypoint provider model update <providerId> <modelRef> --clear-insecure-tls`
-- `waypoint provider model rm <providerId> <modelRef>`
-- `waypoint provider model enable <providerId> <modelRef>`
-- `waypoint provider model disable <providerId> <modelRef>`
-- `waypoint provider model set-key <providerId> <modelRef> --api-key <key>`
+- `waypoint models add <providerId> --model-id <id> --upstream <name> --base-url <url>`
+- `waypoint models update <providerId> <modelRef> ...`
+- `waypoint models update <providerId> <modelRef> --clear-insecure-tls`
+- `waypoint models rm <providerId> <modelRef>`
+- `waypoint models enable <providerId>/<modelRef>`
+- `waypoint models disable <providerId>/<modelRef>`
+- `waypoint models set-key <providerId>/<modelRef> --api-key <key>`
+
+Legacy command forms (`waypoint provider ...`, `waypoint provider model ...`) are still supported through rewrite shims with deprecation warnings.
 
 Legacy endpoint write commands are blocked in v0.5.0; use migration + provider model commands.
 
@@ -65,13 +67,13 @@ This migration copies endpoint-managed models into provider `pcai`, then disable
 1. Pre-check:
    - `waypoint ls`
 2. Run migration:
-   - `waypoint provider migrate-endpoints --provider pcai --match-domain ai-application.stjude.org --protocol openai`
+   - `waypoint providers migrate-endpoints --provider pcai --match-domain ai-application.stjude.org --protocol openai`
 3. Verify:
-   - `waypoint provider show pcai`
-   - `waypoint provider models pcai`
-   - `waypoint provider pools`
+   - `waypoint providers show pcai`
+   - `waypoint models pcai`
+   - `waypoint providers pools`
    - `waypoint ls` (legacy endpoints should show `disabled=yes`)
 4. Rollback (single model path):
    - Re-enable the endpoint in `config.yaml` (`disabled: false`) or via admin endpoint patch.
    - Set the corresponding `pcai` provider model `enabled: false` in `$WAYPOINT_DIR/providers.json`.
-   - Rebuild pools: `waypoint provider pools` (or `POST /admin/pools/rebuild`).
+   - Rebuild pools: `waypoint providers pools` (or `POST /admin/pools/rebuild`).

@@ -2,6 +2,27 @@
 
 All notable changes to Waypoint are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- CLI canonical provider/model groups now use one-hop commands:
+  - `waypoint providers`
+  - `waypoint models <providerId>`
+  - `waypoint models show <providerId>/<modelId>`
+- Added legacy rewrite shims with deprecation warnings for common old forms (for example `waypoint provider model ls <providerId>`).
+- Added `WAYPOINT_NO_WARN=1` support to suppress legacy rewrite warnings in scripts.
+- Updated CLI docs to prefer canonical `providers`/`models` command paths.
+
+### Added
+
+- New CLI utilities:
+  - `cli/legacyRewrite.ts`
+  - `cli/modelRef.ts`
+- New tests:
+  - `tests/cliLegacyRewrite.test.ts`
+  - `tests/modelRef.test.ts`
+
 ## [0.4.2] - 2026-02-23
 
 ### Added
