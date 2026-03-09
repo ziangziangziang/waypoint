@@ -3,10 +3,12 @@ import { Gauge, Loader2, Play, RefreshCw, MessageSquareText } from 'lucide-react
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import {
+  BenchmarkCapabilityMatrix,
   BenchmarkRunEvent,
   BenchmarkRunRecord,
   BenchmarkRunSummary,
   getBenchmarkRun,
+  listBenchmarkCapabilities,
   listBenchmarkRuns,
   listModels,
   startBenchmarkRun,
@@ -25,7 +27,7 @@ type ModelLeaderboardRow = {
   totalFailovers: number
 }
 
-const SUITES = ['smoke', 'proxy', 'agent', 'pool_smoke', 'omni_call_smoke']
+const SUITES = ['smoke', 'proxy', 'agent', 'pool_smoke', 'omni_call_smoke', 'capabilities']
 const PROFILES = ['local', 'ci']
 
 export function Benchmark() {
@@ -43,6 +45,7 @@ export function Benchmark() {
   const [showRaw, setShowRaw] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [modelLeaderboard, setModelLeaderboard] = useState<ModelLeaderboardRow[]>([])
+  const [capabilityMatrix, setCapabilityMatrix] = useState<BenchmarkCapabilityMatrix | null>(null)
   const eventSourceRef = useRef<EventSource | null>(null)
 
   const loadRuns = async () => {
@@ -57,6 +60,15 @@ export function Benchmark() {
       setError((err as Error).message)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const loadCapabilities = async () => {
+    try {
+      const response = await listBenchmarkCapabilities(7)
+      setCapabilityMatrix(response)
+    } catch (err) {
+      console.error('Failed to load benchmark capabilities:', err)
     }
   }
 
@@ -75,8 +87,10 @@ export function Benchmark() {
   useEffect(() => {
     void loadRuns()
     void loadModels()
+    void loadCapabilities()
     const timer = setInterval(() => {
       void loadRuns()
+      void loadCapabilities()
     }, 5000)
     return () => clearInterval(timer)
   }, [])
@@ -157,9 +171,12 @@ export function Benchmark() {
         profile,
         scenarioPath: scenarioPath.trim() || undefined,
         modelOverride: selectedModel || undefined,
+        updateCapCache: suite === 'capabilities',
+        capTtlDays: 7,
       })
       setSelectedRunId(run.id)
       await loadRuns()
+      await loadCapabilities()
     } catch (err) {
       const message = (err as Error).message
       setError(message)
@@ -178,7 +195,7 @@ export function Benchmark() {
   const traceEvents = useMemo(() => events.filter((event) => event.type === 'exchange'), [events])
 
   return (
-    <div className="flex-1 flex flex-col h-screen min-h-0">
+    <div className="flex-1 flex flex-col h-full min-h-0">
       <header className="sticky top-0 z-20 h-14 border-b border-border bg-background/95 backdrop-blur flex items-center px-6 gap-4 shrink-0">
         <div className="flex items-center gap-2">
           <Gauge className="w-4 h-4 text-primary" />
@@ -229,6 +246,7 @@ export function Benchmark() {
                   value={selectedModel}
                   onChange={(event) => setSelectedModel(event.target.value)}
                 >
+                  {suite === 'capabilities' && <option value="">(all models)</option>}
                   {models.length === 0 && <option value="">No models</option>}
                   {models.map((model) => (
                     <option key={model.id} value={model.id}>{model.id}</option>
@@ -244,7 +262,7 @@ export function Benchmark() {
                   placeholder="optional"
                 />
               </label>
-              <Button className="w-full" onClick={startRun} disabled={starting || !selectedModel}>
+              <Button className="w-full" onClick={startRun} disabled={starting || (suite !== 'capabilities' && !selectedModel)}>
                 {starting ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Play className="w-4 h-4 mr-2" />}
                 Start
               </Button>
@@ -359,6 +377,56 @@ export function Benchmark() {
                   </tbody>
                 </table>
               </div>
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-header">
+              <span className="panel-title">Capabilities</span>
+              <span className="text-2xs text-muted-foreground ml-auto">
+                TTL {capabilityMatrix?.ttlDays ?? 7}d
+              </span>
+            </div>
+            <div className="p-4 overflow-auto">
+              <table className="w-full text-xs">
+                <thead className="text-muted-foreground">
+                  <tr>
+                    <th className="text-left py-1">Model</th>
+                    <th className="text-left py-1">Freshness</th>
+                    <th className="text-left py-1">Verified</th>
+                    <th className="text-left py-1">Chat</th>
+                    <th className="text-left py-1">Tools</th>
+                    <th className="text-left py-1">Embed</th>
+                    <th className="text-left py-1">Image</th>
+                    <th className="text-left py-1">Audio In</th>
+                    <th className="text-left py-1">Audio Out</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(capabilityMatrix?.models ?? []).map((model) => (
+                    <tr key={model.model} className="border-t border-border/40">
+                      <td className="py-1 pr-2 font-mono">{model.model}</td>
+                      <td className={cn('py-1', model.freshness === 'fresh' ? 'text-success' : 'text-warning')}>
+                        {model.freshness}
+                      </td>
+                      <td className="py-1 text-muted-foreground">{model.lastVerifiedAt}</td>
+                      <td className="py-1">{model.findings.chat_basic.status}</td>
+                      <td className="py-1">{model.findings.chat_tool_calls.status}</td>
+                      <td className="py-1">{model.findings.embeddings.status}</td>
+                      <td className="py-1">{model.findings.images_generation.status}</td>
+                      <td className="py-1">{model.findings.audio_transcription.status}</td>
+                      <td className="py-1">{model.findings.audio_speech.status}</td>
+                    </tr>
+                  ))}
+                  {(capabilityMatrix?.models.length ?? 0) === 0 && (
+                    <tr>
+                      <td colSpan={9} className="py-3 text-center text-muted-foreground">
+                        No capability snapshots yet. Run suite "capabilities" to populate cache.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         </section>

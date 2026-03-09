@@ -92,7 +92,7 @@ export async function aggregateStats(
 
   if (filtered.length === 0) {
     return {
-      window: `${windowDays}d`,
+      window: formatWindowString(windowMs),
       total: 0,
       success: 0,
       errors: 0,

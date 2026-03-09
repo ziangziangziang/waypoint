@@ -22,6 +22,11 @@ export interface MediaCacheEntry {
 interface CacheIndex {
   entries: MediaCacheEntry[];
   totalSize: number;
+  evictionBlockedCount?: number;
+}
+
+interface MediaRefIndex {
+  refs: Record<string, string[]>;
 }
 
 const DEFAULT_MAX_SIZE_BYTES = 1024 * 1024 * 1024; // 1GB
@@ -39,24 +44,37 @@ function cacheIndexPath(paths: StoragePaths): string {
   return path.join(resolveMediaDir(paths), "index.json");
 }
 
+function refsIndexPath(paths: StoragePaths): string {
+  return path.join(resolveMediaDir(paths), "media_refs.json");
+}
+
 async function ensureMediaDir(paths: StoragePaths): Promise<void> {
   await ensureStorageDir(paths);
   await fs.mkdir(resolveMediaDir(paths), { recursive: true });
+}
+
+export async function ensureMediaCacheReady(paths: StoragePaths): Promise<void> {
+  await ensureMediaDir(paths);
+  const index = await loadCacheIndex(paths);
+  await saveCacheIndex(paths, index);
+  const refs = await loadRefsIndex(paths);
+  await saveRefsIndex(paths, refs);
 }
 
 async function loadCacheIndex(paths: StoragePaths): Promise<CacheIndex> {
   const indexPath = cacheIndexPath(paths);
   try {
     const raw = await fs.readFile(indexPath, "utf8");
-    const data = JSON.parse(raw) as CacheIndex;
-    data.entries = data.entries.map((entry) => ({
-      ...entry,
-      createdAt: new Date(entry.createdAt),
-    }));
-    return data;
+      const data = JSON.parse(raw) as CacheIndex;
+      data.entries = data.entries.map((entry) => ({
+        ...entry,
+        createdAt: new Date(entry.createdAt),
+      }));
+      data.evictionBlockedCount = typeof data.evictionBlockedCount === "number" ? data.evictionBlockedCount : 0;
+      return data;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { entries: [], totalSize: 0 };
+      return { entries: [], totalSize: 0, evictionBlockedCount: 0 };
     }
     throw error;
   }
@@ -64,6 +82,33 @@ async function loadCacheIndex(paths: StoragePaths): Promise<CacheIndex> {
 
 async function saveCacheIndex(paths: StoragePaths, index: CacheIndex): Promise<void> {
   await fs.writeFile(cacheIndexPath(paths), JSON.stringify(index, null, 2), "utf8");
+}
+
+async function loadRefsIndex(paths: StoragePaths): Promise<MediaRefIndex> {
+  const refsPath = refsIndexPath(paths);
+  try {
+    const raw = await fs.readFile(refsPath, "utf8");
+    const parsed = JSON.parse(raw) as MediaRefIndex;
+    const refs = parsed?.refs && typeof parsed.refs === "object" ? parsed.refs : {};
+    const cleaned: Record<string, string[]> = {};
+    for (const [hash, sessionIds] of Object.entries(refs)) {
+      if (!Array.isArray(sessionIds)) continue;
+      const deduped = Array.from(new Set(sessionIds.filter((id) => typeof id === "string" && id.length > 0)));
+      if (deduped.length > 0) {
+        cleaned[hash] = deduped;
+      }
+    }
+    return { refs: cleaned };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { refs: {} };
+    }
+    throw error;
+  }
+}
+
+async function saveRefsIndex(paths: StoragePaths, index: MediaRefIndex): Promise<void> {
+  await fs.writeFile(refsIndexPath(paths), JSON.stringify(index, null, 2), "utf8");
 }
 
 export async function storeMedia(
@@ -83,6 +128,7 @@ export async function storeMedia(
   const filePath = path.join(resolveMediaDir(paths), filename);
 
   const index = await loadCacheIndex(paths);
+  const refs = await loadRefsIndex(paths);
   const existing = index.entries.find((entry) => entry.hash === hash);
   if (existing) {
     index.entries = index.entries.filter((entry) => entry.hash !== hash);
@@ -108,7 +154,13 @@ export async function storeMedia(
   const maxSize = options?.maxSizeBytes ?? DEFAULT_MAX_SIZE_BYTES;
   const evicted: string[] = [];
   while (index.totalSize > maxSize && index.entries.length > 1) {
-    const oldest = index.entries.shift();
+    const evictionTargetIndex = index.entries.findIndex((entry) => !isHashReferenced(refs, entry.hash));
+    if (evictionTargetIndex < 0) {
+      index.evictionBlockedCount = (index.evictionBlockedCount ?? 0) + 1;
+      break;
+    }
+
+    const [oldest] = index.entries.splice(evictionTargetIndex, 1);
     if (!oldest) {
       break;
     }
@@ -158,18 +210,32 @@ export async function getImagePath(paths: StoragePaths, hash: string): Promise<s
 export async function getCacheStats(paths: StoragePaths): Promise<{
   count: number;
   totalSizeBytes: number;
+  referencedCount: number;
+  unreferencedCount: number;
+  evictionBlockedCount: number;
   oldestEntry?: Date;
   newestEntry?: Date;
 }> {
   const index = await loadCacheIndex(paths);
+  const refs = await loadRefsIndex(paths);
   if (index.entries.length === 0) {
-    return { count: 0, totalSizeBytes: 0 };
+    return {
+      count: 0,
+      totalSizeBytes: 0,
+      referencedCount: 0,
+      unreferencedCount: 0,
+      evictionBlockedCount: index.evictionBlockedCount ?? 0,
+    };
   }
 
   const sorted = [...index.entries].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  const referencedCount = index.entries.filter((entry) => isHashReferenced(refs, entry.hash)).length;
   return {
     count: index.entries.length,
     totalSizeBytes: index.totalSize,
+    referencedCount,
+    unreferencedCount: index.entries.length - referencedCount,
+    evictionBlockedCount: index.evictionBlockedCount ?? 0,
     oldestEntry: sorted[0].createdAt,
     newestEntry: sorted[sorted.length - 1].createdAt,
   };
@@ -188,8 +254,63 @@ export async function clearCache(paths: StoragePaths): Promise<number> {
     }
   }
 
-  await saveCacheIndex(paths, { entries: [], totalSize: 0 });
+  await saveCacheIndex(paths, { entries: [], totalSize: 0, evictionBlockedCount: 0 });
+  await saveRefsIndex(paths, { refs: {} });
   return deleted;
+}
+
+export async function syncSessionMediaReferences(
+  paths: StoragePaths,
+  sessionId: string,
+  hashes: string[]
+): Promise<void> {
+  await ensureMediaDir(paths);
+  const refs = await loadRefsIndex(paths);
+  const nextHashes = Array.from(new Set(hashes.filter((hash) => /^[a-f0-9]{16}$/i.test(hash))));
+
+  // Remove previous references for this session from all hashes.
+  for (const [hash, sessionIds] of Object.entries(refs.refs)) {
+    const filtered = sessionIds.filter((id) => id !== sessionId);
+    if (filtered.length > 0) {
+      refs.refs[hash] = filtered;
+    } else {
+      delete refs.refs[hash];
+    }
+  }
+
+  for (const hash of nextHashes) {
+    const existing = refs.refs[hash] ?? [];
+    refs.refs[hash] = Array.from(new Set([...existing, sessionId]));
+  }
+
+  await saveRefsIndex(paths, refs);
+}
+
+export async function unmarkSessionMediaReferences(
+  paths: StoragePaths,
+  sessionId: string
+): Promise<void> {
+  await ensureMediaDir(paths);
+  const refs = await loadRefsIndex(paths);
+  for (const [hash, sessionIds] of Object.entries(refs.refs)) {
+    const filtered = sessionIds.filter((id) => id !== sessionId);
+    if (filtered.length > 0) {
+      refs.refs[hash] = filtered;
+    } else {
+      delete refs.refs[hash];
+    }
+  }
+  await saveRefsIndex(paths, refs);
+}
+
+export async function getMediaRefCount(paths: StoragePaths, hash: string): Promise<number> {
+  const refs = await loadRefsIndex(paths);
+  return refs.refs[hash]?.length ?? 0;
+}
+
+function isHashReferenced(refs: MediaRefIndex, hash: string): boolean {
+  const sessionIds = refs.refs[hash];
+  return Array.isArray(sessionIds) && sessionIds.length > 0;
 }
 
 function normalizeMediaInput(

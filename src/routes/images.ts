@@ -7,6 +7,7 @@ import { StoragePaths } from "../storage/files";
 import { selectPoolCandidates } from "../pools/scheduler";
 import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 import { resolveGenerationModel, runImageGeneration } from "../services/imageGeneration";
+import { setCaptureError, setCaptureRouting } from "../middleware/requestCapture";
 
 export async function registerImageRoutes(app: FastifyInstance, paths: StoragePaths): Promise<void> {
   // POST /v1/images/generations
@@ -39,6 +40,12 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
       );
       setHeaders(reply, generated.headers);
       reply.code(generated.statusCode).send(generated.payload);
+      setCaptureRouting(reply, {
+        publicModel: model,
+        endpointId: generated.route.endpointId,
+        endpointName: generated.route.endpointName,
+        upstreamModel: generated.route.upstreamModel,
+      });
       
       await logRequest(paths, buildLog(
         requestId,
@@ -60,6 +67,7 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
       ));
     } catch (error) {
       const errorType = (error as { type?: string }).type ?? (error as Error).name;
+      setCaptureError(reply, { type: errorType, message: (error as Error).message });
       await logRequest(paths, {
         requestId,
         ts: new Date(),
@@ -130,10 +138,17 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
       const upstreamBody = await readBody(outcome.attempt.response);
       setHeaders(reply, outcome.attempt.response.headers);
       reply.code(outcome.attempt.response.statusCode).send(upstreamBody.payload);
+      setCaptureRouting(reply, {
+        publicModel: model,
+        endpointId: outcome.attempt.endpoint.id,
+        endpointName: outcome.attempt.endpoint.name,
+        upstreamModel: outcome.attempt.upstreamModel,
+      });
       
       await logRequest(paths, buildLog(requestId, model, outcome, Date.now() - start, false));
     } catch (error) {
       const errorType = (error as { type?: string }).type ?? (error as Error).name;
+      setCaptureError(reply, { type: errorType, message: (error as Error).message });
       await logRequest(paths, {
         requestId,
         ts: new Date(),
@@ -196,10 +211,17 @@ export async function registerImageRoutes(app: FastifyInstance, paths: StoragePa
       const upstreamBody = await readBody(outcome.attempt.response);
       setHeaders(reply, outcome.attempt.response.headers);
       reply.code(outcome.attempt.response.statusCode).send(upstreamBody.payload);
+      setCaptureRouting(reply, {
+        publicModel: model,
+        endpointId: outcome.attempt.endpoint.id,
+        endpointName: outcome.attempt.endpoint.name,
+        upstreamModel: outcome.attempt.upstreamModel,
+      });
       
       await logRequest(paths, buildLog(requestId, model, outcome, Date.now() - start, false));
     } catch (error) {
       const errorType = (error as { type?: string }).type ?? (error as Error).name;
+      setCaptureError(reply, { type: errorType, message: (error as Error).message });
       await logRequest(paths, {
         requestId,
         ts: new Date(),

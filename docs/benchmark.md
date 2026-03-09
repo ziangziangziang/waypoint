@@ -20,23 +20,28 @@ waypoint bench --suite pool_smoke
 # Omni call smoke check (audio + text turn)
 waypoint bench --suite omni_call_smoke
 
+# Capability probe run + cache update
+waypoint bench --suite capabilities --update-cap-cache
+
 # Compare with baseline for soft regression warnings
 waypoint bench --baseline ~/.config/waypoint/benchmarks/bench-2026-02-23T12-00-00-000Z.json
 ```
 
 ## CLI options
 
-- `--suite <name>` built-in suite (`smoke`, `proxy`, `agent`, `pool_smoke`, `omni_call_smoke`)
+- `--suite <name>` built-in suite (`smoke`, `proxy`, `agent`, `pool_smoke`, `omni_call_smoke`, `capabilities`)
 - `--scenario <path>` scenario file (`.json`, `.jsonl`, `.yaml`, `.yml`)
 - `--model <name>` force one model for all scenarios
 - `--out <path>` output file (`.json`/`.txt`) or output directory
 - `--config <path>` benchmark config file (YAML or JSON)
 - `--profile <name>` config profile (default: `local`)
 - `--baseline <path>` previous benchmark report for p95/throughput deltas
+- `--update-cap-cache` persist capability findings to `$WAYPOINT_DIR/capabilities`
+- `--cap-ttl-days <n>` capability TTL override for freshness (default `7`)
 
 ## Config resolution order
 
-1. CLI flags (`--suite`, `--scenario`, `--model`, `--out`, `--profile`, `--baseline`)
+1. CLI flags (`--suite`, `--scenario`, `--model`, `--out`, `--profile`, `--baseline`, `--update-cap-cache`, `--cap-ttl-days`)
 2. Explicit `--config`
 3. `$WAYPOINT_DIR/benchmark.config.yaml` (if present)
 4. Internal defaults
@@ -217,6 +222,10 @@ Per run:
 - `bench-<timestamp>.json`
 - `bench-<timestamp>.txt`
 
+Capability cache (optional, when `--update-cap-cache` is used):
+
+- `$WAYPOINT_DIR/capabilities/<providerId>__<modelId>.json`
+
 Report includes:
 
 - run metadata + effective config
@@ -225,6 +234,7 @@ Report includes:
 - per-scenario results + measured samples
 - gate outcomes
 - top failure reasons + warnings
+- optional `capabilityMatrix` with per-model capability status/evidence/freshness
 
 ## Recommended config template
 

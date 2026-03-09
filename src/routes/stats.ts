@@ -70,22 +70,29 @@ export async function registerStatsRoutes(
 
   // GET /admin/stats/latency - latency distribution
   app.get("/admin/stats/latency", async (req: FastifyRequest<{ Querystring: StatsQuery }>, reply: FastifyReply) => {
-    const windowDays = parseWindowDays(req.query.window ?? "7d");
-    
-    if (windowDays === null) {
+    const windowMs = parseWindow(req.query.window ?? "7d");
+
+    if (windowMs === null) {
       reply.code(400).send({ error: { message: "Invalid window format" } });
       return;
     }
 
     try {
-      const stats = await readStatsForWindow(paths, windowDays);
+      const stats = await selectStatsForWindow(paths, windowMs);
       const latencies = stats.map((s) => s.latencyMs).sort((a, b) => a - b);
+      const window = formatWindowString(windowMs);
       
       if (latencies.length === 0) {
         reply.send({ 
-          window: `${windowDays}d`,
+          window,
           count: 0,
-          distribution: null 
+          min: null,
+          max: null,
+          avg: null,
+          p50: null,
+          p95: null,
+          p99: null,
+          histogram: {}
         });
         return;
       }
@@ -114,7 +121,7 @@ export async function registerStatsRoutes(
       }
 
       reply.send({
-        window: `${windowDays}d`,
+        window,
         count: latencies.length,
         min: latencies[0],
         max: latencies[latencies.length - 1],
@@ -132,29 +139,30 @@ export async function registerStatsRoutes(
 
   // GET /admin/stats/tokens - token usage over time
   app.get("/admin/stats/tokens", async (req: FastifyRequest<{ Querystring: StatsQuery }>, reply: FastifyReply) => {
-    const windowDays = parseWindowDays(req.query.window ?? "7d");
-    
-    if (windowDays === null) {
+    const windowMs = parseWindow(req.query.window ?? "7d");
+
+    if (windowMs === null) {
       reply.code(400).send({ error: { message: "Invalid window format" } });
       return;
     }
 
     try {
-      const stats = await readStatsForWindow(paths, windowDays);
-      
-      // Group by day
+      const stats = await selectStatsForWindow(paths, windowMs);
+      const bucketGranularity = windowMs <= 24 * 60 * 60 * 1000 ? "hour" : "day";
       const byDay: Record<string, { count: number; tokens: number; estimated: number }> = {};
-      
+      let tokenEstimatedCount = 0;
+
       for (const stat of stats) {
-        const day = stat.timestamp.toISOString().split("T")[0];
-        if (!byDay[day]) {
-          byDay[day] = { count: 0, tokens: 0, estimated: 0 };
+        const bucket = formatTokenBucket(stat.timestamp, bucketGranularity);
+        if (!byDay[bucket]) {
+          byDay[bucket] = { count: 0, tokens: 0, estimated: 0 };
         }
-        byDay[day].count++;
+        byDay[bucket].count++;
         if (stat.totalTokens !== null && stat.totalTokens !== undefined) {
-          byDay[day].tokens += stat.totalTokens;
+          byDay[bucket].tokens += stat.totalTokens;
         } else {
-          byDay[day].estimated++;
+          byDay[bucket].estimated++;
+          tokenEstimatedCount += 1;
         }
       }
 
@@ -165,11 +173,14 @@ export async function registerStatsRoutes(
       const totalTokens = stats.reduce((sum, s) => sum + (s.totalTokens ?? 0), 0);
       
       reply.send({
-        window: `${windowDays}d`,
+        window: formatWindowString(windowMs),
         totalTokens,
         totalRequests: stats.length,
         avgTokensPerRequest: stats.length > 0 ? Math.round(totalTokens / stats.length) : 0,
-        byDay: days
+        byDay: days,
+        tokenEstimatedCount,
+        tokenEstimatedRate: stats.length > 0 ? tokenEstimatedCount / stats.length : 0,
+        bucketGranularity
       });
     } catch (error) {
       app.log.error({ error }, "Failed to compute token usage");
@@ -203,4 +214,24 @@ function percentile(sortedArr: number[], p: number): number {
   if (sortedArr.length === 0) return 0;
   const index = Math.ceil((p / 100) * sortedArr.length) - 1;
   return sortedArr[Math.max(0, index)];
+}
+
+async function selectStatsForWindow(paths: StoragePaths, windowMs: number) {
+  const windowDays = Math.ceil(windowMs / (24 * 60 * 60 * 1000));
+  const stats = await readStatsForWindow(paths, windowDays);
+  const cutoff = Date.now() - windowMs;
+  return stats.filter((s) => s.timestamp.getTime() >= cutoff);
+}
+
+function formatWindowString(ms: number): string {
+  const hours = ms / (60 * 60 * 1000);
+  if (hours < 24) return `${Math.round(hours)}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+function formatTokenBucket(timestamp: Date, granularity: "hour" | "day"): string {
+  if (granularity === "day") {
+    return timestamp.toISOString().slice(0, 10);
+  }
+  return `${timestamp.toISOString().slice(0, 13)}:00`;
 }

@@ -12,10 +12,12 @@ import { registerMcpRoutes } from "./routes/mcp";
 import { closeMcpServiceRoutes, registerMcpServiceRoutes } from "./routes/mcpService";
 import { registerUiRoutes } from "./routes/ui";
 import { registerRequestStatsMiddleware } from "./middleware/requestStats";
+import { registerRequestCaptureMiddleware } from "./middleware/requestCapture";
 import { registerAuthHooks, loadAuthConfig, updateAuthConfig } from "./middleware/auth";
 import { startHealthChecker } from "./workers/healthChecker";
 import { startStatsRotation } from "./workers/statsRotation";
 import { startConfigWatcher, stopConfigWatcher } from "./workers/configWatcher";
+import { startCaptureRetentionWorker } from "./workers/captureRetention";
 import { ensureStorageDir, resolveStoragePaths } from "./storage/files";
 import { invalidateConfigCache } from "./storage/repositories";
 import { discoverAllTools, disconnectAllServers, summarizeMcpError } from "./mcp/discovery";
@@ -44,6 +46,7 @@ async function start(): Promise<void> {
 
   // Register middleware
   await registerRequestStatsMiddleware(app, paths);
+  await registerRequestCaptureMiddleware(app, paths);
   
   // Register auth hooks (no-op by default, enable via config.authEnabled)
   await registerAuthHooks(app, paths, ["/admin", "/ui"]);
@@ -70,6 +73,7 @@ async function start(): Promise<void> {
   // Start background workers
   startHealthChecker(paths);
   startStatsRotation(paths);
+  startCaptureRetentionWorker(paths);
   
   // Auto-connect to enabled MCP servers and discover tools
   discoverAllTools(paths).then((tools) => {

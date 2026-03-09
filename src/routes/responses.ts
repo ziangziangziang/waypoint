@@ -8,6 +8,7 @@ import { StoragePaths } from "../storage/files";
 import { selectPoolCandidates } from "../pools/scheduler";
 import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 import { normalizeMessagesForUpstream, scanMessageModalities } from "../utils/messageMedia";
+import { setCaptureDerivedRequest, setCaptureError, setCaptureResponseOverride, setCaptureRouting } from "../middleware/requestCapture";
 
 /**
  * Responses API compatibility shim.
@@ -58,6 +59,10 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
       tools: transformedTools,
       tool_choice: body.tool_choice
     };
+    setCaptureDerivedRequest(reply, {
+      originalRequest: body,
+      normalizedRequest: chatPayload,
+    });
 
     const requestId = randomUUID();
     const start = Date.now();
@@ -88,6 +93,21 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
       // Handle streaming response
       if (clientWantsStreaming) {
         await streamResponsesAPI(reply, outcome.attempt.response, requestId, body.model);
+        setCaptureResponseOverride(
+          reply,
+          {
+            $type: "stream",
+            contentType: "text/event-stream",
+            note: "Responses API SSE stream captured as metadata",
+          },
+          outcome.attempt.response.headers
+        );
+        setCaptureRouting(reply, {
+          publicModel: body.model,
+          endpointId: outcome.attempt.endpoint.id,
+          endpointName: outcome.attempt.endpoint.name,
+          upstreamModel: outcome.attempt.upstreamModel,
+        });
         await logRequest(paths, buildLog(
           requestId,
           body.model,
@@ -107,6 +127,12 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
       
       setHeaders(reply, outcome.attempt.response.headers);
       reply.code(outcome.attempt.response.statusCode).send(responsesFormat);
+      setCaptureRouting(reply, {
+        publicModel: body.model,
+        endpointId: outcome.attempt.endpoint.id,
+        endpointName: outcome.attempt.endpoint.name,
+        upstreamModel: outcome.attempt.upstreamModel,
+      });
       
       await logRequest(paths, buildLog(
         requestId,
@@ -118,6 +144,7 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
       ));
     } catch (error) {
       const errorType = (error as { type?: string }).type ?? (error as Error).name;
+      setCaptureError(reply, { type: errorType, message: (error as Error).message });
       await logRequest(paths, {
         requestId,
         ts: new Date(),

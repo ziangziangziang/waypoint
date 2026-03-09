@@ -25,6 +25,14 @@ export interface RegistryModelEntry {
   enabled: boolean;
   aliases: string[];
   slug: string;
+  waypoint_health?: RegistryModelHealth;
+}
+
+export interface RegistryModelHealth {
+  status: "up" | "down" | "unknown";
+  lastCheckedAt?: string;
+  consecutiveFailures?: number;
+  latencyMsEwma?: number;
 }
 
 type CandidateRequirements = {
@@ -45,12 +53,21 @@ interface FlattenedProviderModel {
   canonicalId: string;
 }
 
-export async function listModelsForApi(paths: StoragePaths): Promise<RegistryModelEntry[]> {
+export async function listModelsForApi(
+  paths: StoragePaths,
+  options?: { availableOnly?: boolean }
+): Promise<RegistryModelEntry[]> {
   const providers = await listProviders(paths);
+  const healthMap = await getProviderModelHealthMap(paths);
   const entries: RegistryModelEntry[] = [];
 
   for (const provider of providers) {
     for (const model of provider.models) {
+      const health = healthMap[model.providerModelId];
+      const status: RegistryModelHealth["status"] = health?.status ?? "unknown";
+      if (options?.availableOnly && status === "down") {
+        continue;
+      }
       const canonicalId = canonicalProviderModelId(provider.id, model.modelId);
       entries.push({
         id: canonicalId,
@@ -64,6 +81,12 @@ export async function listModelsForApi(paths: StoragePaths): Promise<RegistryMod
         enabled: provider.enabled && model.enabled !== false,
         aliases: model.aliases ?? [],
         slug: canonicalId,
+        waypoint_health: {
+          status,
+          lastCheckedAt: health?.lastCheckedAt ? new Date(health.lastCheckedAt).toISOString() : undefined,
+          consecutiveFailures: health?.consecutiveFailures,
+          latencyMsEwma: health?.latencyMsEwma,
+        },
       });
     }
   }

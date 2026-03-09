@@ -4,7 +4,8 @@ import {
   LayoutDashboard, 
   Settings as SettingsIcon,
   Radio,
-  Gauge
+  Gauge,
+  Search
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useEffect, useState } from 'react'
@@ -14,6 +15,7 @@ const navItems = [
   { to: '/playground', icon: MessageSquare, label: 'Playground' },
   { to: '/benchmark', icon: Gauge, label: 'Benchmark' },
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+  { to: '/peek', icon: Search, label: 'Peek' },
   { to: '/settings', icon: SettingsIcon, label: 'Settings' },
 ]
 
@@ -59,7 +61,7 @@ export function Layout() {
   }, [])
 
   return (
-    <div className="min-h-screen bg-background flex">
+    <div className="h-screen overflow-hidden bg-background flex">
       {/* Sidebar */}
       <aside className="w-56 border-r border-border flex flex-col noise-overlay">
         {/* Logo */}

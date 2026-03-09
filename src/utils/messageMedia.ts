@@ -78,6 +78,11 @@ export async function normalizeMessagesForUpstream(
         continue;
       }
 
+      if (type === "image_url") {
+        nextContent.push(await normalizeImageUrlPart(paths, part));
+        continue;
+      }
+
       if (type === "audio" && typeof part.audio === "string") {
         nextContent.push(await normalizeAudioValue(paths, part.audio));
         continue;
@@ -96,6 +101,44 @@ export async function normalizeMessagesForUpstream(
   }
 
   return normalized;
+}
+
+async function normalizeImageUrlPart(
+  paths: StoragePaths,
+  part: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const imageUrlObject = (part.image_url ?? {}) as { url?: unknown };
+  const value = imageUrlObject.url;
+  if (typeof value !== "string" || value.length === 0) {
+    return part;
+  }
+
+  if (value.startsWith("data:")) {
+    return part;
+  }
+
+  const hash = extractLocalHash(value);
+  if (!hash) {
+    return part;
+  }
+
+  const mediaPath = await getMediaPath(paths, hash);
+  const mediaEntry = await getMediaEntry(paths, hash);
+  if (!mediaPath || !mediaEntry) {
+    throw invalidRequestError("Referenced image not found in cache.");
+  }
+  const file = await import("fs/promises");
+  const buffer = await file.readFile(mediaPath);
+  const dataUrl = `data:${mediaEntry.mimeType};base64,${buffer.toString("base64")}`;
+
+  return {
+    ...part,
+    type: "image_url",
+    image_url: {
+      ...imageUrlObject,
+      url: dataUrl,
+    },
+  };
 }
 
 async function normalizeInputAudioPart(

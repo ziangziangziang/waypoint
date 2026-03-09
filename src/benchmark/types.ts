@@ -9,6 +9,26 @@ export type BenchmarkMode =
   | "audio_speech"
   | "omni_call";
 
+export type BenchmarkCapabilityKey =
+  | "chat_basic"
+  | "chat_streaming"
+  | "chat_tool_calls"
+  | "chat_vision_input"
+  | "images_generation"
+  | "images_edit"
+  | "embeddings"
+  | "audio_transcription"
+  | "audio_speech"
+  | "responses_compat";
+
+export type BenchmarkCapabilityStatus =
+  | "supported"
+  | "unsupported"
+  | "unknown"
+  | "misconfigured";
+
+export type BenchmarkCapabilityFreshness = "fresh" | "stale";
+
 export interface BenchmarkAssertions {
   contains?: string[];
   notContains?: string[];
@@ -28,6 +48,7 @@ export interface BenchmarkAssertions {
 export interface BenchmarkScenario {
   id: string;
   mode: BenchmarkMode;
+  capability?: BenchmarkCapabilityKey;
   model?: string;
   timeoutMs?: number;
   assertions: BenchmarkAssertions;
@@ -63,6 +84,8 @@ export interface BenchmarkCliOptions {
   configPath?: string;
   profile?: string;
   baselinePath?: string;
+  updateCapCache?: boolean;
+  capTtlDays?: number;
 }
 
 export interface BenchmarkDefaults {
@@ -109,6 +132,8 @@ export interface BenchmarkConfigFile {
     outPath?: string;
     profile?: string;
     baselinePath?: string;
+    updateCapCache?: boolean;
+    capTtlDays?: number;
   };
 }
 
@@ -118,6 +143,8 @@ export interface BenchmarkRunPlan {
   modelOverride?: string;
   outPath?: string;
   baselinePath?: string;
+  updateCapCache?: boolean;
+  capTtlDays?: number;
 }
 
 export interface EffectiveBenchmarkConfig {
@@ -225,6 +252,7 @@ export interface BenchmarkReport {
   gateResults: BenchmarkGateResults;
   warnings: string[];
   topFailureReasons: Array<{ reason: string; count: number }>;
+  capabilityMatrix?: BenchmarkCapabilityMatrix;
 }
 
 export interface BenchmarkRunOutput {
@@ -242,6 +270,47 @@ export const BENCHMARK_MODES: BenchmarkMode[] = [
   "audio_speech",
   "omni_call",
 ];
+
+export const BENCHMARK_CAPABILITY_KEYS: BenchmarkCapabilityKey[] = [
+  "chat_basic",
+  "chat_streaming",
+  "chat_tool_calls",
+  "chat_vision_input",
+  "images_generation",
+  "images_edit",
+  "embeddings",
+  "audio_transcription",
+  "audio_speech",
+  "responses_compat",
+];
+
+export interface BenchmarkCapabilityFinding {
+  capability: BenchmarkCapabilityKey;
+  status: BenchmarkCapabilityStatus;
+  confidence: number;
+  evidence: string;
+  scenarioId?: string;
+  statusCode?: number;
+  observedAt: string;
+}
+
+export interface BenchmarkModelCapabilitySnapshot {
+  model: string;
+  providerId: string;
+  modelId: string;
+  configFingerprint: string;
+  confidence: number;
+  lastVerifiedAt: string;
+  expiresAt: string;
+  freshness: BenchmarkCapabilityFreshness;
+  findings: Record<BenchmarkCapabilityKey, BenchmarkCapabilityFinding>;
+}
+
+export interface BenchmarkCapabilityMatrix {
+  generatedAt: string;
+  ttlDays: number;
+  models: BenchmarkModelCapabilitySnapshot[];
+}
 
 export interface BenchmarkModeRequirements {
   requiredInput: ModelModality[];

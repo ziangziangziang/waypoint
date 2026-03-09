@@ -724,9 +724,11 @@ export function Playground() {
           throw new Error('Please enter a prompt for image generation')
         }
         
+        const editInputImageUrl = pendingImages.length > 0 ? pendingImages[0] : undefined
         const imageResponse = await generateImage({
           model: selectedModel,
           prompt,
+          image_url: editInputImageUrl,
           n: 1,
           size: imageSize,
           response_format: 'b64_json',

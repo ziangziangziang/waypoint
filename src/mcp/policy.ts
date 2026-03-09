@@ -153,3 +153,15 @@ export function validateSingleImageInput(input: {
     );
   }
 }
+
+export function validateAtMostOneImageInput(input: {
+  image_path?: string;
+  image_url?: string;
+}): void {
+  if (input.image_path && input.image_url) {
+    throw typedError(
+      "invalid_request",
+      "Provide either image_path or image_url, not both."
+    );
+  }
+}

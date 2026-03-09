@@ -13,18 +13,27 @@ import {
   summarizeMcpError,
 } from "../mcp/discovery";
 import { writeBenchmarkArtifacts } from "./artifacts";
+import { classifyCapabilityStatus } from "./capabilityClassifier";
+import { computeConfigFingerprint, writeCapabilitySnapshots } from "./capabilityStore";
 import { resolveBenchmarkConfig } from "./config";
 import { evaluateGates } from "./gates";
 import { validateScenarioCollection } from "./schema";
 import { builtInSuite } from "./suites";
+import { listProviders } from "../providers/repository";
+import { ProviderModelRecord } from "../providers/types";
 import {
+  BENCHMARK_CAPABILITY_KEYS,
   BENCHMARK_MODES,
   BenchmarkCliOptions,
+  BenchmarkCapabilityKey,
+  BenchmarkCapabilityMatrix,
+  BenchmarkCapabilityStatus,
   BenchmarkMode,
   BenchmarkModeRequirements,
   BenchmarkReport,
   BenchmarkRunOutput,
   BenchmarkScenario,
+  BenchmarkModelCapabilitySnapshot,
   EffectiveBenchmarkConfig,
   ScenarioResult,
   ScenarioRunSample,
@@ -122,6 +131,7 @@ interface BinaryResponseEnvelope {
 }
 
 interface ScenarioExecution {
+  scenario: BenchmarkScenario;
   result: ScenarioResult;
   samples: ScenarioRunSample[];
   warnings: string[];
@@ -135,7 +145,7 @@ export async function runBenchmark(
   hooks?: BenchmarkRunHooks
 ): Promise<BenchmarkRunOutput> {
   const effective = await resolveBenchmarkConfig(paths, options);
-  const loaded = await loadScenarios(effective);
+  const loaded = await loadScenarios(paths, effective);
   const runId = hooks?.runId;
 
   if (loaded.scenarios.length === 0) {
@@ -246,7 +256,19 @@ export async function runBenchmark(
     executions.push(execution);
   }
 
-  const reportBase = buildReport(effective, warnings, loaded.scenarioPath, executions, runId);
+  const capabilityMatrix = buildCapabilityMatrix(effective, executions);
+  if (effective.run.updateCapCache && capabilityMatrix && capabilityMatrix.models.length > 0) {
+    await writeCapabilitySnapshots(paths, capabilityMatrix.models);
+  }
+
+  const reportBase = buildReport(
+    effective,
+    warnings,
+    loaded.scenarioPath,
+    executions,
+    capabilityMatrix,
+    runId
+  );
   const gateResults = await evaluateGates(reportBase, effective);
   const report: BenchmarkReport = {
     ...reportBase,
@@ -277,16 +299,20 @@ export async function runBenchmark(
   };
 }
 
-async function loadScenarios(effective: EffectiveBenchmarkConfig): Promise<{
+async function loadScenarios(paths: StoragePaths, effective: EffectiveBenchmarkConfig): Promise<{
   scenarios: BenchmarkScenario[];
   warnings: string[];
   scenarioPath?: string;
 }> {
-  const allScenarios: BenchmarkScenario[] = [];
+  let allScenarios: BenchmarkScenario[] = [];
   const warnings: string[] = [];
 
   if (effective.run.suite) {
-    allScenarios.push(...builtInSuite(effective.run.suite));
+    if (effective.run.suite === "capabilities") {
+      allScenarios = await buildCapabilitySuiteScenarios(paths, effective);
+    } else {
+      allScenarios.push(...builtInSuite(effective.run.suite));
+    }
   }
 
   if (effective.run.scenarioPath) {
@@ -304,6 +330,91 @@ async function loadScenarios(effective: EffectiveBenchmarkConfig): Promise<{
     warnings,
     scenarioPath: effective.run.scenarioPath ? path.resolve(effective.run.scenarioPath) : undefined,
   };
+}
+
+async function buildCapabilitySuiteScenarios(
+  paths: StoragePaths,
+  effective: EffectiveBenchmarkConfig
+): Promise<BenchmarkScenario[]> {
+  const template = builtInSuite("capabilities");
+  if (effective.run.modelOverride) {
+    return materializeCapabilityScenariosForModel(template, effective.run.modelOverride);
+  }
+
+  const providers = await listProviders(paths);
+  const seen = new Set<string>();
+  const scenarios: BenchmarkScenario[] = [];
+  for (const provider of providers) {
+    if (!provider.enabled) {
+      continue;
+    }
+    for (const model of provider.models) {
+      if (model.enabled === false) {
+        continue;
+      }
+      const modelRef = `${provider.id}/${model.modelId}`;
+      if (seen.has(modelRef)) {
+        continue;
+      }
+      seen.add(modelRef);
+      scenarios.push(...materializeCapabilityScenariosForModel(template, modelRef, model));
+    }
+  }
+
+  return scenarios;
+}
+
+function materializeCapabilityScenariosForModel(
+  template: BenchmarkScenario[],
+  model: string,
+  providerModel?: ProviderModelRecord
+): BenchmarkScenario[] {
+  return template
+    .filter((scenario) => {
+      if (scenario.id === "cap.chat_vision_input") {
+        return false;
+      }
+      if (scenario.id === "cap.images_edit") {
+        return false;
+      }
+      if (!providerModel) {
+        return true;
+      }
+      return supportsScenarioByDeclaredCapabilities(scenario, providerModel);
+    })
+    .map((scenario) => ({
+      ...scenario,
+      id: `${scenario.id}::${model}`,
+      model,
+      assertions: { ...scenario.assertions },
+    }));
+}
+
+function supportsScenarioByDeclaredCapabilities(
+  scenario: BenchmarkScenario,
+  providerModel: ProviderModelRecord
+): boolean {
+  const input = new Set(providerModel.capabilities.input);
+  const output = new Set(providerModel.capabilities.output);
+  if (scenario.mode === "chat" || scenario.mode === "agent") {
+    return input.has("text") && output.has("text");
+  }
+  if (scenario.mode === "embeddings") {
+    return input.has("text") && output.has("embedding");
+  }
+  if (scenario.mode === "image_generation") {
+    return output.has("image");
+  }
+  if (scenario.mode === "audio_transcription") {
+    return input.has("audio") && output.has("text");
+  }
+  if (scenario.mode === "audio_speech") {
+    return input.has("text") && output.has("audio");
+  }
+  if (scenario.mode === "omni_call") {
+    return input.has("audio") && output.has("text");
+  }
+  return true;
 }
 
 async function loadScenarioFile(filePath: string): Promise<unknown[]> {
@@ -399,6 +510,7 @@ async function runScenarioWithSampling(
     const reason = `No model available for mode '${scenario.mode}'.`;
     warnings.push(`Scenario '${scenario.id}' skipped: ${reason}`);
     return {
+      scenario,
       result: buildSkippedScenarioResult(scenario, reason),
       samples: [],
       warnings,
@@ -408,18 +520,37 @@ async function runScenarioWithSampling(
   const totalRuns =
     effective.profileSettings.warmupRuns + effective.profileSettings.measuredRuns;
   const measuredSamples: ScenarioRunSample[] = [];
+  const concurrentProbe = shouldRunConcurrentProbe(scenario, effective);
+  const concurrentRuns = concurrentProbe ? Math.max(1, effective.defaults.concurrency) : 1;
 
   for (let index = 0; index < totalRuns; index++) {
     const phase = index < effective.profileSettings.warmupRuns ? "warmup" : "measured";
     const runIndex = index + 1;
-    const sample = await runSingleScenario(
-      paths,
-      scenario,
-      model,
-      effective,
-      runIndex,
-      (event) => onExchange?.(event, runIndex, phase, totalRuns)
-    );
+    const sample =
+      concurrentRuns <= 1 || phase === "warmup"
+        ? await runSingleScenario(
+            paths,
+            scenario,
+            model,
+            effective,
+            runIndex,
+            (event) => onExchange?.(event, runIndex, phase, totalRuns)
+          )
+        : mergeConcurrentSamples(
+            await Promise.all(
+              Array.from({ length: concurrentRuns }).map((_, offset) =>
+                runSingleScenario(
+                  paths,
+                  scenario,
+                  model,
+                  effective,
+                  runIndex * 1000 + offset + 1,
+                  (event) => onExchange?.(event, runIndex, phase, totalRuns)
+                )
+              )
+            ),
+            runIndex
+          );
     onSampleComplete?.(sample, index + 1, phase, totalRuns);
     if (index >= effective.profileSettings.warmupRuns) {
       measuredSamples.push(sample);
@@ -427,6 +558,7 @@ async function runScenarioWithSampling(
   }
 
   return {
+    scenario,
     result: buildScenarioResult(
       scenario,
       model,
@@ -435,6 +567,59 @@ async function runScenarioWithSampling(
     ),
     samples: measuredSamples,
     warnings,
+  };
+}
+
+function shouldRunConcurrentProbe(
+  scenario: BenchmarkScenario,
+  effective: EffectiveBenchmarkConfig
+): boolean {
+  if (effective.run.suite !== "capabilities") {
+    return false;
+  }
+  if (effective.defaults.concurrency <= 1) {
+    return false;
+  }
+  return (
+    scenario.id.startsWith("cap.concurrent_chat_basic") ||
+    scenario.id.startsWith("cap.agent_tool_calls_under_load")
+  );
+}
+
+function mergeConcurrentSamples(samples: ScenarioRunSample[], runIndex: number): ScenarioRunSample {
+  const failures = samples.filter((sample) => !sample.success);
+  const primaryFailure = failures[0];
+  const statusCode =
+    samples.find((sample) => sample.statusCode >= 400)?.statusCode ??
+    samples[0]?.statusCode ??
+    0;
+  const outputPreview = samples
+    .map((sample) => sample.outputPreview)
+    .filter((value) => value.length > 0)
+    .slice(0, 2)
+    .join(" | ");
+
+  const latencyMs = samples.reduce((max, sample) => Math.max(max, sample.latencyMs), 0);
+  const tokens = samples.reduce((sum, sample) => sum + sample.tokens, 0);
+  const toolCalls = samples.reduce((sum, sample) => sum + sample.toolCalls, 0);
+  const throughputTokensPerSec = samples.reduce((sum, sample) => sum + sample.throughputTokensPerSec, 0);
+
+  return {
+    runIndex,
+    success: failures.length === 0,
+    latencyMs,
+    statusCode,
+    tokens,
+    toolCalls,
+    throughputTokensPerSec,
+    outputPreview: outputPreview || samples[0]?.outputPreview || "",
+    error: primaryFailure?.error,
+    candidateAttempts: samples.reduce((sum, sample) => sum + (sample.candidateAttempts ?? 0), 0),
+    failovers: samples.reduce((sum, sample) => sum + (sample.failovers ?? 0), 0),
+    rateLimitSwitches: samples.reduce((sum, sample) => sum + (sample.rateLimitSwitches ?? 0), 0),
+    distinctProviders: samples.reduce((max, sample) => Math.max(max, sample.distinctProviders ?? 0), 0),
+    distinctModels: samples.reduce((max, sample) => Math.max(max, sample.distinctModels ?? 0), 0),
+    audioOutputPresent: samples.some((sample) => sample.audioOutputPresent),
   };
 }
 
@@ -1482,11 +1667,203 @@ function buildScenarioResult(
   };
 }
 
+function buildCapabilityMatrix(
+  effective: EffectiveBenchmarkConfig,
+  executions: ScenarioExecution[]
+): BenchmarkCapabilityMatrix | undefined {
+  const ttlDays = effective.run.capTtlDays ?? 7;
+  const ttlMs = ttlDays * 24 * 60 * 60 * 1000;
+  const byModel = new Map<string, {
+    providerId: string;
+    modelId: string;
+    findings: Partial<Record<BenchmarkCapabilityKey, {
+      status: BenchmarkCapabilityStatus;
+      confidence: number;
+      evidence: string;
+      observedAt: string;
+      scenarioId?: string;
+      statusCode?: number;
+    }>>;
+    lastVerifiedAt: string;
+  }>();
+
+  for (const execution of executions) {
+    const capability = execution.scenario.capability;
+    if (!capability) {
+      continue;
+    }
+    const { providerId, modelId } = splitModelRef(execution.result.model);
+    const modelKey = `${providerId}/${modelId}`;
+    const existing = byModel.get(modelKey) ?? {
+      providerId,
+      modelId,
+      findings: {},
+      lastVerifiedAt: new Date().toISOString(),
+    };
+
+    const status = classifyFromExecution(execution);
+    const confidence = confidenceFromExecution(status, execution.result);
+    const primaryReason = execution.result.errorReasons[0] ?? execution.result.outputPreview;
+    const statusCode =
+      execution.samples.find((sample) => sample.statusCode > 0)?.statusCode ??
+      (execution.result.status === "skipped" ? 0 : 200);
+
+    const nextFinding = {
+      status,
+      confidence,
+      evidence: truncate(primaryReason || "No explicit evidence", 220),
+      observedAt: new Date().toISOString(),
+      scenarioId: execution.scenario.id,
+      statusCode: statusCode > 0 ? statusCode : undefined,
+    };
+
+    const prev = existing.findings[capability];
+    if (!prev || shouldReplaceFinding(prev.status, nextFinding.status, prev.confidence, nextFinding.confidence)) {
+      existing.findings[capability] = nextFinding;
+    }
+
+    existing.lastVerifiedAt = new Date().toISOString();
+    byModel.set(modelKey, existing);
+  }
+
+  const models: BenchmarkModelCapabilitySnapshot[] = [];
+  for (const [key, record] of byModel.entries()) {
+    const findings = Object.fromEntries(
+      BENCHMARK_CAPABILITY_KEYS.map((capability) => {
+        const item = record.findings[capability];
+        if (item) {
+          return [
+            capability,
+            {
+              capability,
+              status: item.status,
+              confidence: item.confidence,
+              evidence: item.evidence,
+              scenarioId: item.scenarioId,
+              statusCode: item.statusCode,
+              observedAt: item.observedAt,
+            },
+          ];
+        }
+        return [
+          capability,
+          {
+            capability,
+            status: "unknown" as const,
+            confidence: 0,
+            evidence: "No probe evidence in this run.",
+            observedAt: record.lastVerifiedAt,
+          },
+        ];
+      })
+    ) as BenchmarkModelCapabilitySnapshot["findings"];
+
+    const confidenceValues = Object.values(findings).map((finding) => finding.confidence);
+    const avgConfidence =
+      confidenceValues.length > 0
+        ? confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length
+        : 0;
+
+    const expiresAt = new Date(Date.parse(record.lastVerifiedAt) + ttlMs).toISOString();
+
+    models.push({
+      model: key,
+      providerId: record.providerId,
+      modelId: record.modelId,
+      configFingerprint: computeConfigFingerprint({
+        suite: effective.run.suite,
+        model: key,
+        profile: effective.profile,
+      }),
+      confidence: Number(avgConfidence.toFixed(3)),
+      lastVerifiedAt: record.lastVerifiedAt,
+      expiresAt,
+      freshness: Date.now() <= Date.parse(expiresAt) ? "fresh" : "stale",
+      findings,
+    });
+  }
+
+  models.sort((a, b) => a.model.localeCompare(b.model));
+
+  if (models.length === 0) {
+    return undefined;
+  }
+
+  return {
+    generatedAt: new Date().toISOString(),
+    ttlDays,
+    models,
+  };
+}
+
+function classifyFromExecution(execution: ScenarioExecution): BenchmarkCapabilityStatus {
+  if (execution.result.status === "skipped") {
+    return "unknown";
+  }
+
+  if (execution.result.success) {
+    return "supported";
+  }
+
+  const sample = execution.samples.find((item) => !item.success) ?? execution.samples[0];
+  return classifyCapabilityStatus({
+    success: false,
+    statusCode: sample?.statusCode,
+    error: sample?.error ?? execution.result.errorReasons[0],
+  });
+}
+
+function confidenceFromExecution(status: BenchmarkCapabilityStatus, result: ScenarioResult): number {
+  if (status === "supported") {
+    return Math.max(0.5, result.passRate);
+  }
+  if (status === "unsupported" || status === "misconfigured") {
+    return 0.9;
+  }
+  return 0.4;
+}
+
+function shouldReplaceFinding(
+  currentStatus: BenchmarkCapabilityStatus,
+  nextStatus: BenchmarkCapabilityStatus,
+  currentConfidence: number,
+  nextConfidence: number
+): boolean {
+  const rank = (value: BenchmarkCapabilityStatus): number => {
+    switch (value) {
+      case "supported":
+        return 4;
+      case "unsupported":
+        return 3;
+      case "misconfigured":
+        return 2;
+      case "unknown":
+        return 1;
+    }
+  };
+  if (rank(nextStatus) !== rank(currentStatus)) {
+    return rank(nextStatus) > rank(currentStatus);
+  }
+  return nextConfidence >= currentConfidence;
+}
+
+function splitModelRef(model: string): { providerId: string; modelId: string } {
+  const [providerId, ...rest] = model.split("/");
+  if (!providerId || rest.length === 0) {
+    return { providerId: "unknown", modelId: model };
+  }
+  return {
+    providerId,
+    modelId: rest.join("/"),
+  };
+}
+
 function buildReport(
   effective: EffectiveBenchmarkConfig,
   warnings: string[],
   scenarioPath: string | undefined,
   executions: ScenarioExecution[],
+  capabilityMatrix: BenchmarkCapabilityMatrix | undefined,
   reportId?: string
 ): Omit<BenchmarkReport, "gateResults"> {
   const results = executions.map((item) => item.result);
@@ -1549,6 +1926,7 @@ function buildReport(
     })),
     warnings,
     topFailureReasons,
+    capabilityMatrix,
   };
 }
 

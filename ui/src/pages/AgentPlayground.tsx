@@ -108,6 +108,18 @@ function formatModelTag(model: Model): string {
   return ''
 }
 
+function modelHealthStatus(model: Model): 'up' | 'down' | 'unknown' {
+  return model.waypoint_health?.status ?? 'unknown'
+}
+
+function isModelSelectable(model: Model): boolean {
+  return modelHealthStatus(model) !== 'down'
+}
+
+function firstSelectableModelId(models: Model[]): string {
+  return models.find(isModelSelectable)?.id ?? ''
+}
+
 // Maximum tool iterations per user message to prevent infinite loops
 const MAX_TOOL_ITERATIONS = 10
 const MAX_IMAGE_PIXELS = 1080 * 720 - 1
@@ -179,6 +191,8 @@ export function AgentPlayground() {
   }
 
   const modelSupportsCall = selectedModelSupportsCall()
+  const selectedModelConfig = models.find((model) => model.id === selectedModel)
+  const selectedModelIsSelectable = selectedModelConfig ? isModelSelectable(selectedModelConfig) : false
   
   // Image input state
   const [pendingImages, setPendingImages] = useState<string[]>([])
@@ -218,7 +232,7 @@ export function AgentPlayground() {
         const response = await listModels()
         setModels(response.data)
         if (response.data.length > 0 && !selectedModel) {
-          setSelectedModel(response.data[0].id)
+          setSelectedModel(firstSelectableModelId(response.data))
         }
       } catch (error) {
         console.error('Failed to load models:', error)
@@ -226,6 +240,15 @@ export function AgentPlayground() {
     }
     loadModels()
   }, [selectedModel])
+
+  // Ensure selected model stays selectable after health refreshes/session restore.
+  useEffect(() => {
+    if (models.length === 0) return
+    const current = models.find((model) => model.id === selectedModel)
+    if (!current || !isModelSelectable(current)) {
+      setSelectedModel(firstSelectableModelId(models))
+    }
+  }, [models, selectedModel])
 
   // Load sessions on mount
   useEffect(() => {
@@ -823,6 +846,10 @@ export function AgentPlayground() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!selectedModelConfig || !isModelSelectable(selectedModelConfig)) {
+      setCallError('Selected model is unavailable. Choose a healthy model and try again.')
+      return
+    }
     const hasText = input.trim().length > 0
     const canSend = callModeEnabled
       ? Boolean(pendingAudio)
@@ -997,9 +1024,11 @@ export function AgentPlayground() {
           throw new Error('Please enter a prompt for image generation')
         }
         
+        const editInputImageUrl = requestImageUrls.length > 0 ? requestImageUrls[0] : undefined
         const imageResponse = await generateImage({
           model: selectedModel,
           prompt,
+          image_url: editInputImageUrl,
           n: 1,
           size: imageSize,
           response_format: 'b64_json',
@@ -1134,10 +1163,10 @@ export function AgentPlayground() {
   }
 
   return (
-    <div className="flex-1 flex h-screen min-h-0">
+    <div className="flex-1 flex h-full min-h-0 overflow-hidden">
       {/* Sessions Sidebar */}
       <aside className={cn(
-        'border-r border-border flex flex-col shrink-0 transition-all duration-300',
+        'border-r border-border flex flex-col min-h-0 shrink-0 transition-all duration-300',
         sidebarCollapsed ? 'w-12' : 'w-64'
       )}>
         <div className="h-14 border-b border-border flex items-center justify-between px-3">
@@ -1292,16 +1321,16 @@ export function AgentPlayground() {
           >
             {models.length === 0 && <option value="">No models available</option>}
             {models.map(model => (
-              <option key={model.id} value={model.id}>
-                {model.id} {formatModelTag(model)}
+              <option key={model.id} value={model.id} disabled={!isModelSelectable(model)}>
+                {model.id} {formatModelTag(model)} {!isModelSelectable(model) ? '(down)' : ''}
               </option>
             ))}
           </select>
         </header>
 
-        <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 min-h-0 flex overflow-hidden">
           {/* Messages Area */}
-          <div className="flex-1 flex flex-col">
+          <div className="flex-1 min-h-0 flex flex-col">
         <div 
           ref={messagesContainerRef}
           className={cn(
@@ -1608,6 +1637,8 @@ export function AgentPlayground() {
                     type="submit"
                     disabled={
                       isLoading ||
+                      !selectedModel ||
+                      !selectedModelIsSelectable ||
                       (callModeEnabled
                         ? !pendingAudio
                         : (!input.trim() && pendingImages.length === 0))

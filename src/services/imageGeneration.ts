@@ -49,7 +49,11 @@ export async function runImageGeneration(
   headers: Record<string, string | string[] | undefined>,
   signal: AbortSignal
 ): Promise<ImageGenerationRunResult> {
-  const model = await resolveGenerationModel(paths, request.model);
+  const model = request.model
+    ? request.model
+    : request.image_url
+      ? await pickDefaultImageEditModel(paths)
+      : await resolveGenerationModel(paths, request.model);
   if (!model) {
     const error = new Error("No diffusion model available. Add or enable a provider model.") as Error & {
       type: string;
@@ -60,20 +64,72 @@ export async function runImageGeneration(
     throw error;
   }
 
-  const outcome = await routeRequest(
-    paths,
-    model,
-    "/v1/images/generations",
-    { ...request, model } as Record<string, unknown>,
-    headers,
-    signal,
-    {
-      endpointType: "diffusion",
-      requiredInput: ["text"],
-      requiredOutput: ["image"],
+  let body: { payload: unknown };
+  let outcome: Awaited<ReturnType<typeof routeRequest>>;
+  if (request.image_url) {
+    const chatPayload = {
+      model,
+      stream: false,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: request.prompt },
+            { type: "image_url", image_url: { url: request.image_url } },
+          ],
+        },
+      ],
+    } as Record<string, unknown>;
+    try {
+      outcome = await routeRequest(
+        paths,
+        model,
+        "/v1/chat/completions",
+        chatPayload,
+        headers,
+        signal,
+        {
+          requiredInput: ["text", "image"],
+          requiredOutput: ["image"],
+        }
+      );
+    } catch (error) {
+      const typed = error as Error & { type?: string };
+      if (typed.type !== "no_endpoints") {
+        throw error;
+      }
+      outcome = await routeRequest(
+        paths,
+        model,
+        "/v1/chat/completions",
+        chatPayload,
+        headers,
+        signal,
+        {
+          requiredInput: ["text"],
+          requiredOutput: ["image"],
+        }
+      );
     }
-  );
-  const body = await readBody(outcome.attempt.response);
+    body = await readBody(outcome.attempt.response);
+    body.payload = normalizeChatImagePayload(body.payload);
+  } else {
+    outcome = await routeRequest(
+      paths,
+      model,
+      "/v1/images/generations",
+      { ...request, model } as Record<string, unknown>,
+      headers,
+      signal,
+      {
+        endpointType: "diffusion",
+        requiredInput: ["text"],
+        requiredOutput: ["image"],
+      }
+    );
+    body = await readBody(outcome.attempt.response);
+  }
+
   return {
     model,
     statusCode: outcome.attempt.response.statusCode,
@@ -133,6 +189,65 @@ export async function normalizeImageGenerationPayload(
   }
 
   return { model, created, images };
+}
+
+export function normalizeChatImagePayload(payload: unknown): unknown {
+  const root = payload as {
+    created?: unknown;
+    choices?: unknown;
+  };
+  const created =
+    typeof root?.created === "number" ? root.created : Math.floor(Date.now() / 1000);
+  const choices = Array.isArray(root?.choices) ? root.choices : [];
+  const firstChoice = (choices[0] ?? null) as
+    | {
+        message?: { content?: unknown };
+      }
+    | null;
+  const content = firstChoice?.message?.content;
+
+  const data: Array<{ url?: string; b64_json?: string; revised_prompt?: string }> = [];
+  let revisedPrompt: string | undefined;
+
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const typed = item as Record<string, unknown>;
+      const type = typeof typed.type === "string" ? typed.type : "";
+      if (!revisedPrompt && type === "text" && typeof typed.text === "string") {
+        revisedPrompt = typed.text.trim() || undefined;
+      }
+      if (type === "image_url") {
+        const imageUrlObject = typed.image_url as { url?: unknown } | undefined;
+        if (typeof imageUrlObject?.url === "string" && imageUrlObject.url.length > 0) {
+          data.push({ url: imageUrlObject.url });
+        }
+      } else if (type === "image" && typeof typed.image === "string" && typed.image.length > 0) {
+        data.push({ url: typed.image });
+      }
+    }
+  }
+
+  if (typeof content === "string" && content.startsWith("data:image/")) {
+    data.push({ url: content });
+  }
+
+  if (data.length === 0) {
+    const error = new Error("Upstream chat completion did not return any image output.") as Error & {
+      type: string;
+      retryable: boolean;
+    };
+    error.type = "invalid_upstream_response";
+    error.retryable = true;
+    throw error;
+  }
+  if (revisedPrompt) {
+    data[0].revised_prompt = revisedPrompt;
+  }
+
+  return { created, data };
 }
 
 async function pickDefaultDiffusionModel(paths: StoragePaths): Promise<string | null> {

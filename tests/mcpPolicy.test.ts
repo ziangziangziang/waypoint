@@ -4,6 +4,7 @@ import path from "path";
 import {
   MCP_TOOL_DESCRIPTION_TEMPLATE,
   resolveBinaryOutputPolicy,
+  validateAtMostOneImageInput,
   validateSingleImageInput,
 } from "../src/mcp/policy";
 
@@ -154,4 +155,14 @@ test("validateSingleImageInput enforces xor behavior", () => {
   );
   assert.doesNotThrow(() => validateSingleImageInput({ image_path: "/tmp/a.png" }));
   assert.doesNotThrow(() => validateSingleImageInput({ image_url: "https://example.com/a.png" }));
+});
+
+test("validateAtMostOneImageInput allows none or one image source", () => {
+  assert.doesNotThrow(() => validateAtMostOneImageInput({}));
+  assert.doesNotThrow(() => validateAtMostOneImageInput({ image_path: "/tmp/a.png" }));
+  assert.doesNotThrow(() => validateAtMostOneImageInput({ image_url: "https://example.com/a.png" }));
+  assert.throws(
+    () => validateAtMostOneImageInput({ image_path: "/tmp/a.png", image_url: "https://example.com/a.png" }),
+    /Provide either image_path or image_url/
+  );
 });

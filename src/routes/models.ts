@@ -4,8 +4,10 @@ import { EndpointType, ModelModality } from "../types";
 import { getAvailableSmartPool, listModelsForApi } from "../providers/modelRegistry";
 
 export async function registerModelsRoutes(app: FastifyInstance, paths: StoragePaths): Promise<void> {
-  app.get("/v1/models", async (_req, reply) => {
-    const concrete = await listModelsForApi(paths);
+  app.get("/v1/models", async (req, reply) => {
+    const query = (req.query ?? {}) as { available_only?: string | boolean };
+    const availableOnly = query.available_only === true || query.available_only === "true";
+    const concrete = await listModelsForApi(paths, { availableOnly });
     const smart = await getAvailableSmartPool(paths);
     const poolEntries = smart
       ? [

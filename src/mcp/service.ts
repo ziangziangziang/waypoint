@@ -11,9 +11,10 @@ import {
   normalizeImageGenerationPayload,
   runImageGeneration,
 } from "../services/imageGeneration";
-import { runImageUnderstanding } from "../services/imageUnderstanding";
+import { imageDataUrlFromPath, runImageUnderstanding } from "../services/imageUnderstanding";
 import { ImageGenerationRequest } from "../types";
 import {
+  validateAtMostOneImageInput,
   MCP_TOOL_DESCRIPTION_TEMPLATE,
   resolveBinaryOutputPolicy,
   typedError,
@@ -69,10 +70,12 @@ export function createMcpService(
       "generate_image",
       {
         description:
-          `Generate image(s) from text using Waypoint diffusion model routing. ${MCP_TOOL_DESCRIPTION_TEMPLATE.binary} Use include_data=true only when inline transport is explicitly required.`,
+          `Generate image(s) from text using Waypoint diffusion model routing. Provide image_path or image_url for image-to-image editing. ${MCP_TOOL_DESCRIPTION_TEMPLATE.binary} Use include_data=true only when inline transport is explicitly required.`,
         inputSchema: {
           prompt: z.string().min(1),
           model: z.string().optional(),
+          image_path: z.string().optional(),
+          image_url: z.string().optional(),
           n: z.number().int().min(1).max(4).optional(),
           size: z.string().optional(),
           quality: z.string().optional(),
@@ -87,6 +90,14 @@ export function createMcpService(
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 60_000);
         try {
+          validateAtMostOneImageInput({
+            image_path: args.image_path,
+            image_url: args.image_url,
+          });
+          const resolvedImageUrl = await resolveOptionalImageInputToUrl({
+            image_path: args.image_path,
+            image_url: args.image_url,
+          });
           const filePolicy = resolveBinaryOutputPolicy({
             n: args.n,
             output_path: args.output_path,
@@ -104,6 +115,7 @@ export function createMcpService(
             quality: args.quality,
             style: args.style,
             response_format: responseFormat,
+            image_url: resolvedImageUrl,
           };
 
           const generated = await resolvedDeps.runImageGeneration(paths, request, {}, controller.signal);
@@ -438,4 +450,27 @@ function resolveOutputPath(
     ? path.resolve(dirValue)
     : path.resolve(options.outputBaseRoot, dirValue);
   return path.join(dir, `image-${created}-${index}.${extension}`);
+}
+
+async function resolveOptionalImageInputToUrl(input: {
+  image_path?: string;
+  image_url?: string;
+}): Promise<string | undefined> {
+  if (input.image_path) {
+    return imageDataUrlFromPath(input.image_path);
+  }
+  if (!input.image_url) {
+    return undefined;
+  }
+  if (
+    input.image_url.startsWith("data:image/") ||
+    input.image_url.startsWith("http://") ||
+    input.image_url.startsWith("https://")
+  ) {
+    return input.image_url;
+  }
+  throw typedError(
+    "invalid_request",
+    "image_url must be an http(s) URL or data:image/* URL."
+  );
 }

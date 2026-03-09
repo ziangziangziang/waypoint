@@ -8,7 +8,7 @@ import {
   addMessage,
   appendMessageContent,
 } from "../storage/sessionRepository";
-import { storeMedia, getMediaPath, getMediaEntry, getCacheStats, clearCache } from "../storage/imageCache";
+import { storeMedia, getMediaPath, getMediaEntry, getCacheStats, clearCache, ensureMediaCacheReady } from "../storage/imageCache";
 import { resolveStoragePaths } from "../storage/files";
 import { ChatMessage } from "../types";
 import { promises as fs } from "fs";
@@ -38,6 +38,8 @@ import { pickBestModelByCapabilities } from "../storage/repositories";
 
 export async function registerSessionRoutes(app: FastifyInstance): Promise<void> {
   const paths = resolveStoragePaths();
+  await ensureMediaCacheReady(paths);
+  app.log.info({ mediaRoot: path.join(paths.baseDir, "media") }, "Media cache initialized");
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Session CRUD
@@ -236,6 +238,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     ) => {
       try {
         const message = await addMessage(paths, req.params.id, normalizeIncomingMessage(req.body));
+        
         if (!message) {
           return reply.status(404).send({
             error: { message: "Session not found", type: "not_found" },

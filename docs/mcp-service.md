@@ -17,6 +17,7 @@ Policy authority: [`docs/mcp-guidelines.md`](./mcp-guidelines.md)
 ## Tool: `generate_image`
 
 Generate image(s) from text using Waypoint's diffusion routing.
+When `image_path` or `image_url` is provided, the tool performs image-to-image editing.
 
 Governance note: this tool follows the file-first, data-opt-in policy from [`docs/mcp-guidelines.md`](./mcp-guidelines.md).
 
@@ -46,6 +47,8 @@ export WAYPOINT_MCP_STRICT_OUTPUT_ROOT=true
 
 - `prompt` (required, string)
 - `model` (optional, string)
+- `image_path` (optional, string; local file path for image-to-image editing)
+- `image_url` (optional, string; supports `http(s)` or `data:` URL for image-to-image editing)
 - `n` (optional, integer `1..4`)
 - `size` (optional, string)
 - `quality` (optional, string)
@@ -76,6 +79,7 @@ Implementation note: in file-output mode, `generate_image` forces upstream `resp
 ### Validation rules
 
 - `output_path` and `output_dir` are mutually exclusive.
+- `image_path` and `image_url` are mutually exclusive.
 - If `n > 1` and `output_path` is used, `output_path` must include `{index}`.
 - `output_path` and `output_dir` must resolve under the configured MCP output root:
   - default root is `process.cwd()`

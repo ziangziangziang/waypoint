@@ -138,6 +138,131 @@ const SUITES: Record<string, BenchmarkScenario[]> = {
       },
     },
   ],
+  capabilities: [
+    {
+      id: "cap.chat_basic",
+      mode: "chat",
+      capability: "chat_basic",
+      prompt: "Reply exactly with: WAYPOINT_CAP_CHAT_BASIC_OK",
+      assertions: {
+        contains: ["WAYPOINT_CAP_CHAT_BASIC_OK"],
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.chat_streaming",
+      mode: "chat",
+      capability: "chat_streaming",
+      prompt: "Reply exactly with: WAYPOINT_CAP_STREAMING_OK",
+      assertions: {
+        contains: ["WAYPOINT_CAP_STREAMING_OK"],
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.chat_tool_calls",
+      mode: "agent",
+      capability: "chat_tool_calls",
+      prompt: "Use at least one tool if available, then output WAYPOINT_CAP_TOOL_CALLS_OK.",
+      maxIterations: 4,
+      assertions: {
+        contains: ["WAYPOINT_CAP_TOOL_CALLS_OK"],
+        minToolCalls: 1,
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.chat_vision_input",
+      mode: "chat",
+      capability: "chat_vision_input",
+      prompt: "Vision probe placeholder: reply with WAYPOINT_CAP_VISION_UNKNOWN when image input is unavailable.",
+      assertions: {
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.images_generation",
+      mode: "image_generation",
+      capability: "images_generation",
+      prompt: "A monochrome square icon.",
+      assertions: {
+        minImages: 1,
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.images_edit",
+      mode: "image_generation",
+      capability: "images_edit",
+      prompt: "Image edit probe placeholder",
+      assertions: {
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.embeddings",
+      mode: "embeddings",
+      capability: "embeddings",
+      input: "waypoint capability embeddings probe",
+      assertions: {
+        minItems: 1,
+        minVectorLength: 1,
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.audio_transcription",
+      mode: "audio_transcription",
+      capability: "audio_transcription",
+      audioFile: "examples/scenarios/assets/omni-call-sample.wav",
+      assertions: {
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.audio_speech",
+      mode: "audio_speech",
+      capability: "audio_speech",
+      inputText: "Waypoint capability speech probe",
+      voice: "alloy",
+      assertions: {
+        minBytes: 1,
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.responses_compat",
+      mode: "omni_call",
+      capability: "responses_compat",
+      prompt: "Please transcribe and summarize.",
+      audioFile: "examples/scenarios/assets/omni-call-sample.wav",
+      assertions: {
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.concurrent_chat_basic",
+      mode: "chat",
+      capability: "chat_basic",
+      prompt: "Reply exactly with: WAYPOINT_CAP_CONCURRENT_CHAT_OK",
+      assertions: {
+        contains: ["WAYPOINT_CAP_CONCURRENT_CHAT_OK"],
+        statusCode: 200,
+      },
+    },
+    {
+      id: "cap.agent_tool_calls_under_load",
+      mode: "agent",
+      capability: "chat_tool_calls",
+      prompt: "Use one tool then reply with WAYPOINT_CAP_AGENT_LOAD_OK.",
+      maxIterations: 4,
+      assertions: {
+        contains: ["WAYPOINT_CAP_AGENT_LOAD_OK"],
+        minToolCalls: 1,
+        statusCode: 200,
+      },
+    },
+  ],
 };
 
 export function builtInSuite(name: string): BenchmarkScenario[] {

@@ -8,6 +8,8 @@ import { StoragePaths } from "../storage/files";
 import { selectPoolCandidates } from "../pools/scheduler";
 import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 import { normalizeMessagesForUpstream, scanMessageModalities } from "../utils/messageMedia";
+import { setCaptureDerivedRequest, setCaptureError, setCaptureResponseOverride, setCaptureRouting } from "../middleware/requestCapture";
+import { Transform } from "stream";
 
 interface ChatBody {
   model: string;
@@ -41,6 +43,7 @@ export async function registerChatRoutes(app: FastifyInstance, paths: StoragePat
         ...(body as Record<string, unknown>),
         messages: normalizedMessages,
       };
+      setCaptureDerivedRequest(reply, { normalizedRequest: bodyWithNormalizedMessages });
       const media = scanMessageModalities(normalizedMessages);
       const outcome = await routeRequest(
         paths,
@@ -62,7 +65,23 @@ export async function registerChatRoutes(app: FastifyInstance, paths: StoragePat
       );
 
       if (body.stream) {
-        await streamResponse(reply, outcome.attempt.response);
+        const streamCapture = await streamResponse(reply, outcome.attempt.response);
+        setCaptureResponseOverride(
+          reply,
+          {
+            $type: "stream",
+            contentType: streamCapture.contentType,
+            bytes: streamCapture.bytes,
+            text: streamCapture.text,
+          },
+          outcome.attempt.response.headers
+        );
+        setCaptureRouting(reply, {
+          publicModel: body.model,
+          endpointId: outcome.attempt.endpoint.id,
+          endpointName: outcome.attempt.endpoint.name,
+          upstreamModel: outcome.attempt.upstreamModel,
+        });
         await logRequest(paths, buildLog(requestId, body, outcome, Date.now() - start));
         return;
       }
@@ -70,9 +89,16 @@ export async function registerChatRoutes(app: FastifyInstance, paths: StoragePat
       const upstreamBody = await readBody(outcome.attempt.response);
       setHeaders(reply, outcome.attempt.response.headers);
       reply.code(outcome.attempt.response.statusCode).send(upstreamBody.payload);
+      setCaptureRouting(reply, {
+        publicModel: body.model,
+        endpointId: outcome.attempt.endpoint.id,
+        endpointName: outcome.attempt.endpoint.name,
+        upstreamModel: outcome.attempt.upstreamModel,
+      });
       await logRequest(paths, buildLog(requestId, body, outcome, Date.now() - start, upstreamBody.totalTokens));
     } catch (error) {
       const errorType = (error as { type?: string }).type ?? (error as Error).name;
+      setCaptureError(reply, { type: errorType, message: (error as Error).message });
       await logRequest(paths, {
         requestId,
         ts: new Date(),
@@ -134,16 +160,28 @@ async function pickDefaultModel(paths: StoragePaths): Promise<string | null> {
   return null;
 }
 
-async function streamResponse(reply: FastifyReply, response: { statusCode: number; headers: Record<string, string | string[]>; body: NodeJS.ReadableStream }): Promise<void> {
+async function streamResponse(
+  reply: FastifyReply,
+  response: { statusCode: number; headers: Record<string, string | string[]>; body: NodeJS.ReadableStream }
+): Promise<{ bytes: number; text?: string; contentType: string }> {
   const headers = normalizeHeaders(response.headers);
   if (!headers["content-type"]) {
     headers["content-type"] = "text/event-stream";
   }
   headers["cache-control"] = headers["cache-control"] ?? "no-cache";
 
+  const chunks: Buffer[] = [];
+  const captureTap = new Transform({
+    transform(chunk, _enc, cb) {
+      const asBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      chunks.push(asBuffer);
+      cb(null, chunk);
+    },
+  });
+
   reply.raw.writeHead(response.statusCode, headers);
   await new Promise<void>((resolve, reject) => {
-    pipeline(response.body, reply.raw, (err) => {
+    pipeline(response.body, captureTap, reply.raw, (err) => {
       if (err) {
         reject(err);
         return;
@@ -151,6 +189,14 @@ async function streamResponse(reply: FastifyReply, response: { statusCode: numbe
       resolve();
     });
   });
+  const buffer = Buffer.concat(chunks);
+  const contentType = headers["content-type"] ?? "application/octet-stream";
+  const isText = contentType.includes("text/") || contentType.includes("json") || contentType.includes("event-stream");
+  return {
+    bytes: buffer.byteLength,
+    text: isText ? buffer.toString("utf8") : undefined,
+    contentType,
+  };
 }
 
 function setHeaders(reply: FastifyReply, headers: Record<string, string | string[]>): void {

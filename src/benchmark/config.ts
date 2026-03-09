@@ -12,6 +12,7 @@ import {
 } from "./types";
 
 const DEFAULT_VERSION = 1;
+const DEFAULT_CAP_TTL_DAYS = 7;
 
 const DEFAULTS: BenchmarkDefaults = {
   requestTimeoutMs: 120000,
@@ -99,6 +100,12 @@ export async function resolveBenchmarkConfig(
       modelOverride: cli.modelOverride ?? fileConfig?.run?.model,
       outPath: cli.outPath ?? fileConfig?.run?.outPath,
       baselinePath: cli.baselinePath ?? fileConfig?.run?.baselinePath,
+      updateCapCache: cli.updateCapCache ?? fileConfig?.run?.updateCapCache ?? false,
+      capTtlDays: intField(
+        cli.capTtlDays ?? fileConfig?.run?.capTtlDays ?? DEFAULT_CAP_TTL_DAYS,
+        "run.capTtlDays",
+        1
+      ),
     },
     configSource,
   };

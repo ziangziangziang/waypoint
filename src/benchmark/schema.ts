@@ -1,6 +1,8 @@
 import {
+  BENCHMARK_CAPABILITY_KEYS,
   BENCHMARK_MODES,
   BenchmarkAssertions,
+  BenchmarkCapabilityKey,
   BenchmarkMode,
   BenchmarkScenario,
   ValidationOutcome,
@@ -9,6 +11,7 @@ import {
 const SCENARIO_KEYS = new Set([
   "id",
   "mode",
+  "capability",
   "model",
   "timeoutMs",
   "assertions",
@@ -82,6 +85,7 @@ function validateScenario(
 
   const id = requiredString(input.id, `${ctx}.id`);
   const mode = validateMode(input.mode, `${ctx}.mode`);
+  const capability = optionalCapabilityKey(input.capability, `${ctx}.capability`);
   const model = optionalString(input.model, `${ctx}.model`);
   const timeoutMs = optionalInteger(input.timeoutMs, `${ctx}.timeoutMs`, 1);
   const assertions = validateAssertions(input.assertions, `${ctx}.assertions`, warnings);
@@ -89,6 +93,7 @@ function validateScenario(
   const scenario: BenchmarkScenario = {
     id,
     mode,
+    capability,
     model,
     timeoutMs,
     assertions,
@@ -277,6 +282,19 @@ function optionalInputValue(value: unknown, field: string): string | string[] | 
     return entry;
   });
   return normalized;
+}
+
+function optionalCapabilityKey(value: unknown, field: string): BenchmarkCapabilityKey | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new Error(`${field}: expected capability key string.`);
+  }
+  if (!BENCHMARK_CAPABILITY_KEYS.includes(value as BenchmarkCapabilityKey)) {
+    throw new Error(`${field}: unsupported capability '${value}'.`);
+  }
+  return value as BenchmarkCapabilityKey;
 }
 
 function optionalInteger(

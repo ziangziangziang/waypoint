@@ -56,7 +56,7 @@ export function Settings() {
   }
 
   return (
-    <div className="flex-1 flex flex-col h-screen min-h-0">
+    <div className="flex-1 flex flex-col h-full min-h-0">
       <header className="sticky top-0 z-20 h-14 border-b border-border bg-background/95 backdrop-blur flex items-center px-6 gap-4 shrink-0">
         <div className="flex items-center gap-2">
           <SettingsIcon className="w-4 h-4 text-primary" />

@@ -103,6 +103,7 @@ export interface UpstreamError extends Error {
 export interface ImageGenerationRequest {
   model?: string;
   prompt: string;
+  image_url?: string;
   n?: number;
   size?: string;
   quality?: string;

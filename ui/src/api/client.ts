@@ -145,6 +145,12 @@ export interface Model {
   owned_by?: string;
   endpoint_type?: EndpointType;
   capabilities?: ModelCapabilities;
+  waypoint_health?: {
+    status: 'up' | 'down' | 'unknown';
+    lastCheckedAt?: string;
+    consecutiveFailures?: number;
+    latencyMsEwma?: number;
+  };
   waypoint_pool?: {
     id: string;
     strategy: string;
@@ -158,8 +164,13 @@ export interface ModelsResponse {
   data: Model[];
 }
 
-export async function listModels(): Promise<ModelsResponse> {
-  const response = await fetch(`${API_BASE}/v1/models`);
+export async function listModels(options?: { availableOnly?: boolean }): Promise<ModelsResponse> {
+  const params = new URLSearchParams();
+  if (options?.availableOnly) {
+    params.set('available_only', 'true');
+  }
+  const qs = params.toString();
+  const response = await fetch(`${API_BASE}/v1/models${qs ? `?${qs}` : ''}`);
   return handleResponse<ModelsResponse>(response);
 }
 
@@ -190,12 +201,12 @@ export async function getStats(window: string = '24h'): Promise<StatsAggregation
 export interface LatencyDistribution {
   window: string;
   count: number;
-  min: number;
-  max: number;
-  avg: number;
-  p50: number;
-  p95: number;
-  p99: number;
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+  p50: number | null;
+  p95: number | null;
+  p99: number | null;
   histogram: Record<string, number>;
 }
 
@@ -209,6 +220,9 @@ export interface TokenUsage {
   totalTokens: number;
   totalRequests: number;
   avgTokensPerRequest: number;
+  tokenEstimatedCount?: number;
+  tokenEstimatedRate?: number;
+  bucketGranularity?: 'hour' | 'day';
   byDay: Array<{ date: string; count: number; tokens: number; estimated: number }>;
 }
 
@@ -386,6 +400,7 @@ export async function* streamChatCompletion(
 export interface ImageGenerationRequest {
   model?: string;
   prompt: string;
+  image_url?: string;
   n?: number;
   size?: string;
   quality?: string;
@@ -689,6 +704,48 @@ export interface BenchmarkRunSummary {
   artifactPath?: string;
 }
 
+export type BenchmarkCapabilityKey =
+  | 'chat_basic'
+  | 'chat_streaming'
+  | 'chat_tool_calls'
+  | 'chat_vision_input'
+  | 'images_generation'
+  | 'images_edit'
+  | 'embeddings'
+  | 'audio_transcription'
+  | 'audio_speech'
+  | 'responses_compat'
+
+export type BenchmarkCapabilityStatus = 'supported' | 'unsupported' | 'unknown' | 'misconfigured'
+
+export interface BenchmarkCapabilityFinding {
+  capability: BenchmarkCapabilityKey
+  status: BenchmarkCapabilityStatus
+  confidence: number
+  evidence: string
+  scenarioId?: string
+  statusCode?: number
+  observedAt: string
+}
+
+export interface BenchmarkModelCapabilitySnapshot {
+  model: string
+  providerId: string
+  modelId: string
+  configFingerprint: string
+  confidence: number
+  lastVerifiedAt: string
+  expiresAt: string
+  freshness: 'fresh' | 'stale'
+  findings: Record<BenchmarkCapabilityKey, BenchmarkCapabilityFinding>
+}
+
+export interface BenchmarkCapabilityMatrix {
+  generatedAt: string
+  ttlDays: number
+  models: BenchmarkModelCapabilitySnapshot[]
+}
+
 export interface BenchmarkRunEvent {
   type: string;
   timestamp: string;
@@ -729,6 +786,8 @@ export interface BenchmarkRunRecord extends BenchmarkRunSummary {
     configPath?: string;
     profile?: string;
     baselinePath?: string;
+    updateCapCache?: boolean;
+    capTtlDays?: number;
   };
   progress?: {
     totalScenarios: number;
@@ -751,6 +810,8 @@ export async function startBenchmarkRun(payload: {
   configPath?: string;
   profile?: string;
   baselinePath?: string;
+  updateCapCache?: boolean;
+  capTtlDays?: number;
 }): Promise<BenchmarkRunRecord> {
   const response = await fetch(`${API_BASE}/admin/benchmarks/runs`, {
     method: 'POST',
@@ -758,6 +819,20 @@ export async function startBenchmarkRun(payload: {
     body: JSON.stringify(payload),
   });
   return handleResponse<BenchmarkRunRecord>(response);
+}
+
+export async function listBenchmarkCapabilities(ttlDays?: number): Promise<BenchmarkCapabilityMatrix> {
+  const query = typeof ttlDays === 'number' ? `?ttlDays=${encodeURIComponent(String(ttlDays))}` : ''
+  const response = await fetch(`${API_BASE}/admin/benchmarks/capabilities${query}`)
+  return handleResponse<BenchmarkCapabilityMatrix>(response)
+}
+
+export async function getBenchmarkCapability(modelId: string, ttlDays?: number): Promise<BenchmarkModelCapabilitySnapshot> {
+  const query = typeof ttlDays === 'number' ? `?ttlDays=${encodeURIComponent(String(ttlDays))}` : ''
+  const response = await fetch(
+    `${API_BASE}/admin/benchmarks/capabilities/${encodeURIComponent(modelId)}${query}`
+  )
+  return handleResponse<BenchmarkModelCapabilitySnapshot>(response)
 }
 
 export async function listBenchmarkRuns(): Promise<{ object: 'list'; data: BenchmarkRunSummary[] }> {
@@ -889,4 +964,92 @@ export async function executeMcpTool(
     body: JSON.stringify({ name, arguments: args }),
   });
   return handleResponse<{ result: string }>(response);
+}
+
+// ========================================
+// Capture API
+// ========================================
+
+export interface CaptureConfig {
+  enabled: boolean;
+  retentionDays: number;
+  maxBytes: number;
+}
+
+export interface CaptureRecordSummary {
+  id: string;
+  timestamp: string;
+  route: string;
+  method: string;
+  statusCode: number;
+  latencyMs: number;
+  model?: string;
+}
+
+export interface CaptureRecordDetail {
+  id: string;
+  timestamp: string;
+  route: string;
+  method: string;
+  captureEnabledSnapshot: boolean;
+  statusCode: number;
+  latencyMs: number;
+  request: {
+    headers: Record<string, string>;
+    body?: unknown;
+    derived?: Record<string, unknown>;
+  };
+  response: {
+    headers: Record<string, string>;
+    body?: unknown;
+    error?: { type?: string; message?: string };
+  };
+  routing: {
+    publicModel?: string;
+    endpointId?: string;
+    endpointName?: string;
+    upstreamModel?: string;
+  };
+  analysis: {
+    systemMessages: string[];
+    userMessages: string[];
+    assistantMessages: string[];
+    tools: Array<{ name: string; description?: string }>;
+    mcpToolDescriptions: string[];
+    agentsMdHints: string[];
+    rawSections: string[];
+  };
+  artifacts: Array<{
+    hash: string;
+    mime: string;
+    bytes: number;
+    blobRef: string;
+    kind: 'image' | 'audio' | 'binary';
+  }>;
+}
+
+export async function getCaptureConfig(): Promise<CaptureConfig> {
+  const response = await fetch(`${API_BASE}/admin/capture/config`);
+  return handleResponse<CaptureConfig>(response);
+}
+
+export async function updateCaptureConfig(
+  patch: Partial<CaptureConfig>
+): Promise<CaptureConfig> {
+  const response = await fetch(`${API_BASE}/admin/capture/config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  return handleResponse<CaptureConfig>(response);
+}
+
+export async function listCaptureRecords(limit = 5): Promise<{ object: 'list'; data: CaptureRecordSummary[] }> {
+  const response = await fetch(`${API_BASE}/admin/capture/records?limit=${encodeURIComponent(String(limit))}`);
+  return handleResponse<{ object: 'list'; data: CaptureRecordSummary[] }>(response);
+}
+
+export async function getCaptureRecord(id: string): Promise<CaptureRecordDetail> {
+  const response = await fetch(`${API_BASE}/admin/capture/records/${encodeURIComponent(id)}`);
+  return handleResponse<CaptureRecordDetail>(response);
 }

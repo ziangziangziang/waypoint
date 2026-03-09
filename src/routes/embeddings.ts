@@ -6,6 +6,7 @@ import { RequestLog } from "../types";
 import { StoragePaths } from "../storage/files";
 import { selectPoolCandidates } from "../pools/scheduler";
 import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
+import { setCaptureError, setCaptureRouting } from "../middleware/requestCapture";
 
 interface EmbeddingsBody {
   model: string;
@@ -67,9 +68,16 @@ export async function registerEmbeddingsRoutes(app: FastifyInstance, paths: Stor
       const upstreamBody = await readBody(outcome.attempt.response);
       setHeaders(reply, outcome.attempt.response.headers);
       reply.code(outcome.attempt.response.statusCode).send(upstreamBody.payload);
+      setCaptureRouting(reply, {
+        publicModel: body.model,
+        endpointId: outcome.attempt.endpoint.id,
+        endpointName: outcome.attempt.endpoint.name,
+        upstreamModel: outcome.attempt.upstreamModel,
+      });
       await logRequest(paths, buildLog(requestId, body, outcome, Date.now() - start, upstreamBody.totalTokens));
     } catch (error) {
       const errorType = (error as { type?: string }).type ?? (error as Error).name;
+      setCaptureError(reply, { type: errorType, message: (error as Error).message });
       await logRequest(paths, {
         requestId,
         ts: new Date(),

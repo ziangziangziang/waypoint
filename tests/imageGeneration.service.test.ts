@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import { promises as fs } from "fs";
 import {
+  normalizeChatImagePayload,
   normalizeImageGenerationPayload,
 } from "../src/services/imageGeneration";
 import { StoragePaths } from "../src/storage/files";
@@ -70,4 +71,37 @@ test("normalizeImageGenerationPayload extracts b64 from data URL", async () => {
   assert.equal(result.images.length, 1);
   assert.equal(result.images[0].b64_json, "CCC");
   assert.equal(result.images[0].url, "data:image/png;base64,CCC");
+});
+
+test("normalizeChatImagePayload converts chat multimodal image content", () => {
+  const normalized = normalizeChatImagePayload({
+    created: 1730000000,
+    choices: [
+      {
+        message: {
+          content: [
+            { type: "text", text: "edited result" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,DDD" } },
+          ],
+        },
+      },
+    ],
+  }) as {
+    created: number;
+    data: Array<{ url?: string; revised_prompt?: string }>;
+  };
+  assert.equal(normalized.created, 1730000000);
+  assert.equal(normalized.data.length, 1);
+  assert.equal(normalized.data[0].url, "data:image/png;base64,DDD");
+  assert.equal(normalized.data[0].revised_prompt, "edited result");
+});
+
+test("normalizeChatImagePayload throws when chat payload has no image output", () => {
+  assert.throws(
+    () =>
+      normalizeChatImagePayload({
+        choices: [{ message: { content: [{ type: "text", text: "no image" }] } }],
+      }),
+    /did not return any image output/
+  );
 });

@@ -110,6 +110,18 @@ function renderTextSummary(report: BenchmarkReport): string {
     }
   }
 
+  if (report.capabilityMatrix && report.capabilityMatrix.models.length > 0) {
+    lines.push("");
+    lines.push("Capability Matrix");
+    lines.push(`- TTL Days: ${report.capabilityMatrix.ttlDays}`);
+    for (const model of report.capabilityMatrix.models) {
+      lines.push(`- ${model.model} (${model.freshness}) verified=${model.lastVerifiedAt}`);
+      lines.push(
+        `  chat=${model.findings.chat_basic.status} tools=${model.findings.chat_tool_calls.status} embed=${model.findings.embeddings.status} image=${model.findings.images_generation.status} audio_in=${model.findings.audio_transcription.status} audio_out=${model.findings.audio_speech.status}`
+      );
+    }
+  }
+
   lines.push("");
   return `${lines.join("\n")}\n`;
 }

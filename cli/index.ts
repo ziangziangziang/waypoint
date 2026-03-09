@@ -2028,6 +2028,8 @@ program
   .option("--config <path>", "Benchmark config file (YAML or JSON)")
   .option("--profile <name>", "Benchmark profile (local|ci)")
   .option("--baseline <path>", "Baseline benchmark JSON for regression comparison")
+  .option("--update-cap-cache", "Persist capability findings to capability cache")
+  .option("--cap-ttl-days <n>", "Capability cache TTL days for freshness/output", parseInt)
   .action(async (options) => {
     await ensureStorageDir(paths);
     try {
@@ -2039,12 +2041,17 @@ program
         configPath: options.config,
         profile: options.profile,
         baselinePath: options.baseline,
+        updateCapCache: options.updateCapCache,
+        capTtlDays: options.capTtlDays,
       });
 
       console.log("\n🏁 Benchmark complete");
       console.log(`   Profile:     ${report.profile}`);
       if (report.suite) {
       console.log(`   Suite:       ${report.suite}`);
+      }
+      if (report.capabilityMatrix) {
+        console.log(`   Cap TTL:     ${report.capabilityMatrix.ttlDays}d`);
       }
       console.log(`   Scenarios:   ${report.total}`);
       console.log(`   Executed:    ${report.executed}`);
@@ -2128,6 +2135,22 @@ program
 
       if (report.gateResults.soft.messages.length > 0 && report.gateResults.hard.passed) {
         console.log("Benchmark finished with soft warnings (exit code 0).");
+      }
+
+      if (report.capabilityMatrix && report.capabilityMatrix.models.length > 0) {
+        console.log("\nCapability Matrix:");
+        const rows = report.capabilityMatrix.models.map((model) => ({
+          model: model.model,
+          freshness: model.freshness,
+          verified: model.lastVerifiedAt,
+          chat: model.findings.chat_basic.status,
+          tools: model.findings.chat_tool_calls.status,
+          embed: model.findings.embeddings.status,
+          image: model.findings.images_generation.status,
+          audioIn: model.findings.audio_transcription.status,
+          audioOut: model.findings.audio_speech.status,
+        }));
+        console.table(rows);
       }
     } catch (error) {
       console.error(`Benchmark failed: ${(error as Error).message}`);

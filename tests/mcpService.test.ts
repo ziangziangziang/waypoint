@@ -726,6 +726,214 @@ test("mcp generate_image forces b64_json when writing files", async () => {
   await app.close();
 });
 
+test("mcp generate_image accepts image_url for edit-style generation", async () => {
+  const baseDir = await makeWorkspaceTempDir("waypoint-mcp-test-");
+  let observedImageUrl: string | undefined;
+  const app = Fastify();
+  await registerMcpServiceRoutes(app, makePaths(baseDir), {
+    runImageGeneration: async (_paths, request) => {
+      observedImageUrl = request.image_url;
+      return {
+        model: "mock/diffusion",
+        statusCode: 200,
+        headers: { "content-type": "application/json" },
+        payload: { created: 1730000000, data: [{ b64_json: "AQID" }] },
+        route: {
+          endpointId: "ep-1",
+          endpointName: "mock",
+          upstreamModel: "upstream",
+        },
+      };
+    },
+    normalizeImageGenerationPayload: async () => ({
+      model: "mock/diffusion",
+      created: 1730000000,
+      images: [{ index: 0, b64_json: "AQID", url: "data:image/png;base64,AQID" }],
+    }),
+  });
+
+  const init = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: MCP_HEADERS,
+    payload: {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "test", version: "1.0.0" },
+      },
+    },
+  });
+  const sessionId = init.headers["mcp-session-id"] as string;
+  await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { ...MCP_HEADERS, "mcp-session-id": sessionId },
+    payload: { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+  });
+
+  const call = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { ...MCP_HEADERS, "mcp-session-id": sessionId },
+    payload: {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "generate_image",
+        arguments: {
+          prompt: "edit",
+          image_url: "data:image/png;base64,AQID",
+        },
+      },
+    },
+  });
+  assert.equal(call.statusCode, 200);
+  assert.equal(observedImageUrl, "data:image/png;base64,AQID");
+  await app.close();
+});
+
+test("mcp generate_image accepts image_path for edit-style generation", async () => {
+  const baseDir = await makeWorkspaceTempDir("waypoint-mcp-test-");
+  const inputPath = path.join(baseDir, "input.png");
+  const onePixelPngBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Zk3cAAAAASUVORK5CYII=";
+  await fs.writeFile(inputPath, Buffer.from(onePixelPngBase64, "base64"));
+
+  let observedImageUrl: string | undefined;
+  const app = Fastify();
+  await registerMcpServiceRoutes(app, makePaths(baseDir), {
+    runImageGeneration: async (_paths, request) => {
+      observedImageUrl = request.image_url;
+      return {
+        model: "mock/diffusion",
+        statusCode: 200,
+        headers: { "content-type": "application/json" },
+        payload: { created: 1730000000, data: [{ b64_json: "AQID" }] },
+        route: {
+          endpointId: "ep-1",
+          endpointName: "mock",
+          upstreamModel: "upstream",
+        },
+      };
+    },
+    normalizeImageGenerationPayload: async () => ({
+      model: "mock/diffusion",
+      created: 1730000000,
+      images: [{ index: 0, b64_json: "AQID", url: "data:image/png;base64,AQID" }],
+    }),
+  });
+
+  const init = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: MCP_HEADERS,
+    payload: {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "test", version: "1.0.0" },
+      },
+    },
+  });
+  const sessionId = init.headers["mcp-session-id"] as string;
+  await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { ...MCP_HEADERS, "mcp-session-id": sessionId },
+    payload: { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+  });
+
+  const call = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { ...MCP_HEADERS, "mcp-session-id": sessionId },
+    payload: {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "generate_image",
+        arguments: {
+          prompt: "edit",
+          image_path: inputPath,
+        },
+      },
+    },
+  });
+  assert.equal(call.statusCode, 200);
+  assert.ok(observedImageUrl?.startsWith("data:image/png;base64,"));
+  await app.close();
+});
+
+test("mcp generate_image rejects conflicting image_path and image_url", async () => {
+  const baseDir = await makeWorkspaceTempDir("waypoint-mcp-test-");
+  const app = Fastify();
+  await registerMcpServiceRoutes(app, makePaths(baseDir), {
+    runImageGeneration: async () => {
+      throw new Error("should not run");
+    },
+  });
+
+  const init = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: MCP_HEADERS,
+    payload: {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "test", version: "1.0.0" },
+      },
+    },
+  });
+  const sessionId = init.headers["mcp-session-id"] as string;
+  await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { ...MCP_HEADERS, "mcp-session-id": sessionId },
+    payload: { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+  });
+
+  const call = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { ...MCP_HEADERS, "mcp-session-id": sessionId },
+    payload: {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "generate_image",
+        arguments: {
+          prompt: "edit",
+          image_path: "/tmp/a.png",
+          image_url: "https://example.com/a.png",
+        },
+      },
+    },
+  });
+  const callJson = call.json() as {
+    result?: { content?: Array<{ type: string; text?: string }>; isError?: boolean };
+  };
+  assert.equal(callJson.result?.isError, true);
+  assert.match(
+    callJson.result?.content?.find((item) => item.type === "text")?.text ?? "",
+    /"type":"invalid_request"/
+  );
+  await app.close();
+});
+
 test("mcp understand_image returns structured success output", async () => {
   const baseDir = await makeWorkspaceTempDir("waypoint-mcp-test-");
   const app = Fastify();

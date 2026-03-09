@@ -22,6 +22,15 @@ import {
   startBenchmarkRun,
   subscribeBenchmarkRunEvents,
 } from "../benchmark/jobs";
+import { getCapabilitySnapshotByModel, listCapabilitySnapshots, toCapabilityMatrix } from "../benchmark/capabilityStore";
+import {
+  findCaptureBlobPath,
+  getCaptureConfig,
+  getCaptureRecordById,
+  listCaptureRecords,
+  updateCaptureConfig,
+} from "../storage/captureRepository";
+import { promises as fs } from "fs";
 
 interface AdminEnv {
   adminToken?: string;
@@ -205,6 +214,8 @@ export async function registerAdminRoutes(app: FastifyInstance, paths: StoragePa
         configPath: body.configPath,
         profile: body.profile,
         baselinePath: body.baselinePath,
+        updateCapCache: body.updateCapCache,
+        capTtlDays: body.capTtlDays,
       });
       reply.code(202).send(run);
     }
@@ -269,6 +280,68 @@ export async function registerAdminRoutes(app: FastifyInstance, paths: StoragePa
       unsubscribe();
       reply.raw.end();
     });
+  });
+
+  app.get("/admin/benchmarks/capabilities", async (req, reply) => {
+    const ttlParam = Number((req.query as { ttlDays?: string } | undefined)?.ttlDays);
+    const ttlDays = Number.isFinite(ttlParam) && ttlParam > 0 ? Math.floor(ttlParam) : 7;
+    const data = await listCapabilitySnapshots(paths, ttlDays);
+    reply.send(toCapabilityMatrix(data));
+  });
+
+  app.get("/admin/benchmarks/capabilities/:modelId", async (req, reply) => {
+    const { modelId } = req.params as { modelId: string };
+    const ttlParam = Number((req.query as { ttlDays?: string } | undefined)?.ttlDays);
+    const ttlDays = Number.isFinite(ttlParam) && ttlParam > 0 ? Math.floor(ttlParam) : 7;
+    const model = await getCapabilitySnapshotByModel(paths, modelId, ttlDays);
+    if (!model) {
+      reply.code(404).send({ error: { message: "capability snapshot not found" } });
+      return;
+    }
+    reply.send(model);
+  });
+
+  app.get("/admin/capture/config", async (_req, reply) => {
+    const config = await getCaptureConfig(paths);
+    reply.send(config);
+  });
+
+  app.put(
+    "/admin/capture/config",
+    async (req: FastifyRequest<{ Body: { enabled?: boolean; retentionDays?: number; maxBytes?: number } }>, reply) => {
+      const next = await updateCaptureConfig(paths, req.body ?? {});
+      reply.send(next);
+    }
+  );
+
+  app.get("/admin/capture/records", async (req, reply) => {
+    const query = req.query as { limit?: string } | undefined;
+    const parsed = Number(query?.limit);
+    const limit = Number.isFinite(parsed) ? Math.max(1, Math.min(50, Math.floor(parsed))) : 5;
+    const data = await listCaptureRecords(paths, limit);
+    reply.send({ object: "list", data });
+  });
+
+  app.get("/admin/capture/records/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const record = await getCaptureRecordById(paths, id);
+    if (!record) {
+      reply.code(404).send({ error: { message: "capture record not found" } });
+      return;
+    }
+    reply.send(record);
+  });
+
+  app.get("/admin/capture/blobs/:hash", async (req, reply) => {
+    const { hash } = req.params as { hash: string };
+    const located = await findCaptureBlobPath(paths, hash);
+    if (!located) {
+      reply.code(404).send({ error: { message: "capture blob not found" } });
+      return;
+    }
+    const buffer = await fs.readFile(located.path);
+    reply.header("content-type", located.mime);
+    reply.send(buffer);
   });
 }
 

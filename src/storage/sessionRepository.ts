@@ -3,12 +3,13 @@ import path from "path";
 import crypto from "crypto";
 import { ChatSession, ChatMessage } from "../types";
 import { StoragePaths, ensureStorageDir } from "./files";
+import { storeMedia, syncSessionMediaReferences, unmarkSessionMediaReferences } from "./imageCache";
 
 /**
  * Session Repository
  * 
  * Manages chat sessions for the playground UI.
- * Sessions are stored as JSON files in ~/.cache/waypoint/sessions/
+ * Sessions are stored as JSON files in ~/.config/waypoint/sessions/
  */
 
 export function resolveSessionsDir(paths: StoragePaths): string {
@@ -39,7 +40,12 @@ export async function listSessions(paths: StoragePaths): Promise<ChatSession[]> 
       try {
         const filePath = path.join(sessionsDir, file);
         const raw = await fs.readFile(filePath, "utf8");
-        const session = parseSession(JSON.parse(raw) as ChatSession);
+        let session = parseSession(JSON.parse(raw) as ChatSession);
+        const migrated = await migrateSessionMediaRefs(paths, session);
+        if (migrated.changed) {
+          session = migrated.session;
+          await saveSession(paths, session);
+        }
         sessions.push(session);
       } catch {
         // Skip malformed session files
@@ -62,7 +68,13 @@ export async function getSession(paths: StoragePaths, sessionId: string): Promis
   
   try {
     const raw = await fs.readFile(filePath, "utf8");
-    return parseSession(JSON.parse(raw) as ChatSession);
+    let session = parseSession(JSON.parse(raw) as ChatSession);
+    const migrated = await migrateSessionMediaRefs(paths, session);
+    if (migrated.changed) {
+      session = migrated.session;
+      await saveSession(paths, session);
+    }
+    return session;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
@@ -125,6 +137,7 @@ export async function deleteSession(paths: StoragePaths, sessionId: string): Pro
   const filePath = sessionFilePath(paths, sessionId);
   
   try {
+    await unmarkSessionMediaReferences(paths, sessionId);
     await fs.unlink(filePath);
     return true;
   } catch (error) {
@@ -142,9 +155,11 @@ export async function addMessage(
 ): Promise<ChatMessage | null> {
   const session = await getSession(paths, sessionId);
   if (!session) return null;
+
+  const normalizedMessage = await normalizeMessageMediaRefs(paths, message);
   
   const newMessage: ChatMessage = {
-    ...message,
+    ...normalizedMessage,
     id: crypto.randomUUID(),
     createdAt: new Date(),
   };
@@ -179,6 +194,7 @@ async function saveSession(paths: StoragePaths, session: ChatSession): Promise<v
   const filePath = sessionFilePath(paths, session.id);
   const json = JSON.stringify(session, null, 2);
   await fs.writeFile(filePath, json, "utf8");
+  await syncSessionMediaReferences(paths, session.id, extractMediaHashesFromSession(session));
 }
 
 function parseSession(raw: ChatSession): ChatSession {
@@ -214,4 +230,176 @@ function parseMessageDate(message: ChatMessage & { timestamp?: string }): Date {
     return new Date(message.timestamp);
   }
   return new Date();
+}
+
+async function migrateSessionMediaRefs(
+  paths: StoragePaths,
+  session: ChatSession
+): Promise<{ session: ChatSession; changed: boolean }> {
+  let changed = false;
+  const migratedMessages: ChatMessage[] = [];
+
+  for (const message of session.messages) {
+    const normalized = await normalizeMessageMediaRefs(paths, message);
+    if (!changed && JSON.stringify(normalized) !== JSON.stringify(message)) {
+      changed = true;
+    }
+    migratedMessages.push({
+      ...normalized,
+      id: message.id,
+      createdAt: message.createdAt,
+    });
+  }
+
+  const nextStorageVersion = session.storageVersion >= 2 ? session.storageVersion : 2;
+  if (nextStorageVersion !== session.storageVersion) {
+    changed = true;
+  }
+
+  if (!changed) {
+    return { session, changed: false };
+  }
+
+  return {
+    changed: true,
+    session: {
+      ...session,
+      storageVersion: nextStorageVersion,
+      messages: migratedMessages,
+      updatedAt: new Date(),
+    },
+  };
+}
+
+async function normalizeMessageMediaRefs(
+  paths: StoragePaths,
+  message: Omit<ChatMessage, "id" | "createdAt"> | ChatMessage
+): Promise<Omit<ChatMessage, "id" | "createdAt">> {
+  const next: Omit<ChatMessage, "id" | "createdAt"> = {
+    role: message.role,
+    content: message.content ?? "",
+    name: message.name,
+    tool_calls: message.tool_calls,
+    tool_call_id: message.tool_call_id,
+    images: message.images,
+  };
+
+  // Normalize convenience image list
+  if (Array.isArray(next.images)) {
+    const normalizedImages: string[] = [];
+    for (const value of next.images) {
+      const cachedUrl = await normalizeImageRefToLocalUrl(paths, value);
+      normalizedImages.push(cachedUrl ?? value);
+    }
+    next.images = normalizedImages;
+  }
+
+  // Normalize image_url parts in content
+  if (Array.isArray(next.content)) {
+    const normalizedContent = [];
+    for (const part of next.content) {
+      if (
+        part &&
+        typeof part === "object" &&
+        part.type === "image_url" &&
+        part.image_url &&
+        typeof part.image_url.url === "string"
+      ) {
+        const normalizedUrl = await normalizeImageRefToLocalUrl(paths, part.image_url.url);
+        normalizedContent.push({
+          ...part,
+          image_url: {
+            ...part.image_url,
+            url: normalizedUrl ?? part.image_url.url,
+          },
+        });
+      } else {
+        normalizedContent.push(part);
+      }
+    }
+    next.content = normalizedContent;
+  }
+
+  return next;
+}
+
+async function normalizeImageRefToLocalUrl(paths: StoragePaths, value: string): Promise<string | null> {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const localHash = extractLocalMediaHash(trimmed);
+  if (localHash) {
+    return `/admin/media/${localHash}`;
+  }
+
+  if (/^[a-f0-9]{16}$/i.test(trimmed)) {
+    return `/admin/media/${trimmed.toLowerCase()}`;
+  }
+
+  if (trimmed.startsWith("data:image/")) {
+    try {
+      const cached = await storeMedia(paths, trimmed);
+      return `/admin/media/${cached.hash}`;
+    } catch {
+      return null;
+    }
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const response = await fetch(trimmed, { signal: AbortSignal.timeout(10_000) });
+      if (!response.ok) return null;
+      const contentType = response.headers.get("content-type") ?? undefined;
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const cached = await storeMedia(paths, buffer, { mimeType: contentType });
+      return `/admin/media/${cached.hash}`;
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function extractLocalMediaHash(value: string): string | null {
+  if (value.startsWith("/")) {
+    const match = value.match(/^\/admin\/(?:media|images)\/([a-f0-9]{16})$/i);
+    return match ? match[1].toLowerCase() : null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    if (!["localhost", "127.0.0.1", "::1"].includes(parsed.hostname)) return null;
+    const match = parsed.pathname.match(/^\/admin\/(?:media|images)\/([a-f0-9]{16})$/i);
+    return match ? match[1].toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractMediaHashesFromSession(session: ChatSession): string[] {
+  const hashes = new Set<string>();
+  for (const message of session.messages) {
+    if (Array.isArray(message.images)) {
+      for (const imageRef of message.images) {
+        const hash = extractLocalMediaHash(imageRef);
+        if (hash) hashes.add(hash);
+      }
+    }
+    if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (
+          part &&
+          typeof part === "object" &&
+          part.type === "image_url" &&
+          part.image_url &&
+          typeof part.image_url.url === "string"
+        ) {
+          const hash = extractLocalMediaHash(part.image_url.url);
+          if (hash) hashes.add(hash);
+        }
+      }
+    }
+  }
+  return Array.from(hashes);
 }

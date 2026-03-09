@@ -72,7 +72,8 @@ For tool-calling agents:
 3. Keep responses minimal unless inline data is explicitly needed downstream.
 4. Avoid repeated expensive calls with unchanged arguments.
 5. Use `include_data=true` only for explicit transport requirements.
-6. For image-to-text tools, provide exactly one image source (`image_path` xor `image_url`).
+6. For image-generation editing, provide at most one source (`image_path` xor `image_url`).
+7. For image-to-text tools, provide exactly one image source (`image_path` xor `image_url`).
 
 When the server is pinned with `WAYPOINT_MCP_OUTPUT_ROOT`/`WAYPOINT_MCP_OUTPUT_SUBDIR`, the effective "workspace directory" for file-output policy is that configured root scope, not the client session directory.
 
@@ -83,6 +84,20 @@ When the server is pinned with `WAYPOINT_MCP_OUTPUT_ROOT`/`WAYPOINT_MCP_OUTPUT_S
   "name": "generate_image",
   "arguments": {
     "prompt": "Minimal icon with clean geometric shape",
+    "output_dir": "./tmp/waypoint-images",
+    "include_data": false
+  }
+}
+```
+
+### Image-edit example (`generate_image`)
+
+```json
+{
+  "name": "generate_image",
+  "arguments": {
+    "prompt": "Replace the background with a clean studio backdrop",
+    "image_path": "./tmp/input.png",
     "output_dir": "./tmp/waypoint-images",
     "include_data": false
   }
