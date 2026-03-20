@@ -2,6 +2,25 @@
 
 All notable changes to Waypoint are documented here.
 
+## [0.6.0] - 2026-03-20
+
+### Added
+
+- Built-in MCP service (`POST /mcp`) with two tools:
+  - `generate_image` - File-first image generation with workspace-relative output paths
+  - `understand_image` - Vision-based image analysis with coordinate-preserving geometry metadata
+- Agent Mode in Playground UI - Toggle to enable MCP tool-calling workflows
+- Tool Picker component for selecting available MCP tools in agent mode
+- Tool call visualization in chat UI with status indicators (pending/executing/success/error)
+- Peek Token Flow Sankey diagrams for visualizing token attribution
+
+### Changed
+
+- MCP service uses file-first policy: outputs always write to workspace, rejects paths outside workspace root
+- `generate_image` requires `workspace_root` parameter and returns workspace-relative `file_path`
+- `understand_image` preserves original image geometry for coordinate-sensitive tasks
+- Agent Playground supports up to 10 tool iterations per user message with stop control
+
 ## [Unreleased]
 
 ### Changed

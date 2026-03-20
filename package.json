@@ -1,6 +1,6 @@
 {
   "name": "waypoint",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "private": true,
   "description": "Local OpenAI-compatible reverse proxy with routing, health checks, and playground UI",
   "license": "MIT",
@@ -29,6 +29,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/node": "^20.14.10",
     "tsx": "^4.16.2",
     "typescript": "^5.5.4"

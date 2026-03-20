@@ -64,7 +64,7 @@ export function createMcpService(
     const server = new McpServer(
       {
         name: "waypoint-mcp",
-        version: "0.5.3",
+        version: "0.6.0",
       },
       {
         capabilities: {},

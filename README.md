@@ -36,6 +36,21 @@
   <img src="assets/dashboard.png" alt="Real-time statistics dashboard" width="800" />
 </p>
 
+### MCP Image Generation
+<p align="center">
+  <img src="assets/mcp-generate-image.png" alt="MCP generate_image tool in agent mode" width="800" />
+</p>
+
+### MCP Image Understanding
+<p align="center">
+  <img src="assets/mcp-understand-image.png" alt="MCP understand_image tool analyzing uploaded image" width="800" />
+</p>
+
+### Token Flow Sankey
+<p align="center">
+  <img src="assets/peek-token-flow.png" alt="Peek token flow Sankey visualization" width="800" />
+</p>
+
 ### Naming and Logo
 
 I admit, the name "Waypoint" is proposed by LLM (shut out to Qwen3-vl-30B) after it reads my early repositoy. In the beginning, the work was just intended to be a simple proxy for ill-configured LLM endpoints. I am talking about PCAI.

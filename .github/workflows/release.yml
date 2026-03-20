@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: |
+          npm ci
+          cd ui && npm ci
+      
+      - name: Build
+        run: npm run build:all
+      
+      - name: Extract changelog for version
+        id: changelog
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          BODY=$(sed -n "/## \[$VERSION\]/,/^## /p" CHANGELOG.md | head -n -1)
+          if [ -z "$BODY" ]; then
+            BODY="See CHANGELOG.md for details."
+          fi
+          echo "body=$BODY" >> $GITHUB_OUTPUT
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: false
+          body: |
+            ${{ steps.changelog.outputs.body }}
+            
+            ---
+            
+            ### Installation
+            
+            ```bash
+            git clone https://github.com/zziang/waypoint
+            cd waypoint
+            npm install
+            cd ui && npm install && cd ..
+            npm run build:all
+            npm run start
+            ```
+            
+            Visit `http://localhost:8000/ui`
+            
+            ### Links
+            
+            - [Documentation](https://github.com/zziang/waypoint#readme)
+            - [MCP Service Guide](https://github.com/zziang/waypoint/blob/main/docs/mcp-service.md)
+            - [MCP Guidelines](https://github.com/zziang/waypoint/blob/main/docs/mcp-guidelines.md)
+            
+            ---
+            
+            Built with ❤️ for the local AI community
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
