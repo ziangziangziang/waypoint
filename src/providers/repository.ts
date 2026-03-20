@@ -156,6 +156,20 @@ export async function updateProvider(
   return updated;
 }
 
+export async function deleteProvider(
+  paths: StoragePaths,
+  providerId: string
+): Promise<ProviderRecord | null> {
+  const store = await loadProviderStore(paths);
+  const index = store.providers.findIndex((provider) => provider.id === providerId);
+  if (index === -1) {
+    return null;
+  }
+  const [removed] = store.providers.splice(index, 1);
+  await saveProviderStore(paths, store.providers);
+  return normalizeProviderRecord(removed);
+}
+
 export async function listProviderModels(paths: StoragePaths, providerId: string): Promise<ProviderModelRecord[] | null> {
   const provider = await getProviderById(paths, providerId);
   if (!provider) {

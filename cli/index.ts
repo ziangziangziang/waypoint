@@ -15,7 +15,7 @@ import path from "path";
 import { routeRequest } from "../src/routing/router";
 import { aggregateStats } from "../src/storage/statsRepository";
 import { listMcpServers, addMcpServer, removeMcpServer, updateMcpServer } from "../src/mcp/registry";
-import { runBenchmark } from "../src/benchmark/runner";
+import { listBenchmarkExamples, runBenchmark } from "../src/benchmark/runner";
 import { importProviders } from "../src/providers/importer";
 import { listModelsForApi } from "../src/providers/modelRegistry";
 import { getProviderModelHealthMap, probeProviderModels } from "../src/providers/health";
@@ -169,7 +169,7 @@ program
   .option("--model <mapping...>", "Model mapping as 'public' or 'public=upstream'. If endpoint has 1 model, upstream is auto-detected.")
   .action(async () => {
     console.error(
-      "Endpoint writes are deprecated in v0.5.0. Use `waypoint provider model add ...` and migration commands."
+      "Endpoint writes are deprecated in v0.5.0. Use `waypoint models add ...` and migration commands."
     );
     process.exitCode = 1;
   });
@@ -2020,35 +2020,60 @@ models
 program
   .command("bench")
   .alias("benchmark")
-  .description("Run lightweight benchmarks (chat/agent/embeddings/images/audio)")
-  .option("--suite <name>", "Built-in suite to run")
+  .description("Run showcase benchmark examples or internal diagnostic suites")
+  .option("--suite <name>", "Built-in suite to run (default: showcase)")
+  .option("--example <id>", "Run one built-in example from the selected suite")
+  .option("--list-examples", "List showcase examples and exit")
   .option("--scenario <path>", "Scenario file (.json, .jsonl, .yaml)")
   .option("--model <name>", "Override model for all scenarios")
   .option("--out <path>", "Output file path or directory for benchmark artifact")
   .option("--config <path>", "Benchmark config file (YAML or JSON)")
   .option("--profile <name>", "Benchmark profile (local|ci)")
+  .option("--mode <name>", "Execution mode (showcase|diagnostic)")
   .option("--baseline <path>", "Baseline benchmark JSON for regression comparison")
   .option("--update-cap-cache", "Persist capability findings to capability cache")
   .option("--cap-ttl-days <n>", "Capability cache TTL days for freshness/output", parseInt)
   .action(async (options) => {
     await ensureStorageDir(paths);
     try {
+      if (options.listExamples) {
+        const suiteName = options.suite ?? "showcase";
+        const examples = listBenchmarkExamples(suiteName);
+        console.log(`\nExamples in suite '${suiteName}':\n`);
+        console.table(
+          examples.map((example) => ({
+            id: example.id,
+            mode: example.mode,
+            title: example.title,
+            source: example.exampleSource,
+            tools: example.requiresAvailableTools ? "required" : "optional",
+          }))
+        );
+        return;
+      }
+
       const { report, artifactPath, textArtifactPath } = await runBenchmark(paths, {
         suite: options.suite,
+        exampleId: options.example,
         scenarioPath: options.scenario,
         modelOverride: options.model,
         outPath: options.out,
         configPath: options.config,
         profile: options.profile,
         baselinePath: options.baseline,
+        executionMode: options.mode,
         updateCapCache: options.updateCapCache,
         capTtlDays: options.capTtlDays,
       });
 
       console.log("\n🏁 Benchmark complete");
       console.log(`   Profile:     ${report.profile}`);
+      console.log(`   Mode:        ${report.executionMode}`);
       if (report.suite) {
-      console.log(`   Suite:       ${report.suite}`);
+        console.log(`   Suite:       ${report.suite}`);
+      }
+      if (report.exampleId) {
+        console.log(`   Example:     ${report.exampleId}`);
       }
       if (report.capabilityMatrix) {
         console.log(`   Cap TTL:     ${report.capabilityMatrix.ttlDays}d`);
@@ -2066,6 +2091,28 @@ program
       console.log(`   Throughput:  ${report.avgThroughputTokensPerSec.toFixed(2)} t/s`);
       console.log(`   Artifact:    ${artifactPath}\n`);
       console.log(`   Summary:     ${textArtifactPath}\n`);
+
+      if (report.executionMode === "showcase" && report.scenarioDetails.length > 0) {
+        console.log("Showcase details:");
+        for (const detail of report.scenarioDetails) {
+          console.log(`- ${detail.example?.title ?? detail.id}`);
+          console.log(`  Goal: ${detail.example?.userVisibleGoal ?? "n/a"}`);
+          console.log(`  Model: ${detail.model}`);
+          console.log(`  Verdict: ${detail.verdict}`);
+          if (detail.usedToolNames.length > 0) {
+            console.log(`  Tools: ${detail.usedToolNames.join(", ")}`);
+          }
+          if (detail.finalResponsePreview) {
+            console.log(`  Final: ${detail.finalResponsePreview}`);
+          }
+          if (detail.exchanges.length > 0) {
+            const finalExchange = detail.exchanges[detail.exchanges.length - 1];
+            console.log(`  Request: ${finalExchange.requestPath}`);
+            console.log(`  Response: ${finalExchange.responsePreview}`);
+          }
+        }
+        console.log();
+      }
 
       if (report.warnings.length > 0) {
         console.log("Warnings:");

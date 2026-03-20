@@ -51,6 +51,34 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+## 6) Benchmark the same real-world flows
+
+Use the built-in showcase examples to replay the same kinds of interactions you expect from Opencode:
+
+```bash
+# See available examples
+waypoint bench --list-examples
+
+# Plain chat
+waypoint bench --example showcase-chat-welcome
+
+# Responses API compatibility
+waypoint bench --example showcase-responses-basic
+
+# Tool-calling live show
+waypoint bench --example showcase-agent-tool-call
+```
+
+The Benchmark UI shows:
+
+- the exact scenario input
+- the wire request Waypoint sent
+- tool calls and tool results
+- the final model response
+- the final verdict
+
+This is the fastest way to demonstrate that an Opencode-style workflow works end to end.
+
 ## Troubleshooting
 
 - Empty model list: verify endpoint health with `waypoint status`.

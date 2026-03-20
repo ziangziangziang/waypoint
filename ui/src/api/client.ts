@@ -62,24 +62,110 @@ export interface ProviderModel {
   benchmark?: {
     livebench?: number;
   };
+  limits?: ProviderLimits;
+}
+
+export interface DiscoveredProviderModel {
+  id: string;
+  capabilities?: ModelCapabilities;
+}
+
+export interface ProviderModelDiscoveryResponse {
+  baseUrl: string;
+  models: DiscoveredProviderModel[];
+}
+
+export interface ProviderAuthConfig {
+  type: 'bearer' | 'query' | 'header' | 'none';
+  keyParam?: string;
+  headerName?: string;
+  keyPrefix?: string;
+}
+
+export interface ProviderProtocolConfig {
+  router?: string;
+  responseTextPaths?: string[];
+  [key: string]: unknown;
+}
+
+export interface ProviderLimits {
+  requests?: {
+    perMinute?: number;
+    perDay?: number;
+    perMonth?: number;
+  };
+  tokens?: {
+    perMinute?: number;
+    perDay?: number;
+    perMonth?: number;
+  };
+  concurrent?: number;
 }
 
 export interface Provider {
   id: string;
   name: string;
   description?: string;
+  docs?: string;
   protocol: string;
   protocolRaw?: string;
+  protocolConfig?: ProviderProtocolConfig;
   baseUrl: string;
+  insecureTls?: boolean;
+  autoInsecureTlsDomains?: string[];
   enabled: boolean;
   supportsRouting: boolean;
+  auth?: ProviderAuthConfig;
+  envVar?: string;
   apiKey?: string;
+  limits?: ProviderLimits;
   models: ProviderModel[];
+  warnings?: string[];
+  importedAt?: string;
 }
 
 export async function listProviders(): Promise<Provider[]> {
   const response = await fetch(`${API_BASE}/admin/providers`);
   return handleResponse<Provider[]>(response);
+}
+
+export async function addProvider(payload: Partial<Provider>): Promise<Provider> {
+  const response = await fetch(`${API_BASE}/admin/providers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<Provider>(response);
+}
+
+export async function updateProvider(providerId: string, payload: Partial<Provider>): Promise<Provider> {
+  const response = await fetch(`${API_BASE}/admin/providers/${encodeURIComponent(providerId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<Provider>(response);
+}
+
+export async function deleteProvider(providerId: string): Promise<{ deleted: string }> {
+  const response = await fetch(`${API_BASE}/admin/providers/${encodeURIComponent(providerId)}`, {
+    method: 'DELETE',
+  });
+  return handleResponse<{ deleted: string }>(response);
+}
+
+export async function enableProvider(providerId: string): Promise<Provider> {
+  const response = await fetch(`${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/enable`, {
+    method: 'POST',
+  });
+  return handleResponse<Provider>(response);
+}
+
+export async function disableProvider(providerId: string): Promise<Provider> {
+  const response = await fetch(`${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/disable`, {
+    method: 'POST',
+  });
+  return handleResponse<Provider>(response);
 }
 
 export async function listProviderModels(providerId: string): Promise<ProviderModel[]> {
@@ -121,6 +207,37 @@ export async function deleteProviderModel(providerId: string, modelRef: string):
     { method: 'DELETE' }
   );
   return handleResponse<{ deleted: string }>(response);
+}
+
+export async function enableProviderModel(providerId: string, modelRef: string): Promise<ProviderModel> {
+  const response = await fetch(
+    `${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelRef)}/enable`,
+    { method: 'POST' }
+  );
+  return handleResponse<ProviderModel>(response);
+}
+
+export async function disableProviderModel(providerId: string, modelRef: string): Promise<ProviderModel> {
+  const response = await fetch(
+    `${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelRef)}/disable`,
+    { method: 'POST' }
+  );
+  return handleResponse<ProviderModel>(response);
+}
+
+export async function discoverProviderModels(
+  providerId: string,
+  payload?: { baseUrl?: string; apiKey?: string; insecureTls?: boolean }
+): Promise<ProviderModelDiscoveryResponse> {
+  const response = await fetch(
+    `${API_BASE}/admin/providers/${encodeURIComponent(providerId)}/models/discover`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload ?? {}),
+    }
+  );
+  return handleResponse<ProviderModelDiscoveryResponse>(response);
 }
 
 // ========================================
@@ -218,16 +335,31 @@ export async function getLatencyDistribution(window: string = '7d'): Promise<Lat
 export interface TokenUsage {
   window: string;
   totalTokens: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
   totalRequests: number;
   avgTokensPerRequest: number;
   tokenEstimatedCount?: number;
   tokenEstimatedRate?: number;
+  splitUnknownCount?: number;
+  splitUnknownRate?: number;
   bucketGranularity?: 'hour' | 'day';
-  byDay: Array<{ date: string; count: number; tokens: number; estimated: number }>;
+  bucketTimeZone?: string;
+  byDay: Array<{
+    date: string;
+    count: number;
+    tokens: number;
+    estimated: number;
+    inputTokens: number;
+    outputTokens: number;
+    splitUnknown: number;
+  }>;
 }
 
-export async function getTokenUsage(window: string = '7d'): Promise<TokenUsage> {
-  const response = await fetch(`${API_BASE}/admin/stats/tokens?window=${window}`);
+export async function getTokenUsage(window: string = '7d', options?: { timeZone?: string }): Promise<TokenUsage> {
+  const params = new URLSearchParams({ window });
+  if (options?.timeZone) params.set('timeZone', options.timeZone);
+  const response = await fetch(`${API_BASE}/admin/stats/tokens?${params.toString()}`);
   return handleResponse<TokenUsage>(response);
 }
 
@@ -696,12 +828,28 @@ export interface BenchmarkRunSummary {
   startedAt?: string;
   finishedAt?: string;
   suite?: string;
+  exampleId?: string;
   profile?: string;
   scenarioPath?: string;
   succeeded?: number;
   failed?: number;
   successRate?: number;
   artifactPath?: string;
+}
+
+export interface BenchmarkExampleSummary {
+  id: string
+  suite: string
+  mode: string
+  title: string
+  summary: string
+  userVisibleGoal: string
+  exampleSource: 'opencode' | 'builtin' | 'file'
+  inputPreview: string
+  successCriteria: string
+  expectedHighlights: string[]
+  requiresAvailableTools: boolean
+  model?: string
 }
 
 export type BenchmarkCapabilityKey =
@@ -756,6 +904,7 @@ export interface BenchmarkRunEvent {
   runIndex?: number;
   totalRuns?: number;
   phase?: 'warmup' | 'measured';
+  scenario?: BenchmarkExampleSummary;
   warning?: string;
   summary?: {
     total: number;
@@ -767,9 +916,22 @@ export interface BenchmarkRunEvent {
   exchange?: {
     mode: string;
     model: string;
+    scenarioInput: string;
+    requestPreview: string;
+    responsePreview: string;
     requestPath: string;
     statusCode: number;
     contentType: string;
+    endpointId?: string;
+    endpointName?: string;
+    upstreamModel?: string;
+    toolTrace: Array<{
+      kind: 'tool_call' | 'tool_result';
+      toolName: string;
+      toolCallId?: string;
+      argumentsText?: string;
+      contentText?: string;
+    }>;
     requestRaw: unknown;
     requestSanitized: unknown;
     responseRaw: unknown;
@@ -777,15 +939,94 @@ export interface BenchmarkRunEvent {
   };
 }
 
+export interface BenchmarkScenarioDetail {
+  id: string
+  suite?: string
+  example?: BenchmarkExampleSummary
+  model: string
+  status: 'passed' | 'failed' | 'skipped'
+  verdict: string
+  exchanges: Array<{
+    timestamp?: string
+    mode: string
+    model: string
+    requestPath: string
+    statusCode: number
+    contentType: string
+    requestSanitized: unknown
+    responseSanitized: unknown
+    requestPreview: string
+    responsePreview: string
+    endpointId?: string
+    endpointName?: string
+    upstreamModel?: string
+    toolTrace: Array<{
+      kind: 'tool_call' | 'tool_result'
+      toolName: string
+      toolCallId?: string
+      argumentsText?: string
+      contentText?: string
+    }>
+  }>
+  finalResponsePreview: string
+  usedToolNames: string[]
+}
+
+export interface BenchmarkReport {
+  id: string
+  profile: string
+  executionMode: 'showcase' | 'diagnostic'
+  suite?: string
+  exampleId?: string
+  scenarioPath?: string
+  modelOverride?: string
+  total: number
+  executed: number
+  skipped: number
+  succeeded: number
+  failed: number
+  successRate: number
+  avgLatencyMs: number
+  p95LatencyMs: number
+  totalTokens: number
+  totalToolCalls: number
+  avgThroughputTokensPerSec: number
+  results: Array<{
+    id: string
+    mode: string
+    title?: string
+    model: string
+    status: 'passed' | 'failed' | 'skipped'
+    passRate: number
+    outputPreview: string
+    verdict: string
+    usedToolNames: string[]
+    errorReasons: string[]
+    skippedReason?: string
+    totalTokens: number
+    failovers: number
+    p95LatencyMs: number
+  }>
+  scenarioDetails: BenchmarkScenarioDetail[]
+  capabilityMatrix?: BenchmarkCapabilityMatrix
+  gateResults: {
+    hard: { passed: boolean; messages: string[] }
+    soft: { passed: boolean; messages: string[] }
+  }
+  warnings: string[]
+}
+
 export interface BenchmarkRunRecord extends BenchmarkRunSummary {
   request?: {
     suite?: string;
+    exampleId?: string;
     scenarioPath?: string;
     modelOverride?: string;
     outPath?: string;
     configPath?: string;
     profile?: string;
     baselinePath?: string;
+    executionMode?: 'showcase' | 'diagnostic';
     updateCapCache?: boolean;
     capTtlDays?: number;
   };
@@ -798,18 +1039,20 @@ export interface BenchmarkRunRecord extends BenchmarkRunSummary {
     totalRuns?: number;
     phase?: 'warmup' | 'measured';
   };
-  report?: unknown;
+  report?: BenchmarkReport;
   events?: BenchmarkRunEvent[];
   error?: string;
 }
 
 export async function startBenchmarkRun(payload: {
   suite?: string;
+  exampleId?: string;
   scenarioPath?: string;
   modelOverride?: string;
   configPath?: string;
   profile?: string;
   baselinePath?: string;
+  executionMode?: 'showcase' | 'diagnostic';
   updateCapCache?: boolean;
   capTtlDays?: number;
 }): Promise<BenchmarkRunRecord> {
@@ -819,6 +1062,12 @@ export async function startBenchmarkRun(payload: {
     body: JSON.stringify(payload),
   });
   return handleResponse<BenchmarkRunRecord>(response);
+}
+
+export async function listBenchmarkExamples(suite = 'showcase'): Promise<{ object: 'list'; suite: string; data: BenchmarkExampleSummary[] }> {
+  const query = `?suite=${encodeURIComponent(suite)}`
+  const response = await fetch(`${API_BASE}/admin/benchmarks/examples${query}`)
+  return handleResponse<{ object: 'list'; suite: string; data: BenchmarkExampleSummary[] }>(response)
 }
 
 export async function listBenchmarkCapabilities(ttlDays?: number): Promise<BenchmarkCapabilityMatrix> {
@@ -986,6 +1235,24 @@ export interface CaptureRecordSummary {
   model?: string;
 }
 
+export interface CaptureTimelineEntry {
+  direction: 'request' | 'response';
+  kind: 'message' | 'tool_definition' | 'tool_call' | 'tool_result' | 'reasoning' | 'instructions' | 'stream_preview' | 'error';
+  index: number;
+  sourcePath: string;
+  role?: 'system' | 'user' | 'assistant' | 'tool' | 'developer';
+  content?: string;
+  name?: string;
+  arguments?: string;
+  toolCallId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CaptureCalendarDaySummary {
+  date: string;
+  count: number;
+}
+
 export interface CaptureRecordDetail {
   id: string;
   timestamp: string;
@@ -1011,13 +1278,29 @@ export interface CaptureRecordDetail {
     upstreamModel?: string;
   };
   analysis: {
-    systemMessages: string[];
-    userMessages: string[];
-    assistantMessages: string[];
+    systemMessages: CaptureTextMessage[];
+    userMessages: CaptureTextMessage[];
+    assistantMessages: CaptureAssistantMessage[];
+    toolMessages?: CaptureToolMessage[];
+    requestTimeline?: CaptureTimelineEntry[];
+    responseTimeline?: CaptureTimelineEntry[];
     tools: Array<{ name: string; description?: string }>;
     mcpToolDescriptions: string[];
     agentsMdHints: string[];
     rawSections: string[];
+    tokenFlow?: {
+      eligible: boolean;
+      reason?: string;
+      method: 'exact_totals_estimated_categories' | 'estimated_only' | 'unavailable';
+      totals: {
+        inputTokens: number | null;
+        outputTokens: number | null;
+        totalTokens: number | null;
+      };
+      input: Array<{ key: string; label: string; tokens: number }>;
+      output: Array<{ key: string; label: string; tokens: number }>;
+      notes?: string[];
+    };
   };
   artifacts: Array<{
     hash: string;
@@ -1026,6 +1309,31 @@ export interface CaptureRecordDetail {
     blobRef: string;
     kind: 'image' | 'audio' | 'binary';
   }>;
+}
+
+export interface CaptureTextMessage {
+  content: string;
+  truncated?: boolean;
+  originalLength?: number;
+}
+
+export interface CaptureAssistantMessage extends CaptureTextMessage {
+  reasoningContent?: string;
+  toolCalls?: CaptureToolCall[];
+  asksForClarification?: boolean;
+}
+
+export interface CaptureToolMessage extends CaptureTextMessage {
+  toolCallId?: string;
+}
+
+export interface CaptureToolCall {
+  id?: string;
+  type?: string;
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
 }
 
 export async function getCaptureConfig(): Promise<CaptureConfig> {
@@ -1044,12 +1352,25 @@ export async function updateCaptureConfig(
   return handleResponse<CaptureConfig>(response);
 }
 
-export async function listCaptureRecords(limit = 5): Promise<{ object: 'list'; data: CaptureRecordSummary[] }> {
-  const response = await fetch(`${API_BASE}/admin/capture/records?limit=${encodeURIComponent(String(limit))}`);
-  return handleResponse<{ object: 'list'; data: CaptureRecordSummary[] }>(response);
+export async function listCaptureRecords(
+  options: { limit?: number; offset?: number; date?: string } = {}
+): Promise<{ object: 'list'; data: CaptureRecordSummary[]; total: number }> {
+  const params = new URLSearchParams()
+  if (options.limit !== undefined) params.set('limit', String(options.limit))
+  if (options.offset !== undefined) params.set('offset', String(options.offset))
+  if (options.date) params.set('date', options.date)
+  const response = await fetch(`${API_BASE}/admin/capture/records?${params.toString()}`);
+  return handleResponse<{ object: 'list'; data: CaptureRecordSummary[]; total: number }>(response);
 }
 
 export async function getCaptureRecord(id: string): Promise<CaptureRecordDetail> {
   const response = await fetch(`${API_BASE}/admin/capture/records/${encodeURIComponent(id)}`);
   return handleResponse<CaptureRecordDetail>(response);
+}
+
+export async function getCaptureCalendar(
+  month: string
+): Promise<{ month: string; days: CaptureCalendarDaySummary[] }> {
+  const response = await fetch(`${API_BASE}/admin/capture/calendar?month=${encodeURIComponent(month)}`);
+  return handleResponse<{ month: string; days: CaptureCalendarDaySummary[] }>(response);
 }

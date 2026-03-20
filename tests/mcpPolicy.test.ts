@@ -2,109 +2,113 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import path from "path";
 import {
-  MCP_TOOL_DESCRIPTION_TEMPLATE,
   resolveBinaryOutputPolicy,
   validateAtMostOneImageInput,
   validateSingleImageInput,
 } from "../src/mcp/policy";
 
+test("resolveBinaryOutputPolicy requires workspace_root", () => {
+  assert.throws(
+    () => resolveBinaryOutputPolicy({ output_dir: "./images" }),
+    /workspace_root is required/
+  );
+});
+
 test("resolveBinaryOutputPolicy rejects output_path and output_dir together", () => {
   assert.throws(
-    () => resolveBinaryOutputPolicy({ output_path: "/tmp/a.png", output_dir: "/tmp" }),
+    () =>
+      resolveBinaryOutputPolicy({
+        workspace_root: path.join(path.sep, "Users", "example", "repo"),
+        output_path: "./a.png",
+        output_dir: "./images",
+      }),
     /Provide either output_path or output_dir/
   );
 });
 
-test("resolveBinaryOutputPolicy rejects output paths outside workspace", () => {
+test("resolveBinaryOutputPolicy rejects absolute output paths", () => {
+  const workspaceRoot = path.join(path.sep, "Users", "example", "repo");
   assert.throws(
-    () => resolveBinaryOutputPolicy({ output_path: "/tmp/a.png" }),
-    /output_path resolved to/
+    () => resolveBinaryOutputPolicy({ workspace_root: workspaceRoot, output_path: "/tmp/a.png" }),
+    /output_path must be relative to workspace_root/
   );
   assert.throws(
-    () => resolveBinaryOutputPolicy({ output_dir: "/tmp" }),
-    /output_dir resolved to/
+    () => resolveBinaryOutputPolicy({ workspace_root: workspaceRoot, output_dir: "/tmp" }),
+    /output_dir must be relative to workspace_root/
   );
 });
 
-test("resolveBinaryOutputPolicy accepts output paths inside workspace", () => {
-  const cwd = process.cwd();
-  assert.doesNotThrow(() =>
-    resolveBinaryOutputPolicy({ output_path: path.join(cwd, "tmp", "a.png") })
-  );
-  assert.doesNotThrow(() => resolveBinaryOutputPolicy({ output_dir: path.join(cwd, "tmp") }));
+test("resolveBinaryOutputPolicy accepts relative output paths inside workspace", () => {
+  const workspaceRoot = path.join(path.sep, "Users", "example", "repo");
+  const resolved = resolveBinaryOutputPolicy({
+    workspace_root: workspaceRoot,
+    output_path: "./images/a-{index}.png",
+  });
+  assert.equal(resolved.outputBaseRoot, workspaceRoot);
+  assert.equal(resolved.outputPathPattern, "./images/a-{index}.png");
+  assert.equal(resolved.includeData, false);
 });
 
 test("resolveBinaryOutputPolicy requires {index} for n > 1 with output_path", () => {
-  const cwd = process.cwd();
+  const workspaceRoot = path.join(path.sep, "Users", "example", "repo");
   assert.throws(
-    () => resolveBinaryOutputPolicy({ n: 2, output_path: path.join(cwd, "tmp", "image.png") }),
+    () =>
+      resolveBinaryOutputPolicy({
+        workspace_root: workspaceRoot,
+        n: 2,
+        output_path: "./image.png",
+      }),
     /include '\{index\}'/
   );
 });
 
-test("resolveBinaryOutputPolicy defaults includeData to false in file-output mode", () => {
-  const resolved = resolveBinaryOutputPolicy({ output_dir: path.join(process.cwd(), "tmp", "icons") });
+test("resolveBinaryOutputPolicy defaults includeData to false", () => {
+  const workspaceRoot = path.join(path.sep, "Users", "example", "repo");
+  const resolved = resolveBinaryOutputPolicy({
+    workspace_root: workspaceRoot,
+    output_dir: "./images",
+  });
   assert.equal(resolved.includeData, false);
-  assert.equal(resolved.outputBaseRoot, process.cwd());
+  assert.equal(resolved.outputBaseRoot, workspaceRoot);
 });
 
-test("resolveBinaryOutputPolicy defaults includeData to true without file-output mode", () => {
-  const resolved = resolveBinaryOutputPolicy({});
-  assert.equal(resolved.includeData, true);
-  assert.equal(resolved.outputBaseRoot, process.cwd());
-});
-
-test("resolveBinaryOutputPolicy accepts path under configured output root", () => {
+test("resolveBinaryOutputPolicy accepts workspace_root within pinned root", () => {
   const pinnedRoot = path.join(process.cwd(), "tmp", "manga-root");
+  const workspaceRoot = path.join(pinnedRoot, "repo-a");
   const resolved = resolveBinaryOutputPolicy(
-    { output_dir: path.join(pinnedRoot, "work") },
+    {
+      workspace_root: workspaceRoot,
+      output_dir: "./images",
+    },
     { env: { WAYPOINT_MCP_OUTPUT_ROOT: pinnedRoot } }
   );
-  assert.equal(resolved.outputBaseRoot, pinnedRoot);
+  assert.equal(resolved.outputBaseRoot, workspaceRoot);
 });
 
-test("resolveBinaryOutputPolicy rejects sibling path when output root is pinned", () => {
+test("resolveBinaryOutputPolicy rejects relative workspace_root", () => {
+  assert.throws(
+    () =>
+      resolveBinaryOutputPolicy({
+        workspace_root: "./repo",
+        output_dir: "./images",
+      }),
+    /workspace_root must be an absolute path/
+  );
+});
+
+test("resolveBinaryOutputPolicy rejects workspace_root outside pinned root", () => {
   const pinnedRoot = path.join(process.cwd(), "tmp", "manga-root");
-  const siblingRoot = path.join(process.cwd(), "tmp", "meme-root");
+  const otherRoot = path.join(process.cwd(), "tmp", "meme-root");
   assert.throws(
     () =>
       resolveBinaryOutputPolicy(
-        { output_dir: path.join(siblingRoot, "work") },
+        {
+          workspace_root: otherRoot,
+          output_dir: "./images",
+        },
         { env: { WAYPOINT_MCP_OUTPUT_ROOT: pinnedRoot } }
       ),
-    /must be within/
-  );
-});
-
-test("resolveBinaryOutputPolicy resolves relative output_dir against configured root", () => {
-  const pinnedRoot = path.join(process.cwd(), "tmp", "manga-root");
-  assert.doesNotThrow(() =>
-    resolveBinaryOutputPolicy(
-      { output_dir: "./work" },
-      {
-        env: {
-          WAYPOINT_MCP_OUTPUT_ROOT: pinnedRoot,
-          WAYPOINT_MCP_OUTPUT_SUBDIR: "work",
-        },
-      }
-    )
-  );
-});
-
-test("resolveBinaryOutputPolicy rejects relative output_dir outside configured subdir", () => {
-  const pinnedRoot = path.join(process.cwd(), "tmp", "manga-root");
-  assert.throws(
-    () =>
-      resolveBinaryOutputPolicy(
-        { output_dir: "./tmp" },
-        {
-          env: {
-            WAYPOINT_MCP_OUTPUT_ROOT: pinnedRoot,
-            WAYPOINT_MCP_OUTPUT_SUBDIR: "work",
-          },
-        }
-      ),
-    /must be within/
+    /workspace_root resolved to/
   );
 });
 
@@ -112,7 +116,7 @@ test("resolveBinaryOutputPolicy enforces strict output root requirements", () =>
   assert.throws(
     () =>
       resolveBinaryOutputPolicy(
-        { output_dir: "./work" },
+        { workspace_root: path.join(process.cwd(), "tmp", "repo"), output_dir: "./images" },
         { env: { WAYPOINT_MCP_STRICT_OUTPUT_ROOT: "true" } }
       ),
     /requires WAYPOINT_MCP_OUTPUT_ROOT/
@@ -121,7 +125,7 @@ test("resolveBinaryOutputPolicy enforces strict output root requirements", () =>
   assert.throws(
     () =>
       resolveBinaryOutputPolicy(
-        { output_dir: "./work" },
+        { workspace_root: path.join(process.cwd(), "tmp", "repo"), output_dir: "./images" },
         {
           env: {
             WAYPOINT_MCP_STRICT_OUTPUT_ROOT: "true",
@@ -131,20 +135,6 @@ test("resolveBinaryOutputPolicy enforces strict output root requirements", () =>
       ),
     /must be an absolute path/
   );
-});
-
-test("binary tool description template includes normative keywords", () => {
-  const template = MCP_TOOL_DESCRIPTION_TEMPLATE.binary;
-  assert.match(template, /\bMUST\b/);
-  assert.match(template, /\bMUST NOT\b/);
-  assert.match(template, /\bSHOULD\b/);
-});
-
-test("image-to-text tool description template includes normative keywords", () => {
-  const template = MCP_TOOL_DESCRIPTION_TEMPLATE.image_to_text;
-  assert.match(template, /\bMUST\b/);
-  assert.match(template, /\bMUST NOT\b/);
-  assert.match(template, /\bSHOULD\b/);
 });
 
 test("validateSingleImageInput enforces xor behavior", () => {

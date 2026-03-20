@@ -8,7 +8,15 @@ import { StoragePaths } from "../storage/files";
 import { selectPoolCandidates } from "../pools/scheduler";
 import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 import { normalizeMessagesForUpstream, scanMessageModalities } from "../utils/messageMedia";
-import { setCaptureDerivedRequest, setCaptureError, setCaptureResponseOverride, setCaptureRouting } from "../middleware/requestCapture";
+import {
+  appendCaptureStreamChunk,
+  setCaptureDerivedRequest,
+  setCaptureError,
+  setCaptureResponseOverride,
+  setCaptureRouting,
+  startCaptureStreamResponse,
+} from "../middleware/requestCapture";
+import { setStatsPayload } from "../middleware/requestStats";
 import { Transform } from "stream";
 
 interface ChatBody {
@@ -65,28 +73,24 @@ export async function registerChatRoutes(app: FastifyInstance, paths: StoragePat
       );
 
       if (body.stream) {
-        const streamCapture = await streamResponse(reply, outcome.attempt.response);
-        setCaptureResponseOverride(
-          reply,
-          {
-            $type: "stream",
-            contentType: streamCapture.contentType,
-            bytes: streamCapture.bytes,
-            text: streamCapture.text,
-          },
-          outcome.attempt.response.headers
-        );
         setCaptureRouting(reply, {
           publicModel: body.model,
           endpointId: outcome.attempt.endpoint.id,
           endpointName: outcome.attempt.endpoint.name,
           upstreamModel: outcome.attempt.upstreamModel,
         });
+        setStatsPayload(reply, {
+          endpointId: outcome.attempt.endpoint.id,
+          endpointName: outcome.attempt.endpoint.name,
+          upstreamModel: outcome.attempt.upstreamModel,
+        });
+        await streamResponse(reply, outcome.attempt.response);
         await logRequest(paths, buildLog(requestId, body, outcome, Date.now() - start));
         return;
       }
 
       const upstreamBody = await readBody(outcome.attempt.response);
+      setCaptureResponseOverride(reply, upstreamBody.payload, outcome.attempt.response.headers);
       setHeaders(reply, outcome.attempt.response.headers);
       reply.code(outcome.attempt.response.statusCode).send(upstreamBody.payload);
       setCaptureRouting(reply, {
@@ -94,6 +98,14 @@ export async function registerChatRoutes(app: FastifyInstance, paths: StoragePat
         endpointId: outcome.attempt.endpoint.id,
         endpointName: outcome.attempt.endpoint.name,
         upstreamModel: outcome.attempt.upstreamModel,
+      });
+      setStatsPayload(reply, {
+        endpointId: outcome.attempt.endpoint.id,
+        endpointName: outcome.attempt.endpoint.name,
+        upstreamModel: outcome.attempt.upstreamModel,
+        totalTokens: upstreamBody.totalTokens,
+        promptTokens: upstreamBody.promptTokens,
+        completionTokens: upstreamBody.completionTokens,
       });
       await logRequest(paths, buildLog(requestId, body, outcome, Date.now() - start, upstreamBody.totalTokens));
     } catch (error) {
@@ -169,12 +181,15 @@ async function streamResponse(
     headers["content-type"] = "text/event-stream";
   }
   headers["cache-control"] = headers["cache-control"] ?? "no-cache";
+  const contentType = headers["content-type"] ?? "application/octet-stream";
+  startCaptureStreamResponse(reply, headers, contentType);
 
   const chunks: Buffer[] = [];
   const captureTap = new Transform({
     transform(chunk, _enc, cb) {
       const asBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       chunks.push(asBuffer);
+      appendCaptureStreamChunk(reply, asBuffer, { contentType, headers });
       cb(null, chunk);
     },
   });
@@ -190,8 +205,17 @@ async function streamResponse(
     });
   });
   const buffer = Buffer.concat(chunks);
-  const contentType = headers["content-type"] ?? "application/octet-stream";
   const isText = contentType.includes("text/") || contentType.includes("json") || contentType.includes("event-stream");
+  setCaptureResponseOverride(
+    reply,
+    {
+      $type: "stream",
+      contentType,
+      bytes: buffer.byteLength,
+      text: isText ? buffer.toString("utf8") : undefined,
+    },
+    headers
+  );
   return {
     bytes: buffer.byteLength,
     text: isText ? buffer.toString("utf8") : undefined,
@@ -218,7 +242,14 @@ function normalizeHeaders(headers: Record<string, string | string[]>): Record<st
   return normalized;
 }
 
-async function readBody(response: { body: NodeJS.ReadableStream; headers: Record<string, string | string[]> }): Promise<{ payload: unknown; totalTokens: number | null }> {
+async function readBody(
+  response: { body: NodeJS.ReadableStream; headers: Record<string, string | string[]> }
+): Promise<{
+  payload: unknown;
+  totalTokens: number | null;
+  promptTokens: number | null;
+  completionTokens: number | null;
+}> {
   const chunks: Buffer[] = [];
   for await (const chunk of response.body) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -228,13 +259,20 @@ async function readBody(response: { body: NodeJS.ReadableStream; headers: Record
   if (contentType.includes("application/json")) {
     try {
       const payload = JSON.parse(buffer.toString("utf8"));
-      const usage = typeof payload === "object" && payload && (payload as { usage?: { total_tokens?: number } }).usage;
-      return { payload, totalTokens: usage?.total_tokens ?? null };
+      const usage = typeof payload === "object" && payload && (
+        payload as { usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number } }
+      ).usage;
+      return {
+        payload,
+        totalTokens: usage?.total_tokens ?? null,
+        promptTokens: usage?.prompt_tokens ?? null,
+        completionTokens: usage?.completion_tokens ?? null,
+      };
     } catch {
-      return { payload: buffer, totalTokens: null };
+      return { payload: buffer, totalTokens: null, promptTokens: null, completionTokens: null };
     }
   }
-  return { payload: buffer, totalTokens: null };
+  return { payload: buffer, totalTokens: null, promptTokens: null, completionTokens: null };
 }
 
 function buildLog(

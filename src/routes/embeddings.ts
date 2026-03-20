@@ -7,6 +7,7 @@ import { StoragePaths } from "../storage/files";
 import { selectPoolCandidates } from "../pools/scheduler";
 import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 import { setCaptureError, setCaptureRouting } from "../middleware/requestCapture";
+import { setStatsPayload } from "../middleware/requestStats";
 
 interface EmbeddingsBody {
   model: string;
@@ -74,6 +75,14 @@ export async function registerEmbeddingsRoutes(app: FastifyInstance, paths: Stor
         endpointName: outcome.attempt.endpoint.name,
         upstreamModel: outcome.attempt.upstreamModel,
       });
+      setStatsPayload(reply, {
+        endpointId: outcome.attempt.endpoint.id,
+        endpointName: outcome.attempt.endpoint.name,
+        upstreamModel: outcome.attempt.upstreamModel,
+        totalTokens: upstreamBody.totalTokens,
+        promptTokens: upstreamBody.promptTokens,
+        completionTokens: upstreamBody.completionTokens,
+      });
       await logRequest(paths, buildLog(requestId, body, outcome, Date.now() - start, upstreamBody.totalTokens));
     } catch (error) {
       const errorType = (error as { type?: string }).type ?? (error as Error).name;
@@ -129,7 +138,14 @@ function normalizeHeaders(headers: Record<string, string | string[]>): Record<st
   return normalized;
 }
 
-async function readBody(response: { body: NodeJS.ReadableStream; headers: Record<string, string | string[]> }): Promise<{ payload: unknown; totalTokens: number | null }> {
+async function readBody(
+  response: { body: NodeJS.ReadableStream; headers: Record<string, string | string[]> }
+): Promise<{
+  payload: unknown;
+  totalTokens: number | null;
+  promptTokens: number | null;
+  completionTokens: number | null;
+}> {
   const chunks: Buffer[] = [];
   for await (const chunk of response.body) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -139,13 +155,20 @@ async function readBody(response: { body: NodeJS.ReadableStream; headers: Record
   if (contentType.includes("application/json")) {
     try {
       const payload = JSON.parse(buffer.toString("utf8"));
-      const usage = typeof payload === "object" && payload && (payload as { usage?: { total_tokens?: number } }).usage;
-      return { payload, totalTokens: usage?.total_tokens ?? null };
+      const usage = typeof payload === "object" && payload && (
+        payload as { usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number } }
+      ).usage;
+      return {
+        payload,
+        totalTokens: usage?.total_tokens ?? null,
+        promptTokens: usage?.prompt_tokens ?? null,
+        completionTokens: usage?.completion_tokens ?? null,
+      };
     } catch {
-      return { payload: buffer, totalTokens: null };
+      return { payload: buffer, totalTokens: null, promptTokens: null, completionTokens: null };
     }
   }
-  return { payload: buffer, totalTokens: null };
+  return { payload: buffer, totalTokens: null, promptTokens: null, completionTokens: null };
 }
 
 function buildLog(

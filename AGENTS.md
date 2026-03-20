@@ -30,7 +30,7 @@ Change discipline:
 - UI changes affecting chat/call/image flows must add a targeted test or a manual verification checklist in PR notes.
 
 Default output path rule:
-- Tool outputs must write under the workspace (for example `./tmp/waypoint-images`).
+- Tool outputs must write under the workspace (default `./.waypoint/generated-images`).
 - Reject `output_path`/`output_dir` outside the workspace.
 
 Quick pointers (where to look first):

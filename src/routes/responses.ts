@@ -9,6 +9,7 @@ import { selectPoolCandidates } from "../pools/scheduler";
 import { pickBestProviderModelByCapabilities } from "../providers/modelRegistry";
 import { normalizeMessagesForUpstream, scanMessageModalities } from "../utils/messageMedia";
 import { setCaptureDerivedRequest, setCaptureError, setCaptureResponseOverride, setCaptureRouting } from "../middleware/requestCapture";
+import { setStatsPayload } from "../middleware/requestStats";
 
 /**
  * Responses API compatibility shim.
@@ -108,6 +109,11 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
           endpointName: outcome.attempt.endpoint.name,
           upstreamModel: outcome.attempt.upstreamModel,
         });
+        setStatsPayload(reply, {
+          endpointId: outcome.attempt.endpoint.id,
+          endpointName: outcome.attempt.endpoint.name,
+          upstreamModel: outcome.attempt.upstreamModel,
+        });
         await logRequest(paths, buildLog(
           requestId,
           body.model,
@@ -132,6 +138,14 @@ export async function registerResponsesRoutes(app: FastifyInstance, paths: Stora
         endpointId: outcome.attempt.endpoint.id,
         endpointName: outcome.attempt.endpoint.name,
         upstreamModel: outcome.attempt.upstreamModel,
+      });
+      setStatsPayload(reply, {
+        endpointId: outcome.attempt.endpoint.id,
+        endpointName: outcome.attempt.endpoint.name,
+        upstreamModel: outcome.attempt.upstreamModel,
+        totalTokens: upstreamBody.totalTokens,
+        promptTokens: upstreamBody.promptTokens,
+        completionTokens: upstreamBody.completionTokens,
       });
       
       await logRequest(paths, buildLog(
@@ -793,7 +807,14 @@ function normalizeHeaders(headers: Record<string, string | string[]>): Record<st
   return normalized;
 }
 
-async function readBody(response: { body: NodeJS.ReadableStream; headers: Record<string, string | string[]> }): Promise<{ payload: unknown; totalTokens: number | null }> {
+async function readBody(
+  response: { body: NodeJS.ReadableStream; headers: Record<string, string | string[]> }
+): Promise<{
+  payload: unknown;
+  totalTokens: number | null;
+  promptTokens: number | null;
+  completionTokens: number | null;
+}> {
   const chunks: Buffer[] = [];
   for await (const chunk of response.body) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -803,13 +824,20 @@ async function readBody(response: { body: NodeJS.ReadableStream; headers: Record
   if (contentType.includes("application/json")) {
     try {
       const payload = JSON.parse(buffer.toString("utf8"));
-      const usage = typeof payload === "object" && payload && (payload as { usage?: { total_tokens?: number } }).usage;
-      return { payload, totalTokens: usage?.total_tokens ?? null };
+      const usage = typeof payload === "object" && payload && (
+        payload as { usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number } }
+      ).usage;
+      return {
+        payload,
+        totalTokens: usage?.total_tokens ?? null,
+        promptTokens: usage?.prompt_tokens ?? null,
+        completionTokens: usage?.completion_tokens ?? null,
+      };
     } catch {
-      return { payload: buffer, totalTokens: null };
+      return { payload: buffer, totalTokens: null, promptTokens: null, completionTokens: null };
     }
   }
-  return { payload: buffer, totalTokens: null };
+  return { payload: buffer, totalTokens: null, promptTokens: null, completionTokens: null };
 }
 
 function buildLog(

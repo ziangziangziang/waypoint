@@ -20,6 +20,7 @@ import {
   type TokenUsage,
   type Provider,
 } from '@/api/client'
+import { buildDashboardTokenChartData, buildDashboardTokenMetadata } from './dashboardTokenUsage'
 import {
   BarChart,
   Bar,
@@ -28,8 +29,8 @@ import {
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
-  AreaChart,
-  Area,
+  ComposedChart,
+  Line,
 } from 'recharts'
 
 const MODEL_ROW_DEFAULT_LIMIT = 10
@@ -43,6 +44,9 @@ export function Dashboard() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [timeWindow, setTimeWindow] = useState('24h')
   const [showAllModels, setShowAllModels] = useState(false)
+  const browserTimeZone = typeof Intl !== 'undefined'
+    ? Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+    : 'UTC'
 
   const loadData = async () => {
     setIsLoading(true)
@@ -51,7 +55,7 @@ export function Dashboard() {
       const [statsData, latencyData, tokenData, providersData] = await Promise.all([
         getStats(timeWindow),
         getLatencyDistribution(timeWindow),
-        getTokenUsage(timeWindow),
+        getTokenUsage(timeWindow, { timeZone: browserTimeZone }),
         listProviderCatalog(),
       ])
       setStats(statsData)
@@ -86,7 +90,7 @@ export function Dashboard() {
       }))
     : []
 
-  const tokenChartData = tokenUsage?.byDay ?? []
+  const tokenChartData = buildDashboardTokenChartData(tokenUsage)
   const totalProviderModels = providers.reduce((sum, provider) => sum + provider.models.length, 0)
   const enabledProviderModels = providers.reduce(
     (sum, provider) => sum + provider.models.filter((model) => model.enabled !== false).length,
@@ -121,9 +125,12 @@ export function Dashboard() {
       return b.requests - a.requests
     })
 
-  const tokenEstimatedCount = tokenUsage?.tokenEstimatedCount ?? 0
-  const tokenEstimatedRate = tokenUsage?.tokenEstimatedRate ?? 0
-  const tokenGranularityLabel = tokenUsage?.bucketGranularity === 'hour' ? 'hourly' : 'daily'
+  const {
+    estimatedCount: tokenEstimatedCount,
+    estimatedRate: tokenEstimatedRate,
+    granularityLabel: tokenGranularityLabel,
+    timeZoneLabel: tokenTimeZoneLabel,
+  } = buildDashboardTokenMetadata(tokenUsage, browserTimeZone)
 
   return (
     <div className="flex-1 flex flex-col h-full min-h-0">
@@ -164,7 +171,7 @@ export function Dashboard() {
           </div>
         )}
 
-        <div className="grid grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <MetricCard label="Total Requests" value={stats?.total ?? 0} icon={Zap} loading={isLoading} />
           <MetricCard
             label="Avg Latency"
@@ -272,47 +279,60 @@ export function Dashboard() {
               <p className="text-2xs text-muted-foreground mb-4">
                 Estimated token entries: {tokenEstimatedCount.toLocaleString()} ({(tokenEstimatedRate * 100).toFixed(1)}%)
                 {' '}<span className="font-mono uppercase">{tokenGranularityLabel}</span>
+                {' '}<span className="font-mono uppercase">({tokenTimeZoneLabel})</span>
               </p>
 
               {tokenChartData.length > 0 ? (
                 <div className="h-48">
                   <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={tokenChartData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
-                      <defs>
-                        <linearGradient id="tokenGradient" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor="hsl(var(--primary))" stopOpacity={0.3} />
-                          <stop offset="95%" stopColor="hsl(var(--primary))" stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
+                    <ComposedChart data={tokenChartData} margin={{ top: 0, right: 6, left: -20, bottom: 0 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
                       <XAxis
                         dataKey="date"
                         tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }}
                         axisLine={{ stroke: 'hsl(var(--border))' }}
-                        tickFormatter={(value: string) =>
-                          value.includes('T') ? value.slice(11, 16) : value.slice(5)
-                        }
+                        tickFormatter={(value: string) => formatTokenBucketLabel(value)}
                       />
                       <YAxis
+                        yAxisId="requests"
+                        tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }}
+                        axisLine={{ stroke: 'hsl(var(--border))' }}
+                        allowDecimals={false}
+                      />
+                      <YAxis
+                        yAxisId="tokens"
+                        orientation="right"
                         tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }}
                         axisLine={{ stroke: 'hsl(var(--border))' }}
                       />
                       <Tooltip
-                        contentStyle={{
-                          background: 'hsl(var(--background))',
-                          border: '1px solid hsl(var(--border))',
-                          borderRadius: '4px',
-                          fontSize: '12px',
+                        labelFormatter={(value) => formatTokenBucketTooltip(String(value), tokenTimeZoneLabel)}
+                        content={({ active, label, payload }) => {
+                          if (!active || !payload || payload.length === 0) return null
+                          const row = payload[0]?.payload as
+                            | { count?: number; tokens?: number; estimated?: number }
+                            | undefined
+                          return (
+                            <div
+                              style={{
+                                background: 'hsl(var(--background))',
+                                border: '1px solid hsl(var(--border))',
+                                borderRadius: '4px',
+                                fontSize: '12px',
+                                padding: '8px',
+                              }}
+                            >
+                              <div className="mb-1 font-mono">{formatTokenBucketTooltip(String(label), tokenTimeZoneLabel)}</div>
+                              <div>Requests: {(row?.count ?? 0).toLocaleString()}</div>
+                              <div>Total tokens: {(row?.tokens ?? 0).toLocaleString()}</div>
+                              <div>Estimated entries: {(row?.estimated ?? 0).toLocaleString()}</div>
+                            </div>
+                          )
                         }}
                       />
-                      <Area
-                        type="monotone"
-                        dataKey="tokens"
-                        stroke="hsl(var(--primary))"
-                        fillOpacity={1}
-                        fill="url(#tokenGradient)"
-                      />
-                    </AreaChart>
+                      <Bar yAxisId="requests" dataKey="count" name="Requests" fill="hsl(var(--muted))" radius={[2, 2, 0, 0]} />
+                      <Line yAxisId="tokens" type="monotone" dataKey="tokens" name="Total tokens" stroke="hsl(var(--primary))" dot={false} strokeWidth={2} />
+                    </ComposedChart>
                   </ResponsiveContainer>
                 </div>
               ) : (
@@ -474,6 +494,15 @@ export function Dashboard() {
       </div>
     </div>
   )
+}
+
+function formatTokenBucketLabel(value: string): string {
+  return value.includes('T') ? value.slice(11, 16) : value.slice(5)
+}
+
+function formatTokenBucketTooltip(value: string, timeZone: string): string {
+  const label = value.includes('T') ? `${value.replace('T', ' ')}` : value
+  return `${label} (${timeZone})`
 }
 
 interface MetricCardProps {

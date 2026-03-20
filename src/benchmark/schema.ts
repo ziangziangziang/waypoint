@@ -11,9 +11,17 @@ import {
 const SCENARIO_KEYS = new Set([
   "id",
   "mode",
+  "title",
+  "summary",
+  "userVisibleGoal",
+  "exampleSource",
+  "inputPreview",
+  "successCriteria",
+  "expectedHighlights",
   "capability",
   "model",
   "timeoutMs",
+  "requiresAvailableTools",
   "assertions",
   "prompt",
   "tools",
@@ -32,6 +40,7 @@ const SCENARIO_KEYS = new Set([
 const ASSERTION_KEYS = new Set([
   "contains",
   "notContains",
+  "requiredToolNames",
   "minToolCalls",
   "maxToolCalls",
   "maxLatencyMs",
@@ -99,11 +108,25 @@ function validateScenario(
     assertions,
   };
 
+  scenario.title = optionalString(input.title, `${ctx}.title`);
+  scenario.summary = optionalString(input.summary, `${ctx}.summary`);
+  scenario.userVisibleGoal = optionalString(input.userVisibleGoal, `${ctx}.userVisibleGoal`);
+  scenario.exampleSource = optionalExampleSource(input.exampleSource, `${ctx}.exampleSource`);
+  scenario.inputPreview = optionalString(input.inputPreview, `${ctx}.inputPreview`);
+  scenario.successCriteria = optionalString(input.successCriteria, `${ctx}.successCriteria`);
+  scenario.expectedHighlights = optionalStringArray(
+    input.expectedHighlights,
+    `${ctx}.expectedHighlights`
+  );
   scenario.prompt = optionalString(input.prompt, `${ctx}.prompt`);
   scenario.tools = optionalStringArray(input.tools, `${ctx}.tools`);
   scenario.maxIterations = optionalInteger(input.maxIterations, `${ctx}.maxIterations`, 1, 20);
   scenario.temperature = optionalFiniteNumber(input.temperature, `${ctx}.temperature`);
   scenario.max_tokens = optionalInteger(input.max_tokens, `${ctx}.max_tokens`, 1);
+  scenario.requiresAvailableTools = optionalBoolean(
+    input.requiresAvailableTools,
+    `${ctx}.requiresAvailableTools`
+  );
   scenario.input = optionalInputValue(input.input, `${ctx}.input`);
   scenario.n = optionalInteger(input.n, `${ctx}.n`, 1);
   scenario.size = optionalString(input.size, `${ctx}.size`);
@@ -118,7 +141,12 @@ function validateScenario(
 }
 
 function validateScenarioByMode(scenario: BenchmarkScenario, ctx: string): void {
-  if (scenario.mode === "chat" || scenario.mode === "agent" || scenario.mode === "image_generation") {
+  if (
+    scenario.mode === "chat" ||
+    scenario.mode === "agent" ||
+    scenario.mode === "responses" ||
+    scenario.mode === "image_generation"
+  ) {
     if (!scenario.prompt) {
       throw new Error(`${ctx}.prompt: required for mode '${scenario.mode}'.`);
     }
@@ -174,6 +202,10 @@ function validateAssertions(
 
   const contains = optionalStringArray(input.contains, `${field}.contains`);
   const notContains = optionalStringArray(input.notContains, `${field}.notContains`);
+  const requiredToolNames = optionalStringArray(
+    input.requiredToolNames,
+    `${field}.requiredToolNames`
+  );
   const minToolCalls = optionalInteger(input.minToolCalls, `${field}.minToolCalls`, 0);
   const maxToolCalls = optionalInteger(input.maxToolCalls, `${field}.maxToolCalls`, 0);
   const maxLatencyMs = optionalInteger(input.maxLatencyMs, `${field}.maxLatencyMs`, 1);
@@ -197,6 +229,7 @@ function validateAssertions(
   return {
     contains,
     notContains,
+    requiredToolNames,
     minToolCalls,
     maxToolCalls,
     maxLatencyMs,
@@ -209,6 +242,30 @@ function validateAssertions(
     minBytes,
     contentType,
   };
+}
+
+function optionalExampleSource(
+  value: unknown,
+  field: string
+): BenchmarkScenario["exampleSource"] | undefined {
+  const parsed = optionalString(value, field);
+  if (!parsed) {
+    return undefined;
+  }
+  if (parsed !== "opencode" && parsed !== "builtin" && parsed !== "file") {
+    throw new Error(`${field}: expected 'opencode', 'builtin', or 'file'.`);
+  }
+  return parsed;
+}
+
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "boolean") {
+    throw new Error(`${field}: expected boolean.`);
+  }
+  return value;
 }
 
 function validateMode(value: unknown, field: string): BenchmarkMode {

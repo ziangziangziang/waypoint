@@ -6,6 +6,7 @@ import {
   BenchmarkCliOptions,
   BenchmarkConfigFile,
   BenchmarkDefaults,
+  BenchmarkExecutionMode,
   BenchmarkGateConfig,
   BenchmarkProfileSettings,
   EffectiveBenchmarkConfig,
@@ -20,7 +21,6 @@ const DEFAULTS: BenchmarkDefaults = {
   maxIterations: 6,
   temperature: 0,
   max_tokens: 512,
-  concurrency: 1,
 };
 
 const DEFAULT_PROFILES: Record<string, BenchmarkProfileSettings> = {
@@ -95,11 +95,14 @@ export async function resolveBenchmarkConfig(
     profileSettings: validateProfileSettings(profileSettings, selectedProfile),
     gates: validateGates(mergedGates),
     run: {
-      suite: cli.suite ?? fileConfig?.run?.suite ?? "smoke",
+      suite: cli.suite ?? fileConfig?.run?.suite ?? "showcase",
+      exampleId: cli.exampleId ?? fileConfig?.run?.exampleId,
       scenarioPath: cli.scenarioPath ?? fileConfig?.run?.scenarioPath,
       modelOverride: cli.modelOverride ?? fileConfig?.run?.model,
       outPath: cli.outPath ?? fileConfig?.run?.outPath,
       baselinePath: cli.baselinePath ?? fileConfig?.run?.baselinePath,
+      executionMode: resolveExecutionMode(cli, fileConfig),
+      listExamples: cli.listExamples ?? fileConfig?.run?.listExamples ?? false,
       updateCapCache: cli.updateCapCache ?? fileConfig?.run?.updateCapCache ?? false,
       capTtlDays: intField(
         cli.capTtlDays ?? fileConfig?.run?.capTtlDays ?? DEFAULT_CAP_TTL_DAYS,
@@ -158,8 +161,19 @@ function validateDefaults(defaults: BenchmarkDefaults): BenchmarkDefaults {
     maxIterations: intField(defaults.maxIterations, "defaults.maxIterations", 1),
     temperature: numberField(defaults.temperature, "defaults.temperature"),
     max_tokens: intField(defaults.max_tokens, "defaults.max_tokens", 1),
-    concurrency: intField(defaults.concurrency, "defaults.concurrency", 1),
   };
+}
+
+function resolveExecutionMode(
+  cli: BenchmarkCliOptions,
+  fileConfig?: BenchmarkConfigFile
+): BenchmarkExecutionMode {
+  const explicit = cli.executionMode ?? fileConfig?.run?.executionMode;
+  if (explicit === "showcase" || explicit === "diagnostic") {
+    return explicit;
+  }
+  const suite = cli.suite ?? fileConfig?.run?.suite ?? "showcase";
+  return suite === "showcase" ? "showcase" : "diagnostic";
 }
 
 function validateProfileSettings(

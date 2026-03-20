@@ -1,17 +1,24 @@
 import { Agent, request } from "undici";
 import { ModelCapabilities, ModelMapping, ModelModality } from "../types";
+import { ProviderAuthConfig } from "../providers/types";
 
 export interface EndpointInfo {
   baseUrl: string;
   apiKey?: string;
   insecureTls: boolean;
+  auth?: ProviderAuthConfig;
 }
 
 export async function resolveModelMappings(
   endpoint: EndpointInfo,
   mappings: ModelMapping[]
 ): Promise<ModelMapping[]> {
-  const models = await fetchModelList(endpoint);
+  let models: UpstreamModelInfo[] | null = null;
+  try {
+    models = await discoverUpstreamModels(endpoint);
+  } catch {
+    models = null;
+  }
   if (!models || models.length === 0) {
     return mappings;
   }
@@ -67,48 +74,77 @@ interface UpstreamModelInfo {
   capabilities?: ModelCapabilities;
 }
 
-async function fetchModelList(endpoint: EndpointInfo): Promise<UpstreamModelInfo[] | null> {
+export async function discoverUpstreamModels(endpoint: EndpointInfo): Promise<UpstreamModelInfo[]> {
   const dispatcher = endpoint.insecureTls
     ? new Agent({ connect: { rejectUnauthorized: false } })
     : undefined;
-  const headers: Record<string, string> = {};
-  if (endpoint.apiKey) {
-    headers.authorization = `Bearer ${endpoint.apiKey}`;
+  const { url, headers } = buildDiscoveryRequest(endpoint);
+  const response = await request(url, {
+    method: "GET",
+    headersTimeout: 3000,
+    bodyTimeout: 3000,
+    dispatcher,
+    headers,
+  });
+  const body = (await readJson(response.body)) as {
+    data?: Array<{
+      id?: string;
+      input_modalities?: string[];
+      output_modalities?: string[];
+      capabilities?: { input?: string[]; output?: string[]; supportsTools?: boolean; supportsStreaming?: boolean };
+    }>;
+  } | null;
+  response.body.resume();
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`model discovery failed with status ${response.statusCode}`);
   }
-  try {
-    const response = await request(new URL("/v1/models", endpoint.baseUrl).toString(), {
-      method: "GET",
-      headersTimeout: 3000,
-      bodyTimeout: 3000,
-      dispatcher,
-      headers
-    });
-    const body = (await readJson(response.body)) as {
-      data?: Array<{
-        id?: string;
-        input_modalities?: string[];
-        output_modalities?: string[];
-        capabilities?: { input?: string[]; output?: string[]; supportsTools?: boolean; supportsStreaming?: boolean };
-      }>;
-    } | null;
-    response.body.resume();
-    const list = Array.isArray(body?.data) ? body.data : [];
-    const models: UpstreamModelInfo[] = [];
-    for (const item of list) {
-      if (!item.id) {
-        continue;
-      }
-      const modelInfo: UpstreamModelInfo = { id: item.id };
-      const capabilities = extractCapabilities(item);
-      if (capabilities) {
-        modelInfo.capabilities = capabilities;
-      }
-      models.push(modelInfo);
+  const list = Array.isArray(body?.data) ? body.data : [];
+  const models: UpstreamModelInfo[] = [];
+  for (const item of list) {
+    if (!item.id) {
+      continue;
     }
-    return models;
-  } catch {
-    return null;
+    const modelInfo: UpstreamModelInfo = { id: item.id };
+    const capabilities = extractCapabilities(item);
+    if (capabilities) {
+      modelInfo.capabilities = capabilities;
+    }
+    models.push(modelInfo);
   }
+  return models;
+}
+
+function buildDiscoveryRequest(endpoint: EndpointInfo): { url: string; headers: Record<string, string> } {
+  const authType = endpoint.auth?.type ?? "bearer";
+  const headers: Record<string, string> = {};
+  const url = new URL(buildModelListUrl(endpoint.baseUrl));
+  const apiKey = endpoint.apiKey?.trim();
+
+  if (apiKey && authType === "query") {
+    const keyParam = endpoint.auth?.keyParam?.trim() || "api_key";
+    url.searchParams.set(keyParam, apiKey);
+  } else if (apiKey && authType === "header") {
+    const headerName = endpoint.auth?.headerName?.trim() || endpoint.auth?.keyParam?.trim() || "x-api-key";
+    const prefix = endpoint.auth?.keyPrefix?.trim();
+    headers[headerName] = prefix ? `${prefix} ${apiKey}` : apiKey;
+  } else if (apiKey && authType !== "none") {
+    headers.authorization = `Bearer ${apiKey}`;
+  }
+
+  return { url: url.toString(), headers };
+}
+
+function buildModelListUrl(baseUrl: string): string {
+  const parsed = new URL(baseUrl);
+  const pathname = parsed.pathname.replace(/\/+$/, "");
+  if (!pathname) {
+    parsed.pathname = "/v1/models";
+  } else if (pathname.endsWith("/v1")) {
+    parsed.pathname = `${pathname}/models`;
+  } else {
+    parsed.pathname = `${pathname}/v1/models`;
+  }
+  return parsed.toString();
 }
 
 function extractCapabilities(item: {

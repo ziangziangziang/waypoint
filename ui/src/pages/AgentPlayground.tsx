@@ -41,11 +41,17 @@ import {
   toApiMessage,
 } from './agentPlaygroundPayload'
 import {
+  applyAutoTitleToSessions,
+  createDeferredAutoTitleCandidate,
+  flushDeferredAutoTitle,
+} from './sessionAutoTitle'
+import {
   applyThinkingChunk,
   createThinkingStreamState,
   toDisplayContent,
   toFinalContent,
 } from './agentThinkingContent'
+import { compressImageFileForUpload, fileToDataUrl } from './imageUpload'
 
 // Content can be a string or array of content parts (multimodal)
 type ContentPart = 
@@ -122,45 +128,6 @@ function firstSelectableModelId(models: Model[]): string {
 
 // Maximum tool iterations per user message to prevent infinite loops
 const MAX_TOOL_ITERATIONS = 10
-const MAX_IMAGE_PIXELS = 1080 * 720 - 1
-
-async function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onerror = () => reject(reader.error)
-    reader.onload = () => resolve(reader.result as string)
-    reader.readAsDataURL(file)
-  })
-}
-
-async function compressImageFile(file: File): Promise<string> {
-  const objectUrl = URL.createObjectURL(file)
-  try {
-    const image = new Image()
-    image.src = objectUrl
-    await image.decode()
-    const area = image.width * image.height
-    if (area <= MAX_IMAGE_PIXELS) {
-      return await fileToDataUrl(file)
-    }
-
-    const scale = Math.sqrt(MAX_IMAGE_PIXELS / area)
-    const targetWidth = Math.max(1, Math.floor(image.width * scale))
-    const targetHeight = Math.max(1, Math.floor(image.height * scale))
-    const canvas = document.createElement('canvas')
-    canvas.width = targetWidth
-    canvas.height = targetHeight
-    const context = canvas.getContext('2d')
-    if (!context) {
-      return await fileToDataUrl(file)
-    }
-    context.drawImage(image, 0, 0, targetWidth, targetHeight)
-    const mimeType = file.type === 'image/jpeg' || file.type === 'image/png' ? file.type : 'image/png'
-    return canvas.toDataURL(mimeType, mimeType === 'image/jpeg' ? 0.9 : undefined)
-  } finally {
-    URL.revokeObjectURL(objectUrl)
-  }
-}
 
 export function AgentPlayground() {
   // Session state
@@ -168,6 +135,7 @@ export function AgentPlayground() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [activeSessionStorageVersion, setActiveSessionStorageVersion] = useState<number>(2)
   const [sessionName, setSessionName] = useState('')
+  const [titleGenerationSessionId, setTitleGenerationSessionId] = useState<string | null>(null)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   
   // Chat state
@@ -224,6 +192,7 @@ export function AgentPlayground() {
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const recordingTimerRef = useRef<number | null>(null)
   const callAudioRef = useRef<HTMLAudioElement | null>(null)
+  const pendingAutoTitleRef = useRef<{ sessionId: string; seedText: string } | null>(null)
 
   // Load models on mount
   useEffect(() => {
@@ -332,6 +301,7 @@ export function AgentPlayground() {
       setActiveSessionId(session.id)
       setActiveSessionStorageVersion(session.storageVersion ?? 2)
       setSessionName(session.name)
+      pendingAutoTitleRef.current = null
       setMessages([])
     } catch (error) {
       console.error('Failed to create session:', error)
@@ -343,11 +313,15 @@ export function AgentPlayground() {
     try {
       await deleteSession(sessionId)
       setSessions(prev => prev.filter(s => s.id !== sessionId))
+      if (titleGenerationSessionId === sessionId) {
+        setTitleGenerationSessionId(null)
+      }
       if (activeSessionId === sessionId) {
         setActiveSessionId(null)
         setActiveSessionStorageVersion(2)
         setMessages([])
         setSessionName('')
+        pendingAutoTitleRef.current = null
       }
     } catch (error) {
       console.error('Failed to delete session:', error)
@@ -359,7 +333,7 @@ export function AgentPlayground() {
     Array.from(files).forEach(async (file) => {
       if (!file.type.startsWith('image/')) return
       try {
-        const base64 = await compressImageFile(file)
+        const base64 = await compressImageFileForUpload(file)
         setPendingImages(prev => [...prev, base64])
       } catch (error) {
         console.warn('Failed to compress image, using raw data URL:', error)
@@ -818,30 +792,28 @@ export function AgentPlayground() {
     return undefined
   }
 
-  const maybeAutoTitleSession = async (seedText: string): Promise<void> => {
-    if (!activeSessionId) return
-    const trimmed = seedText.trim()
-    if (!trimmed) return
-    const defaultNamePattern = /^Session\s+\d{1,2}\/\d{1,2}\/\d{2,4}$/
-    if (!defaultNamePattern.test(sessionName)) {
-      return
-    }
-    try {
-      const response = await autoTitleSession(activeSessionId, {
-        model: selectedModel,
-        seedText: trimmed,
-      })
-      setSessionName(response.name)
-      setSessions((prev) =>
-        prev.map((item) =>
-          item.id === activeSessionId
-            ? { ...item, name: response.name, titleStatus: response.titleStatus, titleUpdatedAt: response.titleUpdatedAt }
-            : item
-        )
-      )
-    } catch (error) {
-      console.warn('Auto-title skipped:', error)
-    }
+  const maybeAutoTitleSession = async (sessionId: string): Promise<void> => {
+    await flushDeferredAutoTitle({
+      sessionId,
+      sessionName,
+      model: selectedModel,
+      queuedCandidate: pendingAutoTitleRef.current,
+      generatingSessionId: titleGenerationSessionId,
+      autoTitleSession,
+      onGenerationChange: setTitleGenerationSessionId,
+      onResolved: (response) => {
+        setSessionName((current) => (current === sessionName ? response.name : current))
+        setSessions((prev) => applyAutoTitleToSessions(prev, sessionId, response))
+      },
+      clearQueuedCandidate: () => {
+        if (pendingAutoTitleRef.current?.sessionId === sessionId) {
+          pendingAutoTitleRef.current = null
+        }
+      },
+      onError: (error) => {
+        console.warn('Auto-title skipped:', error)
+      },
+    })
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -921,8 +893,9 @@ export function AgentPlayground() {
           timestamp: userMessage.createdAt.toISOString(),
         })
         const textForTitle = getTextContent(userMessage.content)
-        if (textForTitle) {
-          void maybeAutoTitleSession(textForTitle)
+        const autoTitleCandidate = createDeferredAutoTitleCandidate(activeSessionId, sessionName, textForTitle)
+        if (autoTitleCandidate) {
+          pendingAutoTitleRef.current = autoTitleCandidate
         }
       } catch (error) {
         console.error('Failed to save user message:', error)
@@ -1016,6 +989,7 @@ export function AgentPlayground() {
             content: assistantContent.length > 0 ? assistantContent : assistantText || '',
             timestamp: new Date().toISOString(),
           })
+          await maybeAutoTitleSession(activeSessionId)
         }
       } else if (selectedModelSupportsImageOutput()) {
         // Image generation mode
@@ -1075,6 +1049,7 @@ export function AgentPlayground() {
               content: imageContent,
               timestamp: new Date().toISOString(),
             })
+            await maybeAutoTitleSession(activeSessionId)
           } catch (error) {
             console.error('Failed to save assistant message:', error)
           }
@@ -1085,6 +1060,9 @@ export function AgentPlayground() {
           [...messages, userMessage, assistantMessage],
           assistantMessage.id
         )
+        if (activeSessionId) {
+          await maybeAutoTitleSession(activeSessionId)
+        }
       } else {
         // Regular chat (LLM, embedding, audio handled as chat for now)
         abortControllerRef.current = new AbortController()
@@ -1125,6 +1103,7 @@ export function AgentPlayground() {
               content: finalContent,
               timestamp: new Date().toISOString(),
             })
+            await maybeAutoTitleSession(activeSessionId)
           } catch (error) {
             console.error('Failed to save assistant message:', error)
           }
@@ -1215,7 +1194,7 @@ export function AgentPlayground() {
                   <div className="flex-1 min-w-0">
                     <p className="text-sm truncate">{session.name}</p>
                     <p className="text-2xs text-muted-foreground">
-                      {session.messageCount} messages
+                      {titleGenerationSessionId === session.id ? 'Generating title...' : `${session.messageCount} messages`}
                     </p>
                   </div>
                   <Button
@@ -1251,6 +1230,11 @@ export function AgentPlayground() {
             <h2 className="font-mono font-semibold text-sm uppercase tracking-wider">
               {sessionName || 'Playground'}
             </h2>
+            {titleGenerationSessionId === activeSessionId && (
+              <span className="text-2xs font-mono uppercase tracking-wider text-muted-foreground">
+                Generating title...
+              </span>
+            )}
           </div>
           
           {/* Agent Mode Toggle */}

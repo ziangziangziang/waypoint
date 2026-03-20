@@ -12,6 +12,7 @@ import { StoragePaths } from "../storage/files";
 
 interface StatsQuery {
   window?: string; // e.g., "1h", "24h", "7d"
+  timeZone?: string;
 }
 
 export async function registerStatsRoutes(
@@ -140,6 +141,7 @@ export async function registerStatsRoutes(
   // GET /admin/stats/tokens - token usage over time
   app.get("/admin/stats/tokens", async (req: FastifyRequest<{ Querystring: StatsQuery }>, reply: FastifyReply) => {
     const windowMs = parseWindow(req.query.window ?? "7d");
+    const timeZone = normalizeTimeZone(req.query.timeZone);
 
     if (windowMs === null) {
       reply.code(400).send({ error: { message: "Invalid window format" } });
@@ -149,13 +151,30 @@ export async function registerStatsRoutes(
     try {
       const stats = await selectStatsForWindow(paths, windowMs);
       const bucketGranularity = windowMs <= 24 * 60 * 60 * 1000 ? "hour" : "day";
-      const byDay: Record<string, { count: number; tokens: number; estimated: number }> = {};
+      const byDay: Record<string, {
+        count: number;
+        tokens: number;
+        estimated: number;
+        inputTokens: number;
+        outputTokens: number;
+        splitUnknown: number;
+      }> = {};
       let tokenEstimatedCount = 0;
+      let splitUnknownCount = 0;
+      let totalInputTokens = 0;
+      let totalOutputTokens = 0;
 
       for (const stat of stats) {
-        const bucket = formatTokenBucket(stat.timestamp, bucketGranularity);
+        const bucket = formatTokenBucket(stat.timestamp, bucketGranularity, timeZone);
         if (!byDay[bucket]) {
-          byDay[bucket] = { count: 0, tokens: 0, estimated: 0 };
+          byDay[bucket] = {
+            count: 0,
+            tokens: 0,
+            estimated: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            splitUnknown: 0,
+          };
         }
         byDay[bucket].count++;
         if (stat.totalTokens !== null && stat.totalTokens !== undefined) {
@@ -163,6 +182,23 @@ export async function registerStatsRoutes(
         } else {
           byDay[bucket].estimated++;
           tokenEstimatedCount += 1;
+        }
+
+        const promptTokens = stat.promptTokens;
+        const completionTokens = stat.completionTokens;
+        const hasSplit =
+          promptTokens !== null &&
+          promptTokens !== undefined &&
+          completionTokens !== null &&
+          completionTokens !== undefined;
+        if (hasSplit) {
+          byDay[bucket].inputTokens += promptTokens;
+          byDay[bucket].outputTokens += completionTokens;
+          totalInputTokens += promptTokens;
+          totalOutputTokens += completionTokens;
+        } else {
+          byDay[bucket].splitUnknown++;
+          splitUnknownCount += 1;
         }
       }
 
@@ -175,12 +211,17 @@ export async function registerStatsRoutes(
       reply.send({
         window: formatWindowString(windowMs),
         totalTokens,
+        totalInputTokens,
+        totalOutputTokens,
         totalRequests: stats.length,
         avgTokensPerRequest: stats.length > 0 ? Math.round(totalTokens / stats.length) : 0,
         byDay: days,
         tokenEstimatedCount,
         tokenEstimatedRate: stats.length > 0 ? tokenEstimatedCount / stats.length : 0,
-        bucketGranularity
+        splitUnknownCount,
+        splitUnknownRate: stats.length > 0 ? splitUnknownCount / stats.length : 0,
+        bucketGranularity,
+        bucketTimeZone: timeZone,
       });
     } catch (error) {
       app.log.error({ error }, "Failed to compute token usage");
@@ -229,9 +270,36 @@ function formatWindowString(ms: number): string {
   return `${Math.round(hours / 24)}d`;
 }
 
-function formatTokenBucket(timestamp: Date, granularity: "hour" | "day"): string {
+function formatTokenBucket(timestamp: Date, granularity: "hour" | "day", timeZone: string): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    ...(granularity === "hour"
+      ? {
+          hour: "2-digit",
+          hourCycle: "h23" as const,
+        }
+      : {}),
+  });
+  const parts = formatter.formatToParts(timestamp);
+  const year = parts.find((part) => part.type === "year")?.value ?? "0000";
+  const month = parts.find((part) => part.type === "month")?.value ?? "00";
+  const day = parts.find((part) => part.type === "day")?.value ?? "00";
   if (granularity === "day") {
-    return timestamp.toISOString().slice(0, 10);
+    return `${year}-${month}-${day}`;
   }
-  return `${timestamp.toISOString().slice(0, 13)}:00`;
+  const hour = parts.find((part) => part.type === "hour")?.value ?? "00";
+  return `${year}-${month}-${day}T${hour}:00`;
+}
+
+function normalizeTimeZone(input: string | undefined): string {
+  if (!input) return "UTC";
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: input });
+    return input;
+  } catch {
+    return "UTC";
+  }
 }

@@ -15,6 +15,14 @@ interface CaptureContext {
   error?: { type?: string; message?: string };
 }
 
+interface CaptureStreamBody {
+  $type: "stream";
+  contentType: string;
+  bytes: number;
+  text?: string;
+  note?: string;
+}
+
 const captureContexts = new WeakMap<FastifyRequest, CaptureContext>();
 
 interface ReplyCaptureMeta {
@@ -105,10 +113,18 @@ export async function registerRequestCaptureMiddleware(
 
 export function setCaptureRouting(reply: FastifyReply, routing: CaptureRoutingInfo): void {
   meta(reply).captureRouting = routing;
+  const context = captureContexts.get(reply.request);
+  if (context?.enabled) {
+    context.routing = routing;
+  }
 }
 
 export function setCaptureDerivedRequest(reply: FastifyReply, payload: Record<string, unknown>): void {
   meta(reply).captureDerivedRequest = payload;
+  const context = captureContexts.get(reply.request);
+  if (context?.enabled) {
+    context.derivedRequest = payload;
+  }
 }
 
 export function setCaptureResponseOverride(
@@ -117,10 +133,63 @@ export function setCaptureResponseOverride(
   headers?: Record<string, string | string[] | undefined>
 ): void {
   meta(reply).captureResponseOverride = { body, headers };
+  const context = captureContexts.get(reply.request);
+  if (context?.enabled) {
+    context.responseBody = body;
+    if (headers) {
+      context.responseHeaders = headers;
+    }
+  }
 }
 
 export function setCaptureError(reply: FastifyReply, error: { type?: string; message?: string }): void {
   meta(reply).captureError = error;
+  const context = captureContexts.get(reply.request);
+  if (context?.enabled) {
+    context.error = error;
+  }
+}
+
+export function startCaptureStreamResponse(
+  reply: FastifyReply,
+  headers: Record<string, string | string[] | undefined>,
+  contentType: string,
+  note?: string
+): void {
+  const body: CaptureStreamBody = {
+    $type: "stream",
+    contentType,
+    bytes: 0,
+  };
+  if (note) {
+    body.note = note;
+  }
+  setCaptureResponseOverride(reply, body, headers);
+}
+
+export function appendCaptureStreamChunk(
+  reply: FastifyReply,
+  chunk: Buffer,
+  options?: {
+    contentType?: string;
+    headers?: Record<string, string | string[] | undefined>;
+  }
+): void {
+  const context = captureContexts.get(reply.request);
+  if (!context?.enabled) return;
+  const body = ensureCaptureStreamBody(context, options?.contentType);
+  body.bytes += chunk.byteLength;
+  if (isTextLikeStream(body.contentType)) {
+    body.text = (body.text ?? "") + chunk.toString("utf8");
+  }
+  context.responseBody = body;
+  if (options?.headers) {
+    context.responseHeaders = options.headers;
+  }
+  meta(reply).captureResponseOverride = {
+    body,
+    headers: context.responseHeaders,
+  };
 }
 
 function safeClone<T>(value: T): T {
@@ -146,3 +215,31 @@ function payloadToBody(payload: unknown): unknown {
   return payload;
 }
 
+function ensureCaptureStreamBody(
+  context: CaptureContext,
+  contentType?: string
+): CaptureStreamBody {
+  const existing = context.responseBody as CaptureStreamBody | undefined;
+  if (existing?.$type === "stream") {
+    if (contentType) {
+      existing.contentType = contentType;
+    }
+    return existing;
+  }
+  const body: CaptureStreamBody = {
+    $type: "stream",
+    contentType: contentType ?? "application/octet-stream",
+    bytes: 0,
+  };
+  context.responseBody = body;
+  return body;
+}
+
+function isTextLikeStream(contentType: string): boolean {
+  return (
+    contentType.includes("text/") ||
+    contentType.includes("json") ||
+    contentType.includes("xml") ||
+    contentType.includes("event-stream")
+  );
+}

@@ -29,15 +29,31 @@ export interface ImageAnalysis {
   safety_notes: string[];
 }
 
+export interface ImageGeometry {
+  original_width: number;
+  original_height: number;
+  uploaded_width: number;
+  uploaded_height: number;
+  scale_x: number;
+  scale_y: number;
+  resized: boolean;
+}
+
 export interface ImageUnderstandingResult {
   model: string;
   analysis: ImageAnalysis;
   raw_text: string;
+  image_geometry?: ImageGeometry;
   usage: {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
   };
+}
+
+interface ResolvedImageInput {
+  imageUrl: string;
+  imageGeometry?: ImageGeometry;
 }
 
 export async function runImageUnderstanding(
@@ -50,21 +66,27 @@ export async function runImageUnderstanding(
     throw typedError("no_vision_model", "No vision-capable text model available.");
   }
 
-  const imageUrl = await resolveImageInputToUrl(input);
+  const resolvedImage = await resolveImageInput(input);
   const instruction = input.instruction?.trim() ? input.instruction : DEFAULT_INSTRUCTION;
+  const messages: Array<Record<string, unknown>> = [];
+  if (resolvedImage.imageGeometry) {
+    messages.push({
+      role: "system",
+      content: buildImageGeometrySystemMessage(resolvedImage.imageGeometry),
+    });
+  }
+  messages.push({
+    role: "user",
+    content: [
+      { type: "image_url", image_url: { url: resolvedImage.imageUrl } },
+      { type: "text", text: instruction },
+    ],
+  });
 
   const payload: Record<string, unknown> = {
     model,
     stream: false,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: imageUrl } },
-          { type: "text", text: instruction },
-        ],
-      },
-    ],
+    messages,
   };
   if (typeof input.max_tokens === "number") {
     payload.max_tokens = input.max_tokens;
@@ -92,6 +114,7 @@ export async function runImageUnderstanding(
     model,
     analysis,
     raw_text: rawText,
+    image_geometry: resolvedImage.imageGeometry,
     usage: {
       prompt_tokens: responsePayload.usage?.prompt_tokens ?? 0,
       completion_tokens: responsePayload.usage?.completion_tokens ?? 0,
@@ -101,11 +124,16 @@ export async function runImageUnderstanding(
 }
 
 export async function resolveImageInputToUrl(input: ImageUnderstandingRequest): Promise<string> {
+  const resolved = await resolveImageInput(input);
+  return resolved.imageUrl;
+}
+
+export async function resolveImageInput(input: ImageUnderstandingRequest): Promise<ResolvedImageInput> {
   if (input.image_path) {
-    return imageDataUrlFromPath(input.image_path);
+    return imageDataUrlWithGeometryFromPath(input.image_path);
   }
   if (input.image_url && isValidImageUrl(input.image_url)) {
-    return input.image_url;
+    return { imageUrl: input.image_url };
   }
   throw typedError(
     "invalid_request",
@@ -114,6 +142,13 @@ export async function resolveImageInputToUrl(input: ImageUnderstandingRequest): 
 }
 
 export async function imageDataUrlFromPath(imagePath: string): Promise<string> {
+  const resolved = await imageDataUrlWithGeometryFromPath(imagePath);
+  return resolved.imageUrl;
+}
+
+export async function imageDataUrlWithGeometryFromPath(
+  imagePath: string
+): Promise<ResolvedImageInput> {
   const abs = path.resolve(imagePath);
   let data: Buffer;
   try {
@@ -129,11 +164,18 @@ export async function imageDataUrlFromPath(imagePath: string): Promise<string> {
     throw typedError("invalid_request", "Unable to read image dimensions.");
   }
 
+  const originalWidth = meta.width;
+  const originalHeight = meta.height;
+  let uploadedWidth = originalWidth;
+  let uploadedHeight = originalHeight;
+
   const area = meta.width * meta.height;
   if (area > MAX_IMAGE_PIXELS) {
     const scale = Math.sqrt(MAX_IMAGE_PIXELS / area);
     const targetWidth = Math.max(1, Math.floor(meta.width * scale));
     const targetHeight = Math.max(1, Math.floor(meta.height * scale));
+    uploadedWidth = targetWidth;
+    uploadedHeight = targetHeight;
     let resized = image.resize(targetWidth, targetHeight, { fit: "fill" });
     const format = (meta.format ?? "").toLowerCase();
     if (format === "jpeg" || format === "jpg") {
@@ -152,7 +194,28 @@ export async function imageDataUrlFromPath(imagePath: string): Promise<string> {
     data = await resized.toBuffer();
   }
 
-  return `data:${mimeType};base64,${data.toString("base64")}`;
+  return {
+    imageUrl: `data:${mimeType};base64,${data.toString("base64")}`,
+    imageGeometry: {
+      original_width: originalWidth,
+      original_height: originalHeight,
+      uploaded_width: uploadedWidth,
+      uploaded_height: uploadedHeight,
+      scale_x: originalWidth / uploadedWidth,
+      scale_y: originalHeight / uploadedHeight,
+      resized: originalWidth !== uploadedWidth || originalHeight !== uploadedHeight,
+    },
+  };
+}
+
+export function buildImageGeometrySystemMessage(imageGeometry: ImageGeometry): string {
+  return [
+    "If you return coordinates or bounding boxes, express them in the original image pixel space.",
+    `Original image size: ${imageGeometry.original_width}x${imageGeometry.original_height}.`,
+    `Uploaded image size: ${imageGeometry.uploaded_width}x${imageGeometry.uploaded_height}.`,
+    `Scale factors from uploaded to original: x=${imageGeometry.scale_x}, y=${imageGeometry.scale_y}.`,
+    "Do not return coordinates in resized-image pixels.",
+  ].join(" ");
 }
 
 export function parseImageUnderstandingText(rawText: string): ImageAnalysis {

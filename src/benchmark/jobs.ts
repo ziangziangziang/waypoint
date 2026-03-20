@@ -40,6 +40,7 @@ interface BenchmarkRunSummary {
   startedAt?: string;
   finishedAt?: string;
   suite?: string;
+  exampleId?: string;
   profile?: string;
   scenarioPath?: string;
   succeeded?: number;
@@ -152,9 +153,11 @@ export async function getArtifactBenchmarkRun(
         finishedAt: report.createdAt,
         request: {
           suite: report.suite,
+          exampleId: report.exampleId,
           scenarioPath: report.scenarioPath,
           modelOverride: report.modelOverride,
           profile: report.profile,
+          executionMode: report.executionMode,
         },
         progress: {
           totalScenarios: report.total,
@@ -254,6 +257,7 @@ function toSummary(run: BenchmarkRunRecord): BenchmarkRunSummary {
     startedAt: run.startedAt,
     finishedAt: run.finishedAt,
     suite: run.request.suite,
+    exampleId: run.request.exampleId,
     profile: run.request.profile,
     scenarioPath: run.request.scenarioPath,
     succeeded: run.report?.succeeded,

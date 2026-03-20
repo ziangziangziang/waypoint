@@ -43,8 +43,8 @@ function buildStat(overrides: Partial<RequestStats>): RequestStats {
     statusCode: overrides.statusCode ?? 200,
     errorType: overrides.errorType,
     totalTokens: overrides.totalTokens ?? 100,
-    promptTokens: overrides.promptTokens ?? 50,
-    completionTokens: overrides.completionTokens ?? 50,
+    promptTokens: overrides.promptTokens === undefined ? 50 : overrides.promptTokens,
+    completionTokens: overrides.completionTokens === undefined ? 50 : overrides.completionTokens,
   }
 }
 
@@ -86,10 +86,18 @@ test('stats routes honor exact 1h window across aggregate/latency/tokens', async
     window: string
     totalRequests: number
     bucketGranularity: string
+    totalInputTokens: number
+    totalOutputTokens: number
+    splitUnknownCount: number
+    splitUnknownRate: number
   }
   assert.equal(tokenJson.window, '1h')
   assert.equal(tokenJson.totalRequests, 1)
   assert.equal(tokenJson.bucketGranularity, 'hour')
+  assert.equal(tokenJson.totalInputTokens, 50)
+  assert.equal(tokenJson.totalOutputTokens, 50)
+  assert.equal(tokenJson.splitUnknownCount, 0)
+  assert.equal(tokenJson.splitUnknownRate, 0)
 
   await app.close()
 })
@@ -140,19 +148,107 @@ test('token usage exposes hourly vs daily bucket granularity', async () => {
   assert.equal(hourly.statusCode, 200)
   const hourlyJson = hourly.json() as {
     bucketGranularity: string
-    byDay: Array<{ date: string }>
+    byDay: Array<{ date: string; inputTokens: number; outputTokens: number; splitUnknown: number }>
   }
   assert.equal(hourlyJson.bucketGranularity, 'hour')
   assert.ok(hourlyJson.byDay.every((row) => row.date.includes('T')))
+  assert.ok(hourlyJson.byDay.every((row) => typeof row.inputTokens === 'number'))
+  assert.ok(hourlyJson.byDay.every((row) => typeof row.outputTokens === 'number'))
+  assert.ok(hourlyJson.byDay.every((row) => typeof row.splitUnknown === 'number'))
 
   const daily = await app.inject({ method: 'GET', url: '/admin/stats/tokens?window=7d' })
   assert.equal(daily.statusCode, 200)
   const dailyJson = daily.json() as {
     bucketGranularity: string
-    byDay: Array<{ date: string }>
+    byDay: Array<{ date: string; inputTokens: number; outputTokens: number; splitUnknown: number }>
   }
   assert.equal(dailyJson.bucketGranularity, 'day')
   assert.ok(dailyJson.byDay.every((row) => !row.date.includes('T')))
+  assert.ok(dailyJson.byDay.every((row) => typeof row.inputTokens === 'number'))
+  assert.ok(dailyJson.byDay.every((row) => typeof row.outputTokens === 'number'))
+  assert.ok(dailyJson.byDay.every((row) => typeof row.splitUnknown === 'number'))
+
+  await app.close()
+})
+
+test('token usage marks unknown split when only total tokens are present', async () => {
+  const baseDir = await makeWorkspaceTempDir('waypoint-stats-test-')
+  const paths = makePaths(baseDir)
+  const app = Fastify()
+  await registerStatsRoutes(app, paths)
+
+  await appendStats(
+    paths,
+    buildStat({
+      requestId: 'split-unknown',
+      timestamp: new Date(),
+      totalTokens: 42,
+      promptTokens: null,
+      completionTokens: null,
+    })
+  )
+
+  const res = await app.inject({ method: 'GET', url: '/admin/stats/tokens?window=1h' })
+  assert.equal(res.statusCode, 200)
+  const json = res.json() as {
+    totalTokens: number
+    totalRequests: number
+    totalInputTokens: number
+    totalOutputTokens: number
+    splitUnknownCount: number
+    splitUnknownRate: number
+    byDay: Array<{ tokens: number; inputTokens: number; outputTokens: number; splitUnknown: number }>
+  }
+
+  assert.equal(json.totalTokens, 42)
+  assert.equal(json.totalRequests, 1)
+  assert.equal(json.totalInputTokens, 0)
+  assert.equal(json.totalOutputTokens, 0)
+  assert.equal(json.splitUnknownCount, 1)
+  assert.equal(json.splitUnknownRate, 1)
+  assert.equal(json.byDay.length, 1)
+  assert.equal(json.byDay[0].tokens, 42)
+  assert.equal(json.byDay[0].inputTokens, 0)
+  assert.equal(json.byDay[0].outputTokens, 0)
+  assert.equal(json.byDay[0].splitUnknown, 1)
+
+  await app.close()
+})
+
+test('token usage buckets follow requested timezone instead of UTC', async () => {
+  const baseDir = await makeWorkspaceTempDir('waypoint-stats-test-')
+  const paths = makePaths(baseDir)
+  const app = Fastify()
+  await registerStatsRoutes(app, paths)
+
+  await appendStats(
+    paths,
+    buildStat({
+      requestId: 'tz-shift',
+      timestamp: new Date('2026-01-01T01:30:00.000Z'),
+      totalTokens: 42,
+    })
+  )
+
+  const utcRes = await app.inject({ method: 'GET', url: '/admin/stats/tokens?window=365d&timeZone=UTC' })
+  assert.equal(utcRes.statusCode, 200)
+  const utcJson = utcRes.json() as {
+    bucketTimeZone: string
+    byDay: Array<{ date: string }>
+  }
+  assert.equal(utcJson.bucketTimeZone, 'UTC')
+
+  const localRes = await app.inject({
+    method: 'GET',
+    url: '/admin/stats/tokens?window=365d&timeZone=America/Chicago',
+  })
+  assert.equal(localRes.statusCode, 200)
+  const localJson = localRes.json() as {
+    bucketTimeZone: string
+    byDay: Array<{ date: string }>
+  }
+  assert.equal(localJson.bucketTimeZone, 'America/Chicago')
+  assert.notEqual(localJson.byDay[0]?.date, utcJson.byDay[0]?.date)
 
   await app.close()
 })

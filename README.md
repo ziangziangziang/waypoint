@@ -67,7 +67,8 @@ Here is the ascii art version of the logo:
 - **Web UI** — Playground with chat history, image support, and real-time dashboard
 - **Agent Mode** — MCP (Model Context Protocol) integration for tool-calling workflows
 - **Model Capability Matrix** — Per-model input/output modality classification (`text`, `image`, `audio`, `embedding`)
-- **Lightweight Benchmark** — Built-in and file-driven benchmark scenarios (`waypoint bench`)
+- **Benchmark Showcase** — Live example replays plus diagnostic suites (`waypoint bench`)
+- **Peek** — Capture browser for request/response timelines, media artifacts, and token-flow inspection
 - **Statistics** — Request tracking with 7-day window and per-model/endpoint aggregation
 - **Hot Reload** — Config changes apply without restart
 - **Auth Ready** — Optional authentication (disabled by default)
@@ -211,16 +212,43 @@ Initial built-in tool:
 - `generate_image`
   - Generates image(s) using Waypoint's diffusion routing
   - Depends on at least one live diffusion-capable model
-  - Supports direct file output via `output_path` (or `output_dir`) to avoid large base64 payloads in LLM context
-  - Returns structured result with model metadata plus file metadata; raw `url`/`b64_json` are optional via `include_data`
+  - Requires `workspace_root` and always writes generated files into that workspace
+  - Accepts relative `output_path` or `output_dir`; otherwise defaults to `./.waypoint/generated-images`
+  - Returns structured result with model metadata plus workspace-relative `file_path` or `file_paths`; raw `url`/`b64_json` are optional via `include_data`
 - `understand_image`
   - Performs image-to-text understanding with a vision-capable model
-  - Supports `image_path` or `image_url` input with structured analysis output (`ocr_text`, objects, scene, details)
+  - Supports `image_path` or `image_url` input with top-level `text` plus structured `result` output (`ocr_text`, objects, scene, details)
+  - For local `image_path` inputs, preserves original image geometry and reports optional `image_geometry` metadata so coordinate-based tasks stay aligned with the source file
 
 Agent defaults (summary):
-1. Prefer `output_path` or `output_dir` for image generation tool calls.
-2. Write outputs under the workspace directory (use workspace-relative paths).
+1. Always provide `workspace_root` for `generate_image`.
+2. Write outputs under the workspace directory and treat returned `file_path` values as workspace-relative.
 3. Keep `include_data=false` unless inline image payload is explicitly required.
+
+Example `generate_image` tool call for repo-local output:
+
+```json
+{
+  "name": "generate_image",
+  "arguments": {
+    "prompt": "Minimal icon with clean geometric shape",
+    "workspace_root": "/abs/path/to/repo",
+    "output_dir": "./.waypoint/generated-images"
+  }
+}
+```
+
+Example `understand_image` coordinate-sensitive prompt:
+
+```json
+{
+  "name": "understand_image",
+  "arguments": {
+    "image_path": "./assets/layout.png",
+    "instruction": "Return the center point of the submit button as JSON with x and y in original image pixels."
+  }
+}
+```
 
 Canonical MCP governance and behavior contract: [`docs/mcp-guidelines.md`](docs/mcp-guidelines.md).  
 Detailed MCP tool contract and examples: [`docs/mcp-service.md`](docs/mcp-service.md).
@@ -279,17 +307,28 @@ waypoint models enable pcai/gpt-4o
 waypoint models disable pcai/gpt-4o
 waypoint models set-key pcai/gpt-4o --api-key <key>|--env-var <ENV>
 
-# Lightweight benchmark
-waypoint bench                        # Built-in smoke benchmark
-waypoint bench --scenario file.json   # File-driven scenarios
-waypoint bench --out ./artifacts      # Write report artifact
-waypoint bench --config ./benchmark.config.yaml --profile ci
+# Benchmark showcase
+waypoint bench                               # Default live showcase example suite
+waypoint bench --list-examples               # List showcase examples
+waypoint bench --example showcase-agent-tool-call
+waypoint bench --suite showcase --model smart
+waypoint bench --scenario file.json          # File-driven scenarios
+waypoint bench --mode diagnostic --suite pool_smoke
 waypoint bench --baseline ./bench-prev.json
-waypoint bench --suite pool_smoke     # Validate smart pool routing/failover
 ```
 
 Provider credentials imported with `waypoint providers import -f .env` are stored in plaintext at
 `$WAYPOINT_DIR/providers.json` by design for local operation.
+
+### Canonical Provider-First Workflow
+
+Use these commands as the primary operational path:
+
+1. `waypoint providers`
+2. `waypoint providers show <providerId>`
+3. `waypoint models`
+4. `waypoint models <providerId>`
+5. `waypoint models show <providerId>/<modelId>`
 
 Legacy `waypoint provider ...` and `waypoint provider model ...` forms are rewritten to canonical commands with a deprecation warning. Set `WAYPOINT_NO_WARN=1` to suppress legacy rewrite warnings in scripts.
 
@@ -324,7 +363,8 @@ Access the playground at `http://localhost:8000/ui`:
 
 - **Playground** — Chat interface with session history, image upload (VL models), and agent mode
 - **Dashboard** — Real-time stats with latency charts, token usage, endpoint health, and **usage guides** with copy-paste code snippets (cURL, Python, Node.js)
-- **Settings** — Endpoint configuration (coming soon)
+- **Peek** — Calendar browser for captured requests, timeline inspection, media artifacts, and token-flow analysis
+- **Settings** — Provider/model catalog management, MCP guidance, and image defaults
 
 ### Endpoint Usage Guides
 
@@ -345,6 +385,36 @@ Toggle "Agent Mode" in the playground to enable tool calling:
 4. Chat normally — the agent will use tools when appropriate
 
 The agentic loop supports up to 10 tool iterations per message.
+
+### Peek
+
+Peek is the request-capture browser for debugging prompts, routing, tool use, and media-heavy interactions:
+
+- **Calendar browse** — move day by day through captured traffic
+- **Timeline view** — inspect ordered request and response segments, including assistant reasoning/tool-call structure
+- **Request/Response tabs** — compare raw payloads and normalized previews
+- **Media tab** — review persisted images and other artifacts
+- **Token Flow Sankey** — visualize where captured input/output tokens were attributed
+
+Timeline inspection example:
+
+![Peek timeline categorization](assets/categorize.png)
+
+Token-flow Sankey example:
+
+![Peek token flow sankey](assets/sankey.png)
+
+### Statistics
+
+Waypoint exposes request statistics in both CLI and UI:
+
+- `waypoint stats` for aggregated CLI summaries
+- Dashboard cards and charts for latency, throughput, errors, and token usage
+- `/admin/stats` for aggregate windows
+- `/admin/stats/latency` for latency distribution buckets
+- `/admin/stats/tokens` for token usage over time
+
+Statistics are derived from the local JSONL request log store with retention-based rotation. Use them to validate routing changes, benchmark regressions, and slow/failing upstream behavior.
 
 ## Configuration
 

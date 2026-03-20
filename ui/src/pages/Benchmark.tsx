@@ -4,11 +4,13 @@ import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import {
   BenchmarkCapabilityMatrix,
+  BenchmarkExampleSummary,
   BenchmarkRunEvent,
   BenchmarkRunRecord,
   BenchmarkRunSummary,
   getBenchmarkRun,
   listBenchmarkCapabilities,
+  listBenchmarkExamples,
   listBenchmarkRuns,
   listModels,
   startBenchmarkRun,
@@ -27,21 +29,45 @@ type ModelLeaderboardRow = {
   totalFailovers: number
 }
 
-const SUITES = ['smoke', 'proxy', 'agent', 'pool_smoke', 'omni_call_smoke', 'capabilities']
+type ShowcaseExchange = {
+  id: string
+  timestamp?: string
+  mode: string
+  model: string
+  scenarioInput: string
+  requestPath: string
+  statusCode: number
+  contentType: string
+  endpointName?: string
+  upstreamModel?: string
+  toolTrace: Array<{
+    kind: 'tool_call' | 'tool_result'
+    toolName: string
+    toolCallId?: string
+    argumentsText?: string
+    contentText?: string
+  }>
+  requestPayload: unknown
+  responsePayload: unknown
+}
+
+const SUITES = ['showcase', 'smoke', 'proxy', 'agent', 'pool_smoke', 'omni_call_smoke', 'capabilities']
 const PROFILES = ['local', 'ci']
 
 export function Benchmark() {
   const [runs, setRuns] = useState<BenchmarkRunSummary[]>([])
   const [models, setModels] = useState<Model[]>([])
+  const [examples, setExamples] = useState<BenchmarkExampleSummary[]>([])
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
   const [selectedRun, setSelectedRun] = useState<BenchmarkRunRecord | null>(null)
   const [events, setEvents] = useState<BenchmarkRunEvent[]>([])
   const [loading, setLoading] = useState(true)
   const [starting, setStarting] = useState(false)
-  const [suite, setSuite] = useState('smoke')
+  const [suite, setSuite] = useState('showcase')
   const [profile, setProfile] = useState('local')
   const [scenarioPath, setScenarioPath] = useState('')
-  const [selectedModel, setSelectedModel] = useState('smart')
+  const [selectedModel, setSelectedModel] = useState('')
+  const [selectedExampleId, setSelectedExampleId] = useState('')
   const [showRaw, setShowRaw] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [modelLeaderboard, setModelLeaderboard] = useState<ModelLeaderboardRow[]>([])
@@ -76,11 +102,23 @@ export function Benchmark() {
     try {
       const response = await listModels()
       setModels(response.data)
-      if (!response.data.some((model) => model.id === selectedModel) && response.data.length > 0) {
-        setSelectedModel(response.data[0].id)
-      }
     } catch (err) {
       console.error('Failed to load models:', err)
+    }
+  }
+
+  const loadExamples = async (suiteName: string) => {
+    try {
+      const response = await listBenchmarkExamples(suiteName)
+      setExamples(response.data)
+      setSelectedExampleId((current) => {
+        if (response.data.some((example) => example.id === current)) return current
+        return response.data[0]?.id ?? ''
+      })
+    } catch (err) {
+      console.error('Failed to load benchmark examples:', err)
+      setExamples([])
+      setSelectedExampleId('')
     }
   }
 
@@ -88,12 +126,17 @@ export function Benchmark() {
     void loadRuns()
     void loadModels()
     void loadCapabilities()
+    void loadExamples(suite)
     const timer = setInterval(() => {
       void loadRuns()
       void loadCapabilities()
     }, 5000)
     return () => clearInterval(timer)
   }, [])
+
+  useEffect(() => {
+    void loadExamples(suite)
+  }, [suite])
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -146,7 +189,10 @@ export function Benchmark() {
 
   useEffect(() => {
     const buildLeaderboard = async () => {
-      const completedRunIds = runs.filter((run) => run.status === 'completed').slice(0, 20).map((run) => run.id)
+      const completedRunIds = runs
+        .filter((run) => run.status === 'completed')
+        .slice(0, 20)
+        .map((run) => run.id)
       const details = await Promise.all(
         completedRunIds.map(async (id) => {
           try {
@@ -166,11 +212,14 @@ export function Benchmark() {
     setStarting(true)
     setError(null)
     try {
+      const executionMode = suite === 'showcase' ? 'showcase' : 'diagnostic'
       const run = await startBenchmarkRun({
         suite,
+        exampleId: suite === 'showcase' && selectedExampleId ? selectedExampleId : undefined,
         profile,
         scenarioPath: scenarioPath.trim() || undefined,
         modelOverride: selectedModel || undefined,
+        executionMode,
         updateCapCache: suite === 'capabilities',
         capTtlDays: 7,
       })
@@ -178,8 +227,7 @@ export function Benchmark() {
       await loadRuns()
       await loadCapabilities()
     } catch (err) {
-      const message = (err as Error).message
-      setError(message)
+      setError((err as Error).message)
     } finally {
       setStarting(false)
     }
@@ -192,7 +240,55 @@ export function Benchmark() {
     return { total, complete, percent }
   }, [selectedRun])
 
-  const traceEvents = useMemo(() => events.filter((event) => event.type === 'exchange'), [events])
+  const activeExample = useMemo(() => {
+    const reportDetails = selectedRun?.report?.scenarioDetails ?? []
+    const fromRun = reportDetails.find((detail) => detail.id === selectedExampleId)?.example ?? reportDetails[0]?.example
+    if (fromRun) return fromRun
+    return examples.find((example) => example.id === selectedExampleId) ?? examples[0] ?? null
+  }, [examples, selectedExampleId, selectedRun])
+
+  const activeScenarioDetail = useMemo(() => {
+    const details = selectedRun?.report?.scenarioDetails ?? []
+    if (details.length === 0) return null
+    return details.find((detail) => detail.id === selectedExampleId) ?? details[0]
+  }, [selectedExampleId, selectedRun])
+
+  const liveTrace = useMemo<ShowcaseExchange[]>(() => {
+    const traceEvents = events.filter((event) => event.type === 'exchange' && event.exchange)
+    if (traceEvents.length > 0) {
+      return traceEvents.map((event, index) => ({
+        id: `${event.timestamp}-${index}`,
+        timestamp: event.timestamp,
+        mode: event.exchange?.mode ?? 'unknown',
+        model: event.exchange?.model ?? 'unknown',
+        scenarioInput: event.exchange?.scenarioInput ?? '',
+        requestPath: event.exchange?.requestPath ?? '',
+        statusCode: event.exchange?.statusCode ?? 0,
+        contentType: event.exchange?.contentType ?? '',
+        endpointName: event.exchange?.endpointName,
+        upstreamModel: event.exchange?.upstreamModel,
+        toolTrace: event.exchange?.toolTrace ?? [],
+        requestPayload: showRaw ? event.exchange?.requestRaw : event.exchange?.requestSanitized,
+        responsePayload: showRaw ? event.exchange?.responseRaw : event.exchange?.responseSanitized,
+      }))
+    }
+
+    return (activeScenarioDetail?.exchanges ?? []).map((exchange, index) => ({
+      id: `${activeScenarioDetail?.id ?? 'detail'}-${index}`,
+      timestamp: exchange.timestamp,
+      mode: exchange.mode,
+      model: exchange.model,
+      scenarioInput: activeScenarioDetail?.example?.inputPreview ?? '',
+      requestPath: exchange.requestPath,
+      statusCode: exchange.statusCode,
+      contentType: exchange.contentType,
+      endpointName: exchange.endpointName,
+      upstreamModel: exchange.upstreamModel,
+      toolTrace: exchange.toolTrace,
+      requestPayload: exchange.requestSanitized,
+      responsePayload: exchange.responseSanitized,
+    }))
+  }, [activeScenarioDetail, events, showRaw])
 
   return (
     <div className="flex-1 flex flex-col h-full min-h-0">
@@ -201,22 +297,23 @@ export function Benchmark() {
           <Gauge className="w-4 h-4 text-primary" />
           <h2 className="font-mono font-semibold text-sm uppercase tracking-wider">Benchmark</h2>
         </div>
+        <div className="text-xs text-muted-foreground font-mono">Live examples first, diagnostics second</div>
         <div className="flex-1" />
-        <Button variant="outline" size="sm" onClick={() => { void loadRuns(); void loadModels(); }} disabled={loading}>
+        <Button variant="outline" size="sm" onClick={() => { void loadRuns(); void loadModels(); void loadExamples(suite) }} disabled={loading}>
           <RefreshCw className={cn('w-3 h-3 mr-2', loading && 'animate-spin')} />
           Refresh
         </Button>
       </header>
 
-      <div className="flex-1 min-h-0 grid grid-cols-[300px_1fr] gap-0">
+      <div className="flex-1 min-h-0 grid grid-cols-[320px_1fr] gap-0">
         <aside className="border-r border-border p-4 space-y-4 overflow-auto">
           <div className="panel">
             <div className="panel-header">
-              <span className="panel-title">Start Run</span>
+              <span className="panel-title">Run Example</span>
             </div>
             <div className="p-3 space-y-3">
               <label className="text-xs text-muted-foreground block">
-                Suite
+                Benchmark Path
                 <select
                   className="mt-1 w-full bg-input border border-border rounded px-2 py-1 text-sm font-mono"
                   value={suite}
@@ -227,6 +324,23 @@ export function Benchmark() {
                   ))}
                 </select>
               </label>
+
+              {suite === 'showcase' && (
+                <label className="text-xs text-muted-foreground block">
+                  Example
+                  <select
+                    className="mt-1 w-full bg-input border border-border rounded px-2 py-1 text-sm font-mono"
+                    value={selectedExampleId}
+                    onChange={(event) => setSelectedExampleId(event.target.value)}
+                  >
+                    {examples.map((example) => (
+                      <option key={example.id} value={example.id}>{example.title}</option>
+                    ))}
+                    {examples.length === 0 && <option value="">No examples</option>}
+                  </select>
+                </label>
+              )}
+
               <label className="text-xs text-muted-foreground block">
                 Profile
                 <select
@@ -239,22 +353,23 @@ export function Benchmark() {
                   ))}
                 </select>
               </label>
+
               <label className="text-xs text-muted-foreground block">
-                Model
+                Model Override
                 <select
                   className="mt-1 w-full bg-input border border-border rounded px-2 py-1 text-sm font-mono"
                   value={selectedModel}
                   onChange={(event) => setSelectedModel(event.target.value)}
                 >
-                  {suite === 'capabilities' && <option value="">(all models)</option>}
-                  {models.length === 0 && <option value="">No models</option>}
+                  <option value="">(auto)</option>
                   {models.map((model) => (
                     <option key={model.id} value={model.id}>{model.id}</option>
                   ))}
                 </select>
               </label>
+
               <label className="text-xs text-muted-foreground block">
-                Scenario Path
+                Custom Scenario File
                 <input
                   className="mt-1 w-full bg-input border border-border rounded px-2 py-1 text-sm font-mono"
                   value={scenarioPath}
@@ -262,7 +377,14 @@ export function Benchmark() {
                   placeholder="optional"
                 />
               </label>
-              <Button className="w-full" onClick={startRun} disabled={starting || (suite !== 'capabilities' && !selectedModel)}>
+
+              <p className="text-2xs text-muted-foreground">
+                {suite === 'showcase'
+                  ? 'Showcase runs a single visible replay so the user can inspect the exact exchange.'
+                  : 'Diagnostic suites keep the older benchmark behavior and capability matrix.'}
+              </p>
+
+              <Button className="w-full" onClick={startRun} disabled={starting || (suite === 'showcase' && !selectedExampleId)}>
                 {starting ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Play className="w-4 h-4 mr-2" />}
                 Start
               </Button>
@@ -285,7 +407,7 @@ export function Benchmark() {
                   onClick={() => setSelectedRunId(run.id)}
                 >
                   <p className="text-xs font-mono truncate">{run.id}</p>
-                  <p className="text-2xs text-muted-foreground">{run.suite ?? 'custom'} • {run.profile ?? '-'}</p>
+                  <p className="text-2xs text-muted-foreground">{run.suite ?? 'custom'}{run.exampleId ? ` • ${run.exampleId}` : ''}</p>
                   <p className={cn('text-2xs uppercase font-mono', statusClass(run.status))}>{run.status}</p>
                 </button>
               ))}
@@ -317,32 +439,111 @@ export function Benchmark() {
           </div>
 
           <div className="grid grid-cols-2 gap-6">
-            <div className="panel min-h-[400px]">
+            <div className="panel min-h-[320px]">
               <div className="panel-header">
-                <MessageSquareText className="w-4 h-4 text-muted-foreground" />
-                <span className="panel-title">Benchmark Trace</span>
-                <button
-                  className="ml-auto text-2xs px-2 py-1 rounded bg-secondary hover:bg-secondary/80"
-                  onClick={() => setShowRaw((prev) => !prev)}
-                >
-                  {showRaw ? 'Raw' : 'Sanitized'}
-                </button>
+                <span className="panel-title">What This Demonstrates</span>
               </div>
-              <div className="p-4 space-y-3 max-h-[460px] overflow-auto">
-                {traceEvents.map((event, index) => (
-                  <TraceCard key={`${event.timestamp}-${index}`} event={event} showRaw={showRaw} />
-                ))}
-                {traceEvents.length === 0 && (
-                  <p className="text-xs text-muted-foreground">No request/response trace yet.</p>
+              <div className="p-4 space-y-3 text-sm">
+                {activeExample ? (
+                  <>
+                    <div>
+                      <p className="text-2xs uppercase text-muted-foreground mb-1">Title</p>
+                      <p className="font-medium">{activeExample.title}</p>
+                    </div>
+                    <div>
+                      <p className="text-2xs uppercase text-muted-foreground mb-1">Goal</p>
+                      <p>{activeExample.userVisibleGoal}</p>
+                    </div>
+                    <div>
+                      <p className="text-2xs uppercase text-muted-foreground mb-1">Input</p>
+                      <pre className="text-xs font-mono whitespace-pre-wrap break-words">{activeExample.inputPreview}</pre>
+                    </div>
+                    <div>
+                      <p className="text-2xs uppercase text-muted-foreground mb-1">Success</p>
+                      <p>{activeExample.successCriteria}</p>
+                    </div>
+                    <div>
+                      <p className="text-2xs uppercase text-muted-foreground mb-1">Expected Highlights</p>
+                      <div className="flex flex-wrap gap-2">
+                        {activeExample.expectedHighlights.map((item) => (
+                          <span key={item} className="rounded border border-border px-2 py-1 text-2xs font-mono text-muted-foreground">{item}</span>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-sm text-muted-foreground">No showcase example selected.</p>
                 )}
               </div>
             </div>
 
-            <div className="panel min-h-[400px]">
+            <div className="panel min-h-[320px]">
               <div className="panel-header">
-                <span className="panel-title">Model Leaderboard (History)</span>
+                <span className="panel-title">Verdict</span>
               </div>
-              <div className="p-4 overflow-auto max-h-[460px]">
+              <div className="p-4 space-y-3 text-sm">
+                {activeScenarioDetail ? (
+                  <>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className={cn(
+                        'rounded border px-2 py-1 text-2xs font-mono',
+                        activeScenarioDetail.status === 'passed'
+                          ? 'border-emerald-500/40 text-emerald-300 bg-emerald-500/10'
+                          : activeScenarioDetail.status === 'skipped'
+                            ? 'border-amber-500/40 text-amber-300 bg-amber-500/10'
+                            : 'border-red-500/40 text-red-300 bg-red-500/10'
+                      )}>
+                        {activeScenarioDetail.status}
+                      </span>
+                      <span className="text-2xs font-mono text-muted-foreground">{activeScenarioDetail.model}</span>
+                    </div>
+                    <div>
+                      <p className="text-2xs uppercase text-muted-foreground mb-1">Reason</p>
+                      <p>{activeScenarioDetail.verdict}</p>
+                    </div>
+                    <div>
+                      <p className="text-2xs uppercase text-muted-foreground mb-1">Final Response</p>
+                      <pre className="text-xs font-mono whitespace-pre-wrap break-words">{activeScenarioDetail.finalResponsePreview || 'n/a'}</pre>
+                    </div>
+                    <div>
+                      <p className="text-2xs uppercase text-muted-foreground mb-1">Tools Used</p>
+                      <p className="text-xs font-mono">{activeScenarioDetail.usedToolNames.length > 0 ? activeScenarioDetail.usedToolNames.join(', ') : 'none'}</p>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-sm text-muted-foreground">Run an example to capture a verdict.</p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="panel min-h-[420px]">
+            <div className="panel-header">
+              <MessageSquareText className="w-4 h-4 text-muted-foreground" />
+              <span className="panel-title">Live Show</span>
+              <button
+                className="ml-auto text-2xs px-2 py-1 rounded bg-secondary hover:bg-secondary/80"
+                onClick={() => setShowRaw((prev) => !prev)}
+              >
+                {showRaw ? 'Raw' : 'Sanitized'}
+              </button>
+            </div>
+            <div className="p-4 space-y-3 max-h-[640px] overflow-auto">
+              {liveTrace.map((exchange) => (
+                <TraceCard key={exchange.id} exchange={exchange} />
+              ))}
+              {liveTrace.length === 0 && (
+                <p className="text-xs text-muted-foreground">No request/response trace yet.</p>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-6">
+            <div className="panel min-h-[320px]">
+              <div className="panel-header">
+                <span className="panel-title">Model Leaderboard (Diagnostics)</span>
+              </div>
+              <div className="p-4 overflow-auto max-h-[360px]">
                 <table className="w-full text-xs">
                   <thead className="text-muted-foreground">
                     <tr>
@@ -378,55 +579,49 @@ export function Benchmark() {
                 </table>
               </div>
             </div>
-          </div>
 
-          <div className="panel">
-            <div className="panel-header">
-              <span className="panel-title">Capabilities</span>
-              <span className="text-2xs text-muted-foreground ml-auto">
-                TTL {capabilityMatrix?.ttlDays ?? 7}d
-              </span>
-            </div>
-            <div className="p-4 overflow-auto">
-              <table className="w-full text-xs">
-                <thead className="text-muted-foreground">
-                  <tr>
-                    <th className="text-left py-1">Model</th>
-                    <th className="text-left py-1">Freshness</th>
-                    <th className="text-left py-1">Verified</th>
-                    <th className="text-left py-1">Chat</th>
-                    <th className="text-left py-1">Tools</th>
-                    <th className="text-left py-1">Embed</th>
-                    <th className="text-left py-1">Image</th>
-                    <th className="text-left py-1">Audio In</th>
-                    <th className="text-left py-1">Audio Out</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(capabilityMatrix?.models ?? []).map((model) => (
-                    <tr key={model.model} className="border-t border-border/40">
-                      <td className="py-1 pr-2 font-mono">{model.model}</td>
-                      <td className={cn('py-1', model.freshness === 'fresh' ? 'text-success' : 'text-warning')}>
-                        {model.freshness}
-                      </td>
-                      <td className="py-1 text-muted-foreground">{model.lastVerifiedAt}</td>
-                      <td className="py-1">{model.findings.chat_basic.status}</td>
-                      <td className="py-1">{model.findings.chat_tool_calls.status}</td>
-                      <td className="py-1">{model.findings.embeddings.status}</td>
-                      <td className="py-1">{model.findings.images_generation.status}</td>
-                      <td className="py-1">{model.findings.audio_transcription.status}</td>
-                      <td className="py-1">{model.findings.audio_speech.status}</td>
-                    </tr>
-                  ))}
-                  {(capabilityMatrix?.models.length ?? 0) === 0 && (
+            <div className="panel min-h-[320px]">
+              <div className="panel-header">
+                <span className="panel-title">Capabilities (Diagnostics)</span>
+                <span className="text-2xs text-muted-foreground ml-auto">
+                  TTL {capabilityMatrix?.ttlDays ?? 7}d
+                </span>
+              </div>
+              <div className="p-4 overflow-auto max-h-[360px]">
+                <table className="w-full text-xs">
+                  <thead className="text-muted-foreground">
                     <tr>
-                      <td colSpan={9} className="py-3 text-center text-muted-foreground">
-                        No capability snapshots yet. Run suite "capabilities" to populate cache.
-                      </td>
+                      <th className="text-left py-1">Model</th>
+                      <th className="text-left py-1">Freshness</th>
+                      <th className="text-left py-1">Chat</th>
+                      <th className="text-left py-1">Tools</th>
+                      <th className="text-left py-1">Embed</th>
+                      <th className="text-left py-1">Image</th>
                     </tr>
-                  )}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {(capabilityMatrix?.models ?? []).map((model) => (
+                      <tr key={model.model} className="border-t border-border/40">
+                        <td className="py-1 pr-2 font-mono">{model.model}</td>
+                        <td className={cn('py-1', model.freshness === 'fresh' ? 'text-success' : 'text-warning')}>
+                          {model.freshness}
+                        </td>
+                        <td className="py-1">{model.findings.chat_basic.status}</td>
+                        <td className="py-1">{model.findings.chat_tool_calls.status}</td>
+                        <td className="py-1">{model.findings.embeddings.status}</td>
+                        <td className="py-1">{model.findings.images_generation.status}</td>
+                      </tr>
+                    ))}
+                    {(capabilityMatrix?.models.length ?? 0) === 0 && (
+                      <tr>
+                        <td colSpan={6} className="py-3 text-center text-muted-foreground">
+                          No capability snapshots yet. Run suite "capabilities" to populate cache.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </section>
@@ -435,28 +630,51 @@ export function Benchmark() {
   )
 }
 
-function TraceCard({ event, showRaw }: { event: BenchmarkRunEvent; showRaw: boolean }) {
-  const exchange = event.exchange
-  if (!exchange) {
-    return null
-  }
-  const requestPayload = showRaw ? exchange.requestRaw : exchange.requestSanitized
-  const responsePayload = showRaw ? exchange.responseRaw : exchange.responseSanitized
-
+function TraceCard({ exchange }: { exchange: ShowcaseExchange }) {
   return (
-    <div className="border border-border rounded-md p-3 space-y-2">
-      <div className="text-2xs text-muted-foreground font-mono">
-        {event.timestamp} • {exchange.mode} • {exchange.model}
+    <div className="border border-border rounded-md p-3 space-y-3">
+      <div className="flex items-center gap-2 flex-wrap text-2xs text-muted-foreground font-mono">
+        <span>{exchange.timestamp ?? 'saved-trace'}</span>
+        <span>•</span>
+        <span>{exchange.mode}</span>
+        <span>•</span>
+        <span>{exchange.model}</span>
+        {exchange.endpointName && (
+          <>
+            <span>•</span>
+            <span>{exchange.endpointName}</span>
+          </>
+        )}
       </div>
+
       <div className="bg-secondary/30 rounded p-2">
-        <p className="text-2xs uppercase text-muted-foreground mb-1">Request {exchange.requestPath}</p>
-        <pre className="text-2xs font-mono whitespace-pre-wrap break-words">{safeStringify(requestPayload)}</pre>
+        <p className="text-2xs uppercase text-muted-foreground mb-1">Scenario Input</p>
+        <pre className="text-2xs font-mono whitespace-pre-wrap break-words">{exchange.scenarioInput}</pre>
       </div>
+
+      <div className="bg-secondary/30 rounded p-2">
+        <p className="text-2xs uppercase text-muted-foreground mb-1">Wire Request {exchange.requestPath}</p>
+        <pre className="text-2xs font-mono whitespace-pre-wrap break-words">{safeStringify(exchange.requestPayload)}</pre>
+      </div>
+
+      {exchange.toolTrace.length > 0 && (
+        <div className="bg-secondary/30 rounded p-2 space-y-2">
+          <p className="text-2xs uppercase text-muted-foreground">Tool Trace</p>
+          {exchange.toolTrace.map((step, index) => (
+            <div key={`${step.kind}-${step.toolName}-${index}`} className="border border-border/60 rounded p-2">
+              <p className="text-2xs font-mono text-muted-foreground">{step.kind} • {step.toolName}</p>
+              {step.argumentsText && <pre className="text-2xs font-mono whitespace-pre-wrap break-words mt-1">{step.argumentsText}</pre>}
+              {step.contentText && <pre className="text-2xs font-mono whitespace-pre-wrap break-words mt-1">{step.contentText}</pre>}
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="bg-secondary/30 rounded p-2">
         <p className="text-2xs uppercase text-muted-foreground mb-1">
           Response {exchange.statusCode} ({exchange.contentType || 'unknown'})
         </p>
-        <pre className="text-2xs font-mono whitespace-pre-wrap break-words">{safeStringify(responsePayload)}</pre>
+        <pre className="text-2xs font-mono whitespace-pre-wrap break-words">{safeStringify(exchange.responsePayload)}</pre>
       </div>
     </div>
   )
@@ -473,8 +691,7 @@ function aggregateModelLeaderboard(runs: BenchmarkRunRecord[]): ModelLeaderboard
   }>()
 
   for (const run of runs) {
-    const report = run.report as { results?: Array<Record<string, unknown>> } | undefined
-    const results = report?.results ?? []
+    const results = run.report?.results ?? []
     for (const result of results) {
       if (result.status === 'skipped') continue
       const model = String(result.model ?? '')

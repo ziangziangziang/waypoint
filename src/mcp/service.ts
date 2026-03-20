@@ -15,7 +15,6 @@ import { imageDataUrlFromPath, runImageUnderstanding } from "../services/imageUn
 import { ImageGenerationRequest } from "../types";
 import {
   validateAtMostOneImageInput,
-  MCP_TOOL_DESCRIPTION_TEMPLATE,
   resolveBinaryOutputPolicy,
   typedError,
   validateSingleImageInput,
@@ -45,6 +44,12 @@ const defaultDeps: McpServiceDependencies = {
   runImageUnderstanding,
 };
 
+const GENERATE_IMAGE_TOOL_DESCRIPTION =
+  "Generate or edit images. workspace_root is required, and successful calls always write files into that workspace. Unless output_path or output_dir is set, files go to .waypoint/generated-images. Report file_path or file_paths, never the MCP transcript path. Use include_data=true only when inline image data is also needed.";
+
+const UNDERSTAND_IMAGE_TOOL_DESCRIPTION =
+  "Analyze one image and return structured text. Provide exactly one of image_path or image_url. If returning points or boxes, use original-image pixel coordinates. Keep instruction short and say what format you want back.";
+
 export function createMcpService(
   paths: StoragePaths,
   deps: McpServiceDependencyOverrides = {}
@@ -69,13 +74,13 @@ export function createMcpService(
     server.registerTool(
       "generate_image",
       {
-        description:
-          `Generate image(s) from text using Waypoint diffusion model routing. Provide image_path or image_url for image-to-image editing. ${MCP_TOOL_DESCRIPTION_TEMPLATE.binary} Use include_data=true only when inline transport is explicitly required.`,
+        description: GENERATE_IMAGE_TOOL_DESCRIPTION,
         inputSchema: {
           prompt: z.string().min(1),
           model: z.string().optional(),
           image_path: z.string().optional(),
           image_url: z.string().optional(),
+          workspace_root: z.string().optional(),
           n: z.number().int().min(1).max(4).optional(),
           size: z.string().optional(),
           quality: z.string().optional(),
@@ -98,13 +103,22 @@ export function createMcpService(
             image_path: args.image_path,
             image_url: args.image_url,
           });
+          if (!args.workspace_root) {
+            throw typedError("invalid_request", "workspace_root is required for generate_image.");
+          }
+          await assertWorkspaceRoot(args.workspace_root);
+          const requestedOutputDir =
+            !args.output_path && !args.output_dir
+              ? "./.waypoint/generated-images"
+              : args.output_dir;
           const filePolicy = resolveBinaryOutputPolicy({
             n: args.n,
             output_path: args.output_path,
-            output_dir: args.output_dir,
+            output_dir: requestedOutputDir,
             include_data: args.include_data,
+            workspace_root: args.workspace_root,
           });
-          const hasFileOutput = Boolean(filePolicy.outputPathPattern || filePolicy.outputDir);
+          const hasFileOutput = true;
           // File output requires decodable bytes; force b64_json upstream even if caller asks for "url".
           const responseFormat = hasFileOutput ? "b64_json" : (args.response_format ?? "b64_json");
           const request: ImageGenerationRequest = {
@@ -124,26 +138,30 @@ export function createMcpService(
             generated.payload,
             generated.model
           );
-          const images = filePolicy.outputPathPattern || filePolicy.outputDir
-              ? await materializeImagesToFiles(normalized.images, normalized.created, {
-                  outputPathPattern: filePolicy.outputPathPattern,
-                  outputDir: filePolicy.outputDir,
-                  includeData: filePolicy.includeData,
-                  outputBaseRoot: filePolicy.outputBaseRoot,
-                })
-              : normalized.images;
+          const artifacts = await materializeImagesToFiles(normalized.images, normalized.created, {
+            outputPathPattern: filePolicy.outputPathPattern,
+            outputDir: filePolicy.outputDir,
+            includeData: filePolicy.includeData,
+            outputBaseRoot: filePolicy.outputBaseRoot,
+          });
+          const filePaths = artifacts.map((artifact) => artifact.file_path);
+          const summary = buildGenerateImageSummary(filePaths.length);
 
           const output = {
             ok: true,
+            summary,
             model: normalized.model,
             created: normalized.created,
-            images,
+            ...(filePaths.length === 1
+              ? { file_path: filePaths[0] }
+              : { file_paths: filePaths }),
+            artifacts,
           };
           return {
             content: [
               {
                 type: "text" as const,
-                text: JSON.stringify(output),
+                text: JSON.stringify(buildGenerateImageTextPayload(output)),
               },
             ],
             structuredContent: output,
@@ -181,8 +199,7 @@ export function createMcpService(
     server.registerTool(
       "understand_image",
       {
-        description:
-          `Analyze an image and return structured text understanding using a vision-capable chat model. ${MCP_TOOL_DESCRIPTION_TEMPLATE.image_to_text}`,
+        description: UNDERSTAND_IMAGE_TOOL_DESCRIPTION,
         inputSchema: {
           image_path: z.string().optional(),
           image_url: z.string().optional(),
@@ -212,15 +229,28 @@ export function createMcpService(
             },
             controller.signal
           );
+          const summary = "Image analyzed.";
           const output = {
             ok: true,
+            summary,
             model: result.model,
-            analysis: result.analysis,
-            raw_text: result.raw_text,
-            usage: result.usage,
+            text: result.raw_text,
+            result: result.analysis,
+            ...(result.image_geometry ? { image_geometry: result.image_geometry } : {}),
+            ...(result.usage ? { usage: result.usage } : {}),
           };
           return {
-            content: [{ type: "text" as const, text: JSON.stringify(output) }],
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  ok: true,
+                  summary,
+                  model: result.model,
+                  text: result.raw_text,
+                }),
+              },
+            ],
             structuredContent: output,
           };
         } catch (error) {
@@ -379,7 +409,7 @@ async function materializeImagesToFiles(
       b64_json?: string;
     } = {
       index: image.index,
-      file_path: resolvedPath,
+      file_path: toRelativeFilePath(options.outputBaseRoot, resolvedPath),
       mime_type: payload.mimeType,
       bytes: payload.buffer.length,
     };
@@ -445,11 +475,43 @@ function resolveOutputPath(
       ? path.resolve(pattern)
       : path.resolve(options.outputBaseRoot, pattern);
   }
-  const dirValue = options.outputDir ?? process.cwd();
+  const dirValue = options.outputDir ?? "./.waypoint/generated-images";
   const dir = path.isAbsolute(dirValue)
     ? path.resolve(dirValue)
     : path.resolve(options.outputBaseRoot, dirValue);
   return path.join(dir, `image-${created}-${index}.${extension}`);
+}
+
+function toRelativeFilePath(outputBaseRoot: string, resolvedPath: string): string {
+  const relative = path.relative(outputBaseRoot, resolvedPath);
+  if (!relative || relative === "") {
+    return ".";
+  }
+  return relative.split(path.sep).join("/");
+}
+
+async function assertWorkspaceRoot(workspaceRoot: string): Promise<void> {
+  if (!path.isAbsolute(workspaceRoot)) {
+    throw typedError(
+      "invalid_request",
+      `workspace_root must be an absolute path, got '${workspaceRoot}'.`
+    );
+  }
+  let stats;
+  try {
+    stats = await fs.stat(workspaceRoot);
+  } catch {
+    throw typedError(
+      "invalid_request",
+      `workspace_root is not readable: ${workspaceRoot}`
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw typedError(
+      "invalid_request",
+      `workspace_root must be a directory: ${workspaceRoot}`
+    );
+  }
 }
 
 async function resolveOptionalImageInputToUrl(input: {
@@ -473,4 +535,24 @@ async function resolveOptionalImageInputToUrl(input: {
     "invalid_request",
     "image_url must be an http(s) URL or data:image/* URL."
   );
+}
+
+function buildGenerateImageSummary(count: number): string {
+  return count === 1 ? "Generated 1 image file in the workspace." : `Generated ${count} image files in the workspace.`;
+}
+
+function buildGenerateImageTextPayload(output: {
+  ok: boolean;
+  summary: string;
+  model: string;
+  file_path?: string;
+  file_paths?: string[];
+}): Record<string, unknown> {
+  return {
+    ok: output.ok,
+    summary: output.summary,
+    ...(output.file_path ? { file_path: output.file_path } : {}),
+    ...(output.file_paths ? { file_paths: output.file_paths } : {}),
+    model: output.model,
+  };
 }

@@ -42,7 +42,9 @@ function renderTextSummary(report: BenchmarkReport): string {
   lines.push(`Run ID: ${report.id}`);
   lines.push(`Created: ${report.createdAt}`);
   lines.push(`Profile: ${report.profile}`);
+  lines.push(`Mode: ${report.executionMode}`);
   if (report.suite) lines.push(`Suite: ${report.suite}`);
+  if (report.exampleId) lines.push(`Example: ${report.exampleId}`);
   if (report.scenarioPath) lines.push(`Scenario File: ${report.scenarioPath}`);
   if (report.modelOverride) lines.push(`Model Override: ${report.modelOverride}`);
   lines.push("");
@@ -91,6 +93,22 @@ function renderTextSummary(report: BenchmarkReport): string {
     );
     for (const reason of scenario.errorReasons) {
       lines.push(`  - ${reason}`);
+    }
+  }
+
+  if (report.scenarioDetails.length > 0) {
+    lines.push("");
+    lines.push("Showcase Details");
+    for (const detail of report.scenarioDetails) {
+      lines.push(`- ${detail.example?.title ?? detail.id} [${detail.status}]`);
+      lines.push(`  model=${detail.model}`);
+      lines.push(`  verdict=${detail.verdict}`);
+      if (detail.usedToolNames.length > 0) {
+        lines.push(`  tools=${detail.usedToolNames.join(", ")}`);
+      }
+      if (detail.finalResponsePreview) {
+        lines.push(`  final=${detail.finalResponsePreview}`);
+      }
     }
   }
 

@@ -2,18 +2,12 @@ import path from "path";
 
 export type McpTypedError = Error & { type: string };
 
-export const MCP_TOOL_DESCRIPTION_TEMPLATE = {
-  binary:
-    "Use file output by default to minimize MCP context payload. Agents MUST write outputs under the workspace directory, MUST prefer output_path/output_dir when available, MUST NOT request inline base64 unless explicitly required, and SHOULD keep responses minimal by default.",
-  image_to_text:
-    "Agents MUST provide exactly one image source (image_path or image_url), MUST NOT send both, and SHOULD use concise task-specific instructions unless detailed extraction is required.",
-} as const;
-
 export interface BinaryOutputPolicyInput {
   n?: number;
   output_path?: string;
   output_dir?: string;
   include_data?: boolean;
+  workspace_root?: string;
 }
 
 export interface BinaryOutputPolicyResolved {
@@ -26,6 +20,7 @@ export interface BinaryOutputPolicyResolved {
 interface BinaryOutputRootConfig {
   baseRoot: string;
   allowedRoot: string;
+  pinnedRoot?: string;
 }
 
 interface ResolveBinaryOutputPolicyOptions {
@@ -44,16 +39,24 @@ export function resolveBinaryOutputPolicy(
   options: ResolveBinaryOutputPolicyOptions = {}
 ): BinaryOutputPolicyResolved {
   const rootConfig = resolveBinaryOutputRootConfig(options);
+  if (!input.workspace_root) {
+    throw typedError("invalid_request", "workspace_root is required for generate_image.");
+  }
+  const workspaceRoot = resolveWorkspaceRoot(input.workspace_root, rootConfig);
+  const effectiveRootConfig = {
+    baseRoot: workspaceRoot,
+    allowedRoot: workspaceRoot,
+  };
 
   if (input.output_path && input.output_dir) {
     throw typedError("invalid_request", "Provide either output_path or output_dir, not both.");
   }
 
   if (input.output_path) {
-    ensureWorkspacePath(input.output_path, "output_path", rootConfig);
+    ensureWorkspacePath(input.output_path, "output_path", effectiveRootConfig);
   }
   if (input.output_dir) {
-    ensureWorkspacePath(input.output_dir, "output_dir", rootConfig);
+    ensureWorkspacePath(input.output_dir, "output_dir", effectiveRootConfig);
   }
 
   if (input.n && input.n > 1 && input.output_path && !input.output_path.includes("{index}")) {
@@ -66,8 +69,8 @@ export function resolveBinaryOutputPolicy(
   return {
     outputPathPattern: input.output_path,
     outputDir: input.output_dir,
-    includeData: input.include_data ?? !(input.output_path || input.output_dir),
-    outputBaseRoot: rootConfig.baseRoot,
+    includeData: input.include_data ?? false,
+    outputBaseRoot: workspaceRoot,
   };
 }
 
@@ -106,7 +109,7 @@ function resolveBinaryOutputRootConfig(options: ResolveBinaryOutputPolicyOptions
     );
   }
   const allowedRoot = configuredSubdir ? path.resolve(baseRoot, configuredSubdir) : baseRoot;
-  return { baseRoot, allowedRoot };
+  return { baseRoot, allowedRoot, pinnedRoot: configuredRoot ? baseRoot : undefined };
 }
 
 function resolveRequestedOutputPath(value: string, baseRoot: string): string {
@@ -116,11 +119,43 @@ function resolveRequestedOutputPath(value: string, baseRoot: string): string {
   return path.resolve(baseRoot, value);
 }
 
+function resolveWorkspaceRoot(
+  workspaceRoot: string | undefined,
+  rootConfig: BinaryOutputRootConfig
+): string {
+  if (!workspaceRoot) {
+    return rootConfig.baseRoot;
+  }
+  if (!path.isAbsolute(workspaceRoot)) {
+    throw typedError(
+      "invalid_request",
+      `workspace_root must be an absolute path, got '${workspaceRoot}'.`
+    );
+  }
+  const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+  const configuredRoot = rootConfig.pinnedRoot;
+  if (configuredRoot && resolvedWorkspaceRoot !== configuredRoot) {
+    if (!resolvedWorkspaceRoot.startsWith(`${configuredRoot}${path.sep}`)) {
+      throw typedError(
+        "invalid_request",
+        `workspace_root resolved to '${resolvedWorkspaceRoot}' and must be within '${configuredRoot}'.`
+      );
+    }
+  }
+  return resolvedWorkspaceRoot;
+}
+
 function ensureWorkspacePath(
   value: string,
   fieldName: string,
   rootConfig: BinaryOutputRootConfig
 ): void {
+  if (path.isAbsolute(value)) {
+    throw typedError(
+      "invalid_request",
+      `${fieldName} must be relative to workspace_root, got '${value}'.`
+    );
+  }
   const resolved = resolveRequestedOutputPath(value, rootConfig.baseRoot);
   if (resolved === rootConfig.allowedRoot) {
     return;

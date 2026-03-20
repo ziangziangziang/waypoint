@@ -9,16 +9,13 @@ Scope:
 
 ## 1) Tool description standard
 
-Every tool description should be concise and policy-aware:
+Every tool description should be concise and action-first:
 
 1. Sentence 1: capability summary (what the tool does).
-2. Sentence 2: runtime/context policy for safe usage.
-3. Normative language:
-   - Agents **MUST** follow preferred safe defaults.
-   - Agents **MUST NOT** request expensive/large payloads unless explicitly required.
-   - Agents **SHOULD** minimize response payload size.
+2. Sentence 2: required default behavior for the caller.
+3. Sentence 3: the biggest pitfall to avoid.
 
-Binary-producing tools should explicitly mention file-first behavior.
+Binary-producing tools should explicitly mention workspace-only file behavior.
 
 ## 2) Input schema conventions
 
@@ -37,8 +34,11 @@ Top-level response shape:
 For binary-producing tools:
 
 - Default to lightweight metadata in responses.
-- Prefer file output (`file_path`, `mime_type`, `bytes`) when supported.
+- Require workspace file output when the tool is binary-producing.
+- Return workspace-relative `file_path` values rather than absolute host paths.
+- Make `file_path` / `file_paths` the canonical small-model result fields.
 - Include raw `url` / `b64_json` only with explicit opt-in (`include_data=true`).
+- Keep `content.text` compact and free of inline base64.
 
 ## 4) Error taxonomy
 
@@ -55,20 +55,21 @@ Error messages should be deterministic and actionable.
 ## 5) Operational behavior
 
 - Tool handlers should define explicit timeout behavior (for example 60s for image generation).
-- Do not silently degrade into large inline payload responses when file mode is requested.
+- Do not silently degrade into inline-only success for binary tools.
 - For binary file-output modes, tools MAY override upstream response format to a byte-bearing format to guarantee file materialization.
 - Retry behavior should be explicit per tool. If no retries are implemented, fail deterministically.
 - In multi-project environments, pin MCP output root via server env:
   - `WAYPOINT_MCP_OUTPUT_ROOT=<absolute project root>`
   - `WAYPOINT_MCP_OUTPUT_SUBDIR=work` (or another controlled relative subdir)
   - `WAYPOINT_MCP_STRICT_OUTPUT_ROOT=true` for fail-fast misconfiguration handling.
+- For streamable HTTP clients, `generate_image` requires `workspace_root`; when present it becomes the base for all relative output paths.
 
 ## 6) Agent behavior guidelines
 
 For tool-calling agents:
 
 1. Prefer file output for binary-generating tools.
-2. Write outputs under the workspace directory (use workspace-relative paths).
+2. Provide `workspace_root` and write outputs under that workspace directory.
 3. Keep responses minimal unless inline data is explicitly needed downstream.
 4. Avoid repeated expensive calls with unchanged arguments.
 5. Use `include_data=true` only for explicit transport requirements.
@@ -84,7 +85,8 @@ When the server is pinned with `WAYPOINT_MCP_OUTPUT_ROOT`/`WAYPOINT_MCP_OUTPUT_S
   "name": "generate_image",
   "arguments": {
     "prompt": "Minimal icon with clean geometric shape",
-    "output_dir": "./tmp/waypoint-images",
+    "workspace_root": "/abs/path/to/repo",
+    "output_dir": "./.waypoint/generated-images",
     "include_data": false
   }
 }
@@ -98,7 +100,8 @@ When the server is pinned with `WAYPOINT_MCP_OUTPUT_ROOT`/`WAYPOINT_MCP_OUTPUT_S
   "arguments": {
     "prompt": "Replace the background with a clean studio backdrop",
     "image_path": "./tmp/input.png",
-    "output_dir": "./tmp/waypoint-images",
+    "workspace_root": "/abs/path/to/repo",
+    "output_dir": "./.waypoint/generated-images",
     "include_data": false
   }
 }
@@ -108,7 +111,8 @@ When the server is pinned with `WAYPOINT_MCP_OUTPUT_ROOT`/`WAYPOINT_MCP_OUTPUT_S
 
 - Exactly one image source is required (`image_path` xor `image_url`).
 - Keep `instruction` concise and task-specific unless broad analysis is needed.
-- Return structured analysis fields with `analysis.answer` always populated.
+- Treat top-level `text` as the canonical answer field.
+- For local image files, coordinate-sensitive answers should be expressed in original image pixels even when the upload is resized upstream.
 
 ## 7) New MCP tool checklist
 
@@ -116,7 +120,7 @@ Before adding a new built-in MCP tool:
 
 1. Description follows the governance template and includes normative guidance.
 2. Input schema uses `snake_case`, bounds/defaults, and validates incompatible combinations.
-3. Output shape follows `{ ok: true|false, ... }` and file-first policy for binary payloads.
+3. Output shape follows `{ ok: true|false, ... }`, compact `content.text`, and workspace-only file policy for binary payloads.
 4. Typed errors are stable and mapped to taxonomy.
 5. Tests cover:
    - policy validation rules,

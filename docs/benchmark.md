@@ -1,241 +1,192 @@
 # Waypoint Benchmark
 
-Waypoint benchmark is config-driven and capability-aware.
+Waypoint benchmark now has two roles:
+
+- `showcase`: a live, user-visible replay of curated examples
+- `diagnostic`: the older internal smoke/capability/regression path
+
+Default behavior is showcase-first.
 
 ## Quick start
 
 ```bash
-# Default run: profile=local, suite=smoke
+# Default run: showcase suite, one visible replay per example
 waypoint bench
 
-# Explicit profile/config
-waypoint bench --config ./examples/benchmark.config.yaml --profile ci
+# List showcase examples
+waypoint bench --list-examples
 
-# Run built-in suite + custom scenarios
-waypoint bench --suite smoke --scenario ./examples/scenarios/custom.yaml
+# Run one example
+waypoint bench --example showcase-agent-tool-call
 
-# Smart pool routing smoke check
-waypoint bench --suite pool_smoke
+# Pin a model for a showcase example
+waypoint bench --suite showcase --example showcase-responses-basic --model smart
 
-# Omni call smoke check (audio + text turn)
-waypoint bench --suite omni_call_smoke
+# Run a diagnostic suite
+waypoint bench --mode diagnostic --suite pool_smoke
 
-# Capability probe run + cache update
-waypoint bench --suite capabilities --update-cap-cache
+# Add file-driven scenarios
+waypoint bench --scenario ./examples/scenarios/custom.yaml
 
-# Compare with baseline for soft regression warnings
-waypoint bench --baseline ~/.config/waypoint/benchmarks/bench-2026-02-23T12-00-00-000Z.json
+# Compare with a previous diagnostic run
+waypoint bench --mode diagnostic --baseline ~/.config/waypoint/benchmarks/bench-2026-02-23T12-00-00-000Z.json
 ```
 
 ## CLI options
 
-- `--suite <name>` built-in suite (`smoke`, `proxy`, `agent`, `pool_smoke`, `omni_call_smoke`, `capabilities`)
-- `--scenario <path>` scenario file (`.json`, `.jsonl`, `.yaml`, `.yml`)
-- `--model <name>` force one model for all scenarios
-- `--out <path>` output file (`.json`/`.txt`) or output directory
-- `--config <path>` benchmark config file (YAML or JSON)
-- `--profile <name>` config profile (default: `local`)
-- `--baseline <path>` previous benchmark report for p95/throughput deltas
-- `--update-cap-cache` persist capability findings to `$WAYPOINT_DIR/capabilities`
-- `--cap-ttl-days <n>` capability TTL override for freshness (default `7`)
+- `--suite <name>` built-in suite. Public default is `showcase`.
+- `--example <id>` run one built-in example from the selected suite.
+- `--list-examples` list built-in examples and exit.
+- `--mode <name>` `showcase` or `diagnostic`.
+- `--scenario <path>` scenario file (`.json`, `.jsonl`, `.yaml`, `.yml`).
+- `--model <name>` force one model for all scenarios.
+- `--out <path>` output file (`.json`/`.txt`) or output directory.
+- `--config <path>` benchmark config file (YAML or JSON).
+- `--profile <name>` config profile (default: `local`).
+- `--baseline <path>` previous benchmark report for p95/throughput deltas.
+- `--update-cap-cache` persist capability findings to `$WAYPOINT_DIR/capabilities`.
+- `--cap-ttl-days <n>` capability TTL override for freshness (default `7`).
 
-## Config resolution order
+## Showcase examples
 
-1. CLI flags (`--suite`, `--scenario`, `--model`, `--out`, `--profile`, `--baseline`, `--update-cap-cache`, `--cap-ttl-days`)
-2. Explicit `--config`
-3. `$WAYPOINT_DIR/benchmark.config.yaml` (if present)
-4. Internal defaults
+The `showcase` suite is the release-facing path. It is built from Opencode-style real usage:
 
-## Internal defaults
+- plain chat completion
+- `/v1/responses` compatibility
+- agent tool calling
+- multi-step agent loop
+- image generation
+- audio + text turn
 
-- `requestTimeoutMs: 120000`
-- `toolTimeoutMs: 15000`
-- `maxIterations: 6`
-- `temperature: 0`
-- `max_tokens: 512`
-- `concurrency: 1`
+Showcase behavior:
 
-Profiles:
+- sequential only
+- one visible replay per scenario
+- request/response trace is the main artifact
+- verdict explains what passed or failed
+- raw payloads stay in the live event stream; persisted artifacts keep sanitized traces
 
-- `local`: `warmupRuns=1`, `measuredRuns=3`, `minScenarioPassRate=1.0`
-- `ci`: `warmupRuns=2`, `measuredRuns=5`, `minScenarioPassRate=1.0`
+## Diagnostic suites
 
-## Scenario file formats
+The older suites remain for engineering use:
 
-File shapes:
+- `smoke`
+- `proxy`
+- `agent`
+- `pool_smoke`
+- `omni_call_smoke`
+- `capabilities`
 
-- array of scenarios
-- object with `scenarios` array
+Diagnostic behavior:
 
-File types:
+- profile-driven warmup and measured runs
+- pass-rate and latency summaries
+- optional baseline regression warnings
+- optional capability cache updates
 
-- `.json`
-- `.jsonl`
-- `.yaml` / `.yml`
+Concurrency is no longer part of the benchmark story.
 
-## Scenario schema (v1)
+## Scenario schema
 
-Required fields (all modes):
+Required fields:
 
 - `id: string`
-- `mode: "chat" | "agent" | "embeddings" | "image_generation" | "audio_transcription" | "audio_speech" | "omni_call"`
+- `mode: "chat" | "agent" | "responses" | "embeddings" | "image_generation" | "audio_transcription" | "audio_speech" | "omni_call"`
 
 Mode-specific required fields:
 
-- `chat | agent`: `prompt`
-- `embeddings`: `input` (`string | string[]`)
-- `image_generation`: `prompt`
+- `chat | agent | responses | image_generation`: `prompt`
+- `embeddings`: `input`
 - `audio_transcription`: `audioFile`
 - `audio_speech`: `inputText`, `voice`
-- `omni_call`: `audioFile` (optional `prompt`)
+- `omni_call`: `audioFile`
 
-Common optional fields:
+Useful showcase metadata:
 
-- `model`, `timeoutMs`, `assertions`
-- `temperature`, `max_tokens` (chat/agent)
-- `tools`, `maxIterations` (agent)
-- `n`, `size` (image_generation)
-- `response_format` (audio_speech)
+- `title`
+- `summary`
+- `userVisibleGoal`
+- `exampleSource`
+- `inputPreview`
+- `successCriteria`
+- `expectedHighlights`
+- `requiresAvailableTools`
 
 Assertions:
 
-- Generic: `statusCode`, `maxLatencyMs`
-- Chat/agent: `contains`, `notContains`, `minToolCalls`, `maxToolCalls`
-- Embeddings: `minItems`, `minVectorLength`
-- Image generation: `minImages`
-- Audio transcription: `containsText`, `notContainsText`
-- Audio speech: `minBytes`, `contentType`
-- Omni call: uses generic text assertions (`contains`, `notContains`) and records `audio_output=yes|no` in output preview
+- generic: `statusCode`, `maxLatencyMs`
+- chat/agent/responses: `contains`, `notContains`
+- agent: `minToolCalls`, `maxToolCalls`, `requiredToolNames`
+- embeddings: `minItems`, `minVectorLength`
+- image generation: `minImages`
+- audio transcription: `containsText`, `notContainsText`
+- audio speech: `minBytes`, `contentType`
 
 Validation behavior:
 
 - schema errors fail fast with `file + index + field`
-- unknown fields are warnings (not hard failures)
+- unknown fields become warnings
 
-### Example: embeddings
-
-```json
-{
-  "id": "embed-basic",
-  "mode": "embeddings",
-  "input": ["waypoint", "proxy"],
-  "assertions": {
-    "minItems": 2,
-    "minVectorLength": 1,
-    "statusCode": 200
-  }
-}
-```
-
-### Example: image generation
+### Example: showcase responses scenario
 
 ```json
 {
-  "id": "img-basic",
-  "mode": "image_generation",
-  "prompt": "A minimal gateway icon",
-  "assertions": {
-    "minImages": 1,
-    "statusCode": 200
-  }
-}
-```
-
-### Example: audio speech
-
-```json
-{
-  "id": "tts-basic",
-  "mode": "audio_speech",
-  "inputText": "Waypoint benchmark",
-  "voice": "alloy",
-  "assertions": {
-    "minBytes": 1,
-    "statusCode": 200
-  }
-}
-```
-
-### Example: omni call
-
-```json
-{
-  "id": "omni-call-basic",
-  "mode": "omni_call",
-  "audioFile": "examples/scenarios/assets/omni-call-sample.wav",
-  "prompt": "Transcribe and summarize this audio.",
+  "id": "responses-demo",
+  "mode": "responses",
+  "title": "Responses Demo",
+  "userVisibleGoal": "Show Responses API compatibility.",
+  "prompt": "List two reasons to use a local AI gateway.",
   "assertions": {
     "statusCode": 200
   }
 }
 ```
 
-## Execution behavior
+### Example: showcase tool-calling scenario
 
-Per scenario:
+```json
+{
+  "id": "agent-tool-demo",
+  "mode": "agent",
+  "title": "Tool Calling",
+  "prompt": "Use one available tool, then summarize what you learned.",
+  "requiresAvailableTools": true,
+  "assertions": {
+    "statusCode": 200,
+    "minToolCalls": 1
+  }
+}
+```
 
-- warmup runs (discarded)
-- measured runs (reported)
+## Artifacts and UI behavior
 
-Per executed scenario report includes:
-
-- `passRate`, `avg/p50/p95/p99 latency`
-- token totals
-- tool-call totals
-- throughput (`tokens/s`)
-- pool routing metrics (`candidateAttempts`, `failovers`, `rateLimitSwitches`, `distinctProviders`, `distinctModels`)
-
-If a scenario has no compatible model family configured:
-
-- scenario is marked `skipped`
-- benchmark continues
-- warning is added to report
-
-Agent safeguards:
-
-- strict `maxIterations`
-- per-tool timeout
-- cap reached -> `max_iterations_reached`
-
-## Gates and exit policy
-
-Hard gates (exit code `1`):
-
-- smoke success rate below `gates.hard.smokeMinSuccessRate` (for executed smoke scenarios)
-- any executed scenario `passRate < minScenarioPassRate`
-- schema/validation errors
-
-Soft gates (warning only, exit code `0`):
-
-- baseline p95 regression above `gates.soft.maxP95RegressionPct`
-- baseline throughput drop above `gates.soft.maxThroughputDropPct`
-
-## Artifacts
-
-Default output path:
-
-- `$WAYPOINT_DIR/benchmarks`
-- fallback: `~/.config/waypoint/benchmarks`
-
-Per run:
+Each run writes:
 
 - `bench-<timestamp>.json`
 - `bench-<timestamp>.txt`
 
-Capability cache (optional, when `--update-cap-cache` is used):
+Reports now include:
 
-- `$WAYPOINT_DIR/capabilities/<providerId>__<modelId>.json`
+- run metadata and effective config
+- per-scenario results
+- sanitized scenario details for history
+- live-show traces for each scenario
+- verdict strings and tool usage summaries
+- optional capability matrix
 
-Report includes:
+The Benchmark UI is optimized for:
 
-- run metadata + effective config
-- `total`, `executed`, `skipped`, `succeeded`, `failed`
-- per-mode summary
-- per-scenario results + measured samples
-- gate outcomes
-- top failure reasons + warnings
-- optional `capabilityMatrix` with per-model capability status/evidence/freshness
+- selecting one example
+- watching the live trace
+- reading the exact scenario input
+- inspecting tool calls and tool results
+- seeing the final verdict clearly
 
-## Recommended config template
+## Verification checklist
 
-See `/Users/zziang/Documents/projects/vibeCoding/Agents/waypoint/examples/benchmark.config.yaml`.
+- `waypoint bench` defaults to showcase behavior.
+- `waypoint bench --list-examples` lists human-readable examples.
+- Benchmark UI loads showcase examples by default.
+- A showcase run shows scenario input, wire request, response, and verdict.
+- Tool-driven examples are skipped clearly when no MCP tools are available.
+- Diagnostic suites still produce capability and regression information.

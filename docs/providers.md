@@ -35,7 +35,7 @@ Use provider-first model management:
 
 Legacy command forms (`waypoint provider ...`, `waypoint provider model ...`) are still supported through rewrite shims with deprecation warnings.
 
-Legacy endpoint write commands are blocked in v0.5.0; use migration + provider model commands.
+Legacy endpoint write commands are blocked in v0.5.0; use migration + `waypoint models ...` commands.
 
 ## Inference V2 (ray/kserve-style) example
 

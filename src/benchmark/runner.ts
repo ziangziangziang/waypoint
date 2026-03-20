@@ -18,7 +18,7 @@ import { computeConfigFingerprint, writeCapabilitySnapshots } from "./capability
 import { resolveBenchmarkConfig } from "./config";
 import { evaluateGates } from "./gates";
 import { validateScenarioCollection } from "./schema";
-import { builtInSuite } from "./suites";
+import { builtInSuite, listSuiteExamples } from "./suites";
 import { listProviders } from "../providers/repository";
 import { ProviderModelRecord } from "../providers/types";
 import {
@@ -28,11 +28,15 @@ import {
   BenchmarkCapabilityKey,
   BenchmarkCapabilityMatrix,
   BenchmarkCapabilityStatus,
+  BenchmarkExchangeSummary,
   BenchmarkMode,
   BenchmarkModeRequirements,
   BenchmarkReport,
   BenchmarkRunOutput,
   BenchmarkScenario,
+  BenchmarkScenarioDetail,
+  BenchmarkScenarioSummary,
+  BenchmarkToolTraceStep,
   BenchmarkModelCapabilitySnapshot,
   EffectiveBenchmarkConfig,
   ScenarioResult,
@@ -49,11 +53,18 @@ export type BenchmarkProgressEventType =
   | "run_completed";
 
 export interface BenchmarkExchangeEvent {
+  scenarioInput: string;
+  requestPreview: string;
+  responsePreview: string;
   mode: BenchmarkMode;
   model: string;
   requestPath: string;
   statusCode: number;
   contentType: string;
+  endpointId?: string;
+  endpointName?: string;
+  upstreamModel?: string;
+  toolTrace: BenchmarkToolTraceStep[];
   requestRaw: unknown;
   requestSanitized: unknown;
   responseRaw: unknown;
@@ -70,6 +81,7 @@ export interface BenchmarkProgressEvent {
   runIndex?: number;
   totalRuns?: number;
   phase?: "warmup" | "measured";
+  scenario?: BenchmarkScenarioSummary;
   exchange?: BenchmarkExchangeEvent;
   sample?: ScenarioRunSample;
   result?: ScenarioResult;
@@ -107,6 +119,11 @@ interface JsonResponseEnvelope {
   payload: unknown;
   contentType: string;
   requestPayload: Record<string, unknown>;
+  route: {
+    endpointId: string;
+    endpointName?: string;
+    upstreamModel?: string;
+  };
   poolMetrics?: {
     candidateAttempts: number;
     failovers: number;
@@ -121,6 +138,11 @@ interface BinaryResponseEnvelope {
   buffer: Buffer;
   contentType: string;
   requestPayload: Record<string, unknown>;
+  route: {
+    endpointId: string;
+    endpointName?: string;
+    upstreamModel?: string;
+  };
   poolMetrics?: {
     candidateAttempts: number;
     failovers: number;
@@ -132,12 +154,18 @@ interface BinaryResponseEnvelope {
 
 interface ScenarioExecution {
   scenario: BenchmarkScenario;
+  example: BenchmarkScenarioSummary;
   result: ScenarioResult;
   samples: ScenarioRunSample[];
+  exchanges: BenchmarkExchangeSummary[];
   warnings: string[];
 }
 
 type ScenarioExchangeCallback = (event: BenchmarkExchangeEvent) => void;
+
+export function listBenchmarkExamples(suite = "showcase"): BenchmarkScenarioSummary[] {
+  return listSuiteExamples(suite);
+}
 
 export async function runBenchmark(
   paths: StoragePaths,
@@ -197,6 +225,7 @@ export async function runBenchmark(
       scenarioId: scenario.id,
       scenarioIndex: scenarioIndex + 1,
       totalScenarios: loaded.scenarios.length,
+      scenario: scenarioToSummary(scenario, effective.run.suite),
     });
 
     const execution = await runScenarioWithSampling(
@@ -315,10 +344,24 @@ async function loadScenarios(paths: StoragePaths, effective: EffectiveBenchmarkC
     }
   }
 
+  if (effective.run.exampleId) {
+    allScenarios = allScenarios.filter((scenario) => scenario.id === effective.run.exampleId);
+    if (allScenarios.length === 0) {
+      throw new Error(
+        `Example '${effective.run.exampleId}' not found in suite '${effective.run.suite ?? "showcase"}'.`
+      );
+    }
+  }
+
   if (effective.run.scenarioPath) {
     const filePath = path.resolve(effective.run.scenarioPath);
     const fromFile = await loadScenarioFile(filePath);
     const validated = validateScenarioCollection(fromFile, filePath);
+    for (const scenario of validated.scenarios) {
+      if (!scenario.exampleSource) {
+        scenario.exampleSource = "file";
+      }
+    }
     allScenarios.push(...validated.scenarios);
     warnings.push(...validated.warnings);
   }
@@ -501,6 +544,7 @@ async function runScenarioWithSampling(
   ) => void
 ): Promise<ScenarioExecution> {
   const warnings: string[] = [];
+  const example = scenarioToSummary(scenario, effective.run.suite);
   const model =
     effective.run.modelOverride ||
     scenario.model ||
@@ -511,115 +555,72 @@ async function runScenarioWithSampling(
     warnings.push(`Scenario '${scenario.id}' skipped: ${reason}`);
     return {
       scenario,
+      example,
       result: buildSkippedScenarioResult(scenario, reason),
       samples: [],
+      exchanges: [],
       warnings,
     };
   }
 
-  const totalRuns =
-    effective.profileSettings.warmupRuns + effective.profileSettings.measuredRuns;
+  const runProfile =
+    effective.run.executionMode === "showcase"
+      ? { warmupRuns: 0, measuredRuns: 1, minScenarioPassRate: 1 }
+      : effective.profileSettings;
+  const totalRuns = runProfile.warmupRuns + runProfile.measuredRuns;
   const measuredSamples: ScenarioRunSample[] = [];
-  const concurrentProbe = shouldRunConcurrentProbe(scenario, effective);
-  const concurrentRuns = concurrentProbe ? Math.max(1, effective.defaults.concurrency) : 1;
+  const measuredExchanges: BenchmarkExchangeSummary[] = [];
+
+  const selectedTools = getSelectedTools(scenario.tools);
+  if (scenario.requiresAvailableTools && selectedTools.length === 0) {
+    const reason = "No MCP tools are available for this tool-driven example.";
+    warnings.push(`Scenario '${scenario.id}' skipped: ${reason}`);
+    return {
+      scenario,
+      example,
+      result: buildSkippedScenarioResult(scenario, reason),
+      samples: [],
+      exchanges: [],
+      warnings,
+    };
+  }
 
   for (let index = 0; index < totalRuns; index++) {
-    const phase = index < effective.profileSettings.warmupRuns ? "warmup" : "measured";
+    const phase = index < runProfile.warmupRuns ? "warmup" : "measured";
     const runIndex = index + 1;
-    const sample =
-      concurrentRuns <= 1 || phase === "warmup"
-        ? await runSingleScenario(
-            paths,
-            scenario,
-            model,
-            effective,
-            runIndex,
-            (event) => onExchange?.(event, runIndex, phase, totalRuns)
-          )
-        : mergeConcurrentSamples(
-            await Promise.all(
-              Array.from({ length: concurrentRuns }).map((_, offset) =>
-                runSingleScenario(
-                  paths,
-                  scenario,
-                  model,
-                  effective,
-                  runIndex * 1000 + offset + 1,
-                  (event) => onExchange?.(event, runIndex, phase, totalRuns)
-                )
-              )
-            ),
-            runIndex
-          );
+    const runExchanges: BenchmarkExchangeSummary[] = [];
+    const sample = await runSingleScenario(
+      paths,
+      scenario,
+      model,
+      effective,
+      runIndex,
+      (event) => {
+        if (phase === "measured") {
+          runExchanges.push(toExchangeSummary(event));
+        }
+        onExchange?.(event, runIndex, phase, totalRuns);
+      }
+    );
     onSampleComplete?.(sample, index + 1, phase, totalRuns);
-    if (index >= effective.profileSettings.warmupRuns) {
+    if (index >= runProfile.warmupRuns) {
       measuredSamples.push(sample);
+      measuredExchanges.push(...runExchanges);
     }
   }
 
   return {
     scenario,
+    example,
     result: buildScenarioResult(
       scenario,
       model,
       measuredSamples,
-      effective.profileSettings.minScenarioPassRate
+      runProfile.minScenarioPassRate
     ),
+    exchanges: measuredExchanges,
     samples: measuredSamples,
     warnings,
-  };
-}
-
-function shouldRunConcurrentProbe(
-  scenario: BenchmarkScenario,
-  effective: EffectiveBenchmarkConfig
-): boolean {
-  if (effective.run.suite !== "capabilities") {
-    return false;
-  }
-  if (effective.defaults.concurrency <= 1) {
-    return false;
-  }
-  return (
-    scenario.id.startsWith("cap.concurrent_chat_basic") ||
-    scenario.id.startsWith("cap.agent_tool_calls_under_load")
-  );
-}
-
-function mergeConcurrentSamples(samples: ScenarioRunSample[], runIndex: number): ScenarioRunSample {
-  const failures = samples.filter((sample) => !sample.success);
-  const primaryFailure = failures[0];
-  const statusCode =
-    samples.find((sample) => sample.statusCode >= 400)?.statusCode ??
-    samples[0]?.statusCode ??
-    0;
-  const outputPreview = samples
-    .map((sample) => sample.outputPreview)
-    .filter((value) => value.length > 0)
-    .slice(0, 2)
-    .join(" | ");
-
-  const latencyMs = samples.reduce((max, sample) => Math.max(max, sample.latencyMs), 0);
-  const tokens = samples.reduce((sum, sample) => sum + sample.tokens, 0);
-  const toolCalls = samples.reduce((sum, sample) => sum + sample.toolCalls, 0);
-  const throughputTokensPerSec = samples.reduce((sum, sample) => sum + sample.throughputTokensPerSec, 0);
-
-  return {
-    runIndex,
-    success: failures.length === 0,
-    latencyMs,
-    statusCode,
-    tokens,
-    toolCalls,
-    throughputTokensPerSec,
-    outputPreview: outputPreview || samples[0]?.outputPreview || "",
-    error: primaryFailure?.error,
-    candidateAttempts: samples.reduce((sum, sample) => sum + (sample.candidateAttempts ?? 0), 0),
-    failovers: samples.reduce((sum, sample) => sum + (sample.failovers ?? 0), 0),
-    rateLimitSwitches: samples.reduce((sum, sample) => sum + (sample.rateLimitSwitches ?? 0), 0),
-    distinctProviders: samples.reduce((max, sample) => Math.max(max, sample.distinctProviders ?? 0), 0),
-    distinctModels: samples.reduce((max, sample) => Math.max(max, sample.distinctModels ?? 0), 0),
-    audioOutputPresent: samples.some((sample) => sample.audioOutputPresent),
   };
 }
 
@@ -642,6 +643,7 @@ function getModeRequirements(mode: BenchmarkMode): BenchmarkModeRequirements {
   switch (mode) {
     case "chat":
     case "agent":
+    case "responses":
       return { requiredInput: ["text"], requiredOutput: ["text"], preferredEndpointType: "llm" };
     case "embeddings":
       return { requiredInput: ["text"], requiredOutput: ["embedding"], preferredEndpointType: "embedding" };
@@ -679,7 +681,10 @@ async function runSingleScenario(
       tokens: 0,
       toolCalls: 0,
       throughputTokensPerSec: 0,
+      finalOutput: "",
       outputPreview: "",
+      verdict: (error as Error).message,
+      usedToolNames: [],
       error: (error as Error).message,
       candidateAttempts: 0,
       failovers: 0,
@@ -703,6 +708,8 @@ async function runModeScenario(
       return runChatScenario(paths, scenario, model, effective, startTime, onExchange);
     case "agent":
       return runAgentScenario(paths, scenario, model, effective, startTime, onExchange);
+    case "responses":
+      return runResponsesScenario(paths, scenario, model, effective, startTime, onExchange);
     case "embeddings":
       return runEmbeddingsScenario(paths, scenario, model, effective, startTime, onExchange);
     case "image_generation":
@@ -743,6 +750,7 @@ async function runChatScenario(
   );
   onExchange?.(
     buildExchangeEvent({
+      scenario,
       mode: "chat",
       model,
       requestPath: "/v1/chat/completions",
@@ -750,6 +758,9 @@ async function runChatScenario(
       responsePayload: envelope.payload,
       statusCode: envelope.statusCode,
       contentType: envelope.contentType,
+      endpointId: envelope.route.endpointId,
+      endpointName: envelope.route.endpointName,
+      upstreamModel: envelope.route.upstreamModel,
     })
   );
 
@@ -761,6 +772,7 @@ async function runChatScenario(
   const assertionError = evaluateAssertions(scenario, {
     output,
     toolCalls: 0,
+    toolNames: [],
     latencyMs,
     statusCode: envelope.statusCode,
   });
@@ -772,7 +784,92 @@ async function runChatScenario(
     tokens,
     toolCalls: 0,
     throughputTokensPerSec: calculateThroughput(tokens, latencyMs),
+    finalOutput: output,
     outputPreview: truncate(output, 180),
+    verdict: assertionError ?? "All assertions passed.",
+    usedToolNames: [],
+    error: assertionError ?? undefined,
+    candidateAttempts: envelope.poolMetrics?.candidateAttempts ?? 0,
+    failovers: envelope.poolMetrics?.failovers ?? 0,
+    rateLimitSwitches: envelope.poolMetrics?.rateLimitSwitches ?? 0,
+    distinctProviders: envelope.poolMetrics?.distinctProviders ?? 0,
+    distinctModels: envelope.poolMetrics?.distinctModels ?? 0,
+  };
+}
+
+async function runResponsesScenario(
+  paths: StoragePaths,
+  scenario: BenchmarkScenario,
+  model: string,
+  effective: EffectiveBenchmarkConfig,
+  startTime: number,
+  onExchange?: ScenarioExchangeCallback
+): Promise<Omit<ScenarioRunSample, "runIndex">> {
+  const timeoutMs = scenario.timeoutMs ?? effective.defaults.requestTimeoutMs;
+  const payload: Record<string, unknown> = {
+    model,
+    input: scenario.prompt,
+    stream: false,
+    temperature: scenario.temperature ?? effective.defaults.temperature,
+    max_tokens: scenario.max_tokens ?? effective.defaults.max_tokens,
+  };
+
+  const envelope = await requestJson(
+    paths,
+    model,
+    "/v1/responses",
+    payload,
+    timeoutMs,
+    getModeRequirements("responses")
+  );
+  onExchange?.(
+    buildExchangeEvent({
+      scenario,
+      mode: "responses",
+      model,
+      requestPath: "/v1/responses",
+      requestPayload: envelope.requestPayload,
+      responsePayload: envelope.payload,
+      statusCode: envelope.statusCode,
+      contentType: envelope.contentType,
+      endpointId: envelope.route.endpointId,
+      endpointName: envelope.route.endpointName,
+      upstreamModel: envelope.route.upstreamModel,
+    })
+  );
+
+  const response = envelope.payload as {
+    output?: Array<{
+      type?: string;
+      content?: Array<{ type?: string; text?: string }>;
+      arguments?: string;
+      name?: string;
+    }>;
+    usage?: { total_tokens?: number };
+  };
+  const output = extractResponsesOutputText(response);
+  const tokens = Number(response?.usage?.total_tokens ?? 0);
+  const latencyMs = Date.now() - startTime;
+
+  const assertionError = evaluateAssertions(scenario, {
+    output,
+    toolCalls: 0,
+    toolNames: [],
+    latencyMs,
+    statusCode: envelope.statusCode,
+  });
+
+  return {
+    success: !assertionError,
+    latencyMs,
+    statusCode: envelope.statusCode,
+    tokens,
+    toolCalls: 0,
+    throughputTokensPerSec: calculateThroughput(tokens, latencyMs),
+    finalOutput: output,
+    outputPreview: truncate(output, 180),
+    verdict: assertionError ?? "All assertions passed.",
+    usedToolNames: [],
     error: assertionError ?? undefined,
     candidateAttempts: envelope.poolMetrics?.candidateAttempts ?? 0,
     failovers: envelope.poolMetrics?.failovers ?? 0,
@@ -799,6 +896,7 @@ async function runAgentScenario(
   let toolCalls = 0;
   let totalTokens = 0;
   let finalOutput = "";
+  const usedToolNames = new Set<string>();
   let statusCode = 200;
   let reachedIterationCap = true;
   let candidateAttempts = 0;
@@ -836,17 +934,6 @@ async function runAgentScenario(
       timeoutMs,
       getModeRequirements("agent")
     );
-    onExchange?.(
-      buildExchangeEvent({
-        mode: "agent",
-        model,
-        requestPath: "/v1/chat/completions",
-        requestPayload: envelope.requestPayload,
-        responsePayload: envelope.payload,
-        statusCode: envelope.statusCode,
-        contentType: envelope.contentType,
-      })
-    );
 
     statusCode = envelope.statusCode;
     const response = (envelope.payload as ChatResponse) ?? {};
@@ -863,6 +950,22 @@ async function runAgentScenario(
     const toolCallList = Array.isArray(assistantMessage?.tool_calls)
       ? assistantMessage.tool_calls
       : [];
+    onExchange?.(
+      buildExchangeEvent({
+        scenario,
+        mode: "agent",
+        model,
+        requestPath: "/v1/chat/completions",
+        requestPayload: envelope.requestPayload,
+        responsePayload: envelope.payload,
+        statusCode: envelope.statusCode,
+        contentType: envelope.contentType,
+        endpointId: envelope.route.endpointId,
+        endpointName: envelope.route.endpointName,
+        upstreamModel: envelope.route.upstreamModel,
+        toolTrace: buildToolTrace(toolCallList, []),
+      })
+    );
 
     if (toolCallList.length === 0) {
       messages.push({ role: "assistant", content: assistantContent });
@@ -899,11 +1002,34 @@ async function runAgentScenario(
       );
 
       toolCalls += 1;
+      usedToolNames.add(name);
       messages.push({
         role: "tool",
         tool_call_id: call.id ?? `tool-${iteration + 1}-${toolCalls}`,
         content: result.content,
       });
+      onExchange?.(
+        buildExchangeEvent({
+          scenario,
+          mode: "agent",
+          model,
+          requestPath: "/mcp/tools/call",
+          requestPayload: {
+            tool_name: name,
+            arguments: args,
+          },
+          responsePayload: result.content,
+          statusCode: 200,
+          contentType: "application/json",
+          toolTrace: buildToolTrace([call], [
+            {
+              name,
+              toolCallId: call.id ?? `tool-${iteration + 1}-${toolCalls}`,
+              content: result.content,
+            },
+          ]),
+        })
+      );
     }
   }
 
@@ -912,6 +1038,7 @@ async function runAgentScenario(
   const assertionError = evaluateAssertions(scenario, {
     output: finalOutput,
     toolCalls,
+    toolNames: Array.from(usedToolNames),
     latencyMs,
     statusCode,
   });
@@ -924,7 +1051,10 @@ async function runAgentScenario(
     tokens: totalTokens,
     toolCalls,
     throughputTokensPerSec: calculateThroughput(totalTokens, latencyMs),
+    finalOutput: finalOutput,
     outputPreview: truncate(finalOutput, 180),
+    verdict: error ?? "All assertions passed.",
+    usedToolNames: Array.from(usedToolNames),
     error: error ?? undefined,
     candidateAttempts,
     failovers,
@@ -958,6 +1088,7 @@ async function runEmbeddingsScenario(
   );
   onExchange?.(
     buildExchangeEvent({
+      scenario,
       mode: "embeddings",
       model,
       requestPath: "/v1/embeddings",
@@ -965,6 +1096,9 @@ async function runEmbeddingsScenario(
       responsePayload: envelope.payload,
       statusCode: envelope.statusCode,
       contentType: envelope.contentType,
+      endpointId: envelope.route.endpointId,
+      endpointName: envelope.route.endpointName,
+      upstreamModel: envelope.route.upstreamModel,
     })
   );
 
@@ -982,6 +1116,7 @@ async function runEmbeddingsScenario(
   const assertionError = evaluateAssertions(scenario, {
     output: text,
     toolCalls: 0,
+    toolNames: [],
     latencyMs,
     statusCode: envelope.statusCode,
     embeddingsItems: data.length,
@@ -995,7 +1130,10 @@ async function runEmbeddingsScenario(
     tokens,
     toolCalls: 0,
     throughputTokensPerSec: calculateThroughput(tokens, latencyMs),
+    finalOutput: text,
     outputPreview: truncate(text, 180),
+    verdict: assertionError ?? "All assertions passed.",
+    usedToolNames: [],
     error: assertionError ?? undefined,
     candidateAttempts: envelope.poolMetrics?.candidateAttempts ?? 0,
     failovers: envelope.poolMetrics?.failovers ?? 0,
@@ -1031,6 +1169,7 @@ async function runImageScenario(
   );
   onExchange?.(
     buildExchangeEvent({
+      scenario,
       mode: "image_generation",
       model,
       requestPath: "/v1/images/generations",
@@ -1038,6 +1177,9 @@ async function runImageScenario(
       responsePayload: envelope.payload,
       statusCode: envelope.statusCode,
       contentType: envelope.contentType,
+      endpointId: envelope.route.endpointId,
+      endpointName: envelope.route.endpointName,
+      upstreamModel: envelope.route.upstreamModel,
     })
   );
 
@@ -1049,6 +1191,7 @@ async function runImageScenario(
   const assertionError = evaluateAssertions(scenario, {
     output: text,
     toolCalls: 0,
+    toolNames: [],
     latencyMs,
     statusCode: envelope.statusCode,
     imagesCount: images.length,
@@ -1061,7 +1204,10 @@ async function runImageScenario(
     tokens: 0,
     toolCalls: 0,
     throughputTokensPerSec: 0,
+    finalOutput: text,
     outputPreview: truncate(text, 180),
+    verdict: assertionError ?? "All assertions passed.",
+    usedToolNames: [],
     error: assertionError ?? undefined,
     candidateAttempts: envelope.poolMetrics?.candidateAttempts ?? 0,
     failovers: envelope.poolMetrics?.failovers ?? 0,
@@ -1099,6 +1245,7 @@ async function runAudioTranscriptionScenario(
   );
   onExchange?.(
     buildExchangeEvent({
+      scenario,
       mode: "audio_transcription",
       model,
       requestPath: "/v1/audio/transcriptions",
@@ -1106,6 +1253,9 @@ async function runAudioTranscriptionScenario(
       responsePayload: envelope.payload,
       statusCode: envelope.statusCode,
       contentType: envelope.contentType,
+      endpointId: envelope.route.endpointId,
+      endpointName: envelope.route.endpointName,
+      upstreamModel: envelope.route.upstreamModel,
     })
   );
 
@@ -1116,6 +1266,7 @@ async function runAudioTranscriptionScenario(
   const assertionError = evaluateAssertions(scenario, {
     output: text,
     toolCalls: 0,
+    toolNames: [],
     latencyMs,
     statusCode: envelope.statusCode,
   });
@@ -1127,7 +1278,10 @@ async function runAudioTranscriptionScenario(
     tokens: 0,
     toolCalls: 0,
     throughputTokensPerSec: 0,
+    finalOutput: text,
     outputPreview: truncate(text, 180),
+    verdict: assertionError ?? "All assertions passed.",
+    usedToolNames: [],
     error: assertionError ?? undefined,
     candidateAttempts: envelope.poolMetrics?.candidateAttempts ?? 0,
     failovers: envelope.poolMetrics?.failovers ?? 0,
@@ -1163,6 +1317,7 @@ async function runAudioSpeechScenario(
   );
   onExchange?.(
     buildExchangeEvent({
+      scenario,
       mode: "audio_speech",
       model,
       requestPath: "/v1/audio/speech",
@@ -1172,6 +1327,9 @@ async function runAudioSpeechScenario(
       },
       statusCode: envelope.statusCode,
       contentType: envelope.contentType,
+      endpointId: envelope.route.endpointId,
+      endpointName: envelope.route.endpointName,
+      upstreamModel: envelope.route.upstreamModel,
     })
   );
 
@@ -1180,6 +1338,7 @@ async function runAudioSpeechScenario(
   const assertionError = evaluateAssertions(scenario, {
     output,
     toolCalls: 0,
+    toolNames: [],
     latencyMs,
     statusCode: envelope.statusCode,
     bytesLength: envelope.buffer.length,
@@ -1193,7 +1352,10 @@ async function runAudioSpeechScenario(
     tokens: 0,
     toolCalls: 0,
     throughputTokensPerSec: 0,
+    finalOutput: output,
     outputPreview: truncate(output, 180),
+    verdict: assertionError ?? "All assertions passed.",
+    usedToolNames: [],
     error: assertionError ?? undefined,
     candidateAttempts: envelope.poolMetrics?.candidateAttempts ?? 0,
     failovers: envelope.poolMetrics?.failovers ?? 0,
@@ -1253,6 +1415,7 @@ async function runOmniCallScenario(
   );
   onExchange?.(
     buildExchangeEvent({
+      scenario,
       mode: "omni_call",
       model,
       requestPath: "/v1/chat/completions",
@@ -1260,6 +1423,9 @@ async function runOmniCallScenario(
       responsePayload: envelope.payload,
       statusCode: envelope.statusCode,
       contentType: envelope.contentType,
+      endpointId: envelope.route.endpointId,
+      endpointName: envelope.route.endpointName,
+      upstreamModel: envelope.route.upstreamModel,
     })
   );
 
@@ -1272,6 +1438,7 @@ async function runOmniCallScenario(
   const assertionError = evaluateAssertions(scenario, {
     output,
     toolCalls: 0,
+    toolNames: [],
     latencyMs,
     statusCode: envelope.statusCode,
   });
@@ -1283,7 +1450,10 @@ async function runOmniCallScenario(
     tokens,
     toolCalls: 0,
     throughputTokensPerSec: calculateThroughput(tokens, latencyMs),
+    finalOutput: output,
     outputPreview: truncate(`${output}\naudio_output=${audioOutputPresent ? "yes" : "no"}`, 180),
+    verdict: assertionError ?? "All assertions passed.",
+    usedToolNames: [],
     error: assertionError ?? undefined,
     candidateAttempts: envelope.poolMetrics?.candidateAttempts ?? 0,
     failovers: envelope.poolMetrics?.failovers ?? 0,
@@ -1370,6 +1540,11 @@ async function requestJson(
     payload: payloadData,
     contentType,
     requestPayload,
+    route: {
+      endpointId: outcome.attempt.endpoint.id,
+      endpointName: outcome.attempt.endpoint.name,
+      upstreamModel: outcome.attempt.upstreamModel,
+    },
     poolMetrics: outcome.attempt.pool,
   };
 }
@@ -1403,6 +1578,11 @@ async function requestBinary(
     buffer,
     contentType,
     requestPayload,
+    route: {
+      endpointId: outcome.attempt.endpoint.id,
+      endpointName: outcome.attempt.endpoint.name,
+      upstreamModel: outcome.attempt.upstreamModel,
+    },
     poolMetrics: outcome.attempt.pool,
   };
 }
@@ -1450,6 +1630,34 @@ function parseAssistantContent(response: ChatResponse): string {
   return parseMessageContent(content);
 }
 
+function extractResponsesOutputText(response: {
+  output?: Array<{
+    type?: string;
+    content?: Array<{ type?: string; text?: string }>;
+    name?: string;
+    arguments?: string;
+  }>;
+}): string {
+  const parts: string[] = [];
+  for (const item of response.output ?? []) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    if (item.type === "message") {
+      for (const part of item.content ?? []) {
+        if (part?.type === "output_text" && typeof part.text === "string") {
+          parts.push(part.text);
+        }
+      }
+      continue;
+    }
+    if (item.type === "function_call" && typeof item.name === "string") {
+      parts.push(`tool_call:${item.name}`);
+    }
+  }
+  return parts.join("\n").trim();
+}
+
 function parseMessageContent(content: unknown): string {
   if (typeof content === "string") {
     return content;
@@ -1474,6 +1682,7 @@ function parseMessageContent(content: unknown): string {
 interface AssertionRuntime {
   output: string;
   toolCalls: number;
+  toolNames: string[];
   latencyMs: number;
   statusCode: number;
   embeddingsItems?: number;
@@ -1495,6 +1704,12 @@ function evaluateAssertions(scenario: BenchmarkScenario, runtime: AssertionRunti
   for (const forbidden of assertions.notContains ?? []) {
     if (runtime.output.includes(forbidden)) {
       return `Assertion failed: output must not include '${forbidden}'.`;
+    }
+  }
+
+  for (const toolName of assertions.requiredToolNames ?? []) {
+    if (!runtime.toolNames.includes(toolName)) {
+      return `Assertion failed: expected tool '${toolName}' to be used.`;
     }
   }
 
@@ -1571,6 +1786,13 @@ function buildSkippedScenarioResult(
   return {
     id: scenario.id,
     mode: scenario.mode,
+    title: scenario.title,
+    summary: scenario.summary,
+    userVisibleGoal: scenario.userVisibleGoal,
+    exampleSource: scenario.exampleSource,
+    inputPreview: scenario.inputPreview ?? describeScenarioInput(scenario),
+    successCriteria: scenario.successCriteria,
+    expectedHighlights: scenario.expectedHighlights,
     model: scenario.model ?? "unresolved",
     status: "skipped",
     success: true,
@@ -1591,6 +1813,8 @@ function buildSkippedScenarioResult(
     distinctProviders: 0,
     distinctModels: 0,
     errorReasons: [],
+    usedToolNames: [],
+    verdict: reason,
     outputPreview: "",
     audioOutputRuns: 0,
   };
@@ -1643,6 +1867,13 @@ function buildScenarioResult(
   return {
     id: scenario.id,
     mode: scenario.mode,
+    title: scenario.title,
+    summary: scenario.summary,
+    userVisibleGoal: scenario.userVisibleGoal,
+    exampleSource: scenario.exampleSource,
+    inputPreview: scenario.inputPreview ?? describeScenarioInput(scenario),
+    successCriteria: scenario.successCriteria,
+    expectedHighlights: scenario.expectedHighlights,
     model,
     status,
     success: status === "passed",
@@ -1662,9 +1893,46 @@ function buildScenarioResult(
     distinctProviders,
     distinctModels,
     audioOutputRuns,
+    usedToolNames: uniqueToolNames(samples),
+    verdict:
+      status === "passed"
+        ? "All assertions passed."
+        : (samples.find((sample) => sample.error)?.error ?? errorReasons[0] ?? "Scenario failed."),
     errorReasons,
     outputPreview,
   };
+}
+
+function uniqueToolNames(samples: ScenarioRunSample[]): string[] {
+  const names = new Set<string>();
+  for (const sample of samples) {
+    for (const toolName of sample.usedToolNames) {
+      names.add(toolName);
+    }
+  }
+  return Array.from(names).sort();
+}
+
+function describeScenarioInput(scenario: BenchmarkScenario): string {
+  if (scenario.inputPreview) {
+    return scenario.inputPreview;
+  }
+  if (scenario.prompt) {
+    return scenario.prompt;
+  }
+  if (scenario.inputText) {
+    return scenario.inputText;
+  }
+  if (typeof scenario.input === "string") {
+    return scenario.input;
+  }
+  if (Array.isArray(scenario.input)) {
+    return scenario.input.join(" | ");
+  }
+  if (scenario.audioFile) {
+    return scenario.audioFile;
+  }
+  return "";
 }
 
 function buildCapabilityMatrix(
@@ -1896,7 +2164,9 @@ function buildReport(
     id: reportId ?? randomUUID(),
     createdAt: new Date().toISOString(),
     profile: effective.profile,
+    executionMode: effective.run.executionMode ?? "diagnostic",
     suite: effective.run.suite,
+    exampleId: effective.run.exampleId,
     scenarioPath,
     modelOverride: effective.run.modelOverride,
     configSource: effective.configSource,
@@ -1920,6 +2190,17 @@ function buildReport(
       gates: effective.gates,
     },
     results,
+    scenarioDetails: executions.map((execution) => ({
+      id: execution.result.id,
+      suite: effective.run.suite,
+      example: execution.example,
+      model: execution.result.model,
+      status: execution.result.status,
+      verdict: execution.result.verdict,
+      exchanges: execution.exchanges,
+      finalResponsePreview: execution.result.outputPreview,
+      usedToolNames: execution.result.usedToolNames,
+    })),
     scenarioRuns: executions.map((execution) => ({
       id: execution.result.id,
       samples: execution.samples,
@@ -1931,6 +2212,7 @@ function buildReport(
 }
 
 function buildExchangeEvent(args: {
+  scenario: BenchmarkScenario;
   mode: BenchmarkMode;
   model: string;
   requestPath: string;
@@ -1938,18 +2220,99 @@ function buildExchangeEvent(args: {
   responsePayload: unknown;
   statusCode: number;
   contentType: string;
+  endpointId?: string;
+  endpointName?: string;
+  upstreamModel?: string;
+  toolTrace?: BenchmarkToolTraceStep[];
 }): BenchmarkExchangeEvent {
+  const requestSanitized = sanitizeForTrace(args.requestPayload);
+  const responseSanitized = sanitizeForTrace(args.responsePayload);
   return {
+    scenarioInput: describeScenarioInput(args.scenario),
+    requestPreview: truncate(previewForTrace(requestSanitized), 220),
+    responsePreview: truncate(previewForTrace(responseSanitized), 220),
     mode: args.mode,
     model: args.model,
     requestPath: args.requestPath,
     statusCode: args.statusCode,
     contentType: args.contentType,
+    endpointId: args.endpointId,
+    endpointName: args.endpointName,
+    upstreamModel: args.upstreamModel,
+    toolTrace: args.toolTrace ?? [],
     requestRaw: safeSerialize(args.requestPayload),
-    requestSanitized: sanitizeForTrace(args.requestPayload),
+    requestSanitized,
     responseRaw: safeSerialize(args.responsePayload),
-    responseSanitized: sanitizeForTrace(args.responsePayload),
+    responseSanitized,
   };
+}
+
+function toExchangeSummary(event: BenchmarkExchangeEvent): BenchmarkExchangeSummary {
+  return {
+    timestamp: new Date().toISOString(),
+    mode: event.mode,
+    model: event.model,
+    requestPath: event.requestPath,
+    statusCode: event.statusCode,
+    contentType: event.contentType,
+    requestSanitized: event.requestSanitized,
+    responseSanitized: event.responseSanitized,
+    requestPreview: event.requestPreview,
+    responsePreview: event.responsePreview,
+    endpointId: event.endpointId,
+    endpointName: event.endpointName,
+    upstreamModel: event.upstreamModel,
+    toolTrace: event.toolTrace,
+  };
+}
+
+function scenarioToSummary(
+  scenario: BenchmarkScenario,
+  suite?: string
+): BenchmarkScenarioSummary {
+  return {
+    id: scenario.id,
+    suite: suite ?? "custom",
+    mode: scenario.mode,
+    title: scenario.title ?? scenario.id,
+    summary: scenario.summary ?? "Benchmark scenario",
+    userVisibleGoal:
+      scenario.userVisibleGoal ?? "Inspect the exact request, response, and final verdict.",
+    exampleSource: scenario.exampleSource ?? (suite ? "builtin" : "file"),
+    inputPreview: describeScenarioInput(scenario),
+    successCriteria: scenario.successCriteria ?? "All configured assertions pass.",
+    expectedHighlights: scenario.expectedHighlights ?? [],
+    requiresAvailableTools: scenario.requiresAvailableTools === true,
+    model: scenario.model,
+  };
+}
+
+function buildToolTrace(
+  toolCalls: ChatToolCall[],
+  toolResults: Array<{ name: string; toolCallId?: string; content: unknown }>
+): BenchmarkToolTraceStep[] {
+  const trace: BenchmarkToolTraceStep[] = [];
+  for (const call of toolCalls) {
+    const toolName = call.function?.name;
+    if (!toolName) {
+      continue;
+    }
+    trace.push({
+      kind: "tool_call",
+      toolName,
+      toolCallId: call.id,
+      argumentsText: call.function?.arguments,
+    });
+  }
+  for (const result of toolResults) {
+    trace.push({
+      kind: "tool_result",
+      toolName: result.name,
+      toolCallId: result.toolCallId,
+      contentText: previewForTrace(sanitizeForTrace(result.content)),
+    });
+  }
+  return trace;
 }
 
 function safeSerialize(value: unknown): unknown {
@@ -2019,6 +2382,17 @@ function looksLikeBase64(value: string): boolean {
     return false;
   }
   return /^[A-Za-z0-9+/=]+$/.test(value);
+}
+
+function previewForTrace(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function emitEvent(hooks: BenchmarkRunHooks | undefined, event: BenchmarkProgressEvent): void {
